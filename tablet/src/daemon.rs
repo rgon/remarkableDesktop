@@ -68,6 +68,8 @@ struct Host {
     views: Vec<String>,
     target: u8,
     alive: bool,
+    /// Address the host verified it can reach us on without USB.
+    remote: Option<String>,
 }
 
 impl Host {
@@ -131,6 +133,8 @@ pub fn run(args: Args) -> Result<(), String> {
 
     let mut ui = Ui::new(&epd, rotation);
     ui.set_label(Button::Side, "SIDE");
+    ui.set_label(Button::Net, "NET");
+    ui.set_enabled(Button::Net, false);
     ui.set_label(Button::Screen, "VIEW");
     ui.set_label(Button::Mode, mode_label(touch_mode));
     ui.set_label(Button::Pen, pen_label(pen_mode));
@@ -182,6 +186,9 @@ pub fn run(args: Args) -> Result<(), String> {
     // (button, since, already fired): a hold fires once, then needs a release.
     let mut hold: Option<(Button, Instant, bool)> = None;
     let mut done = false;
+    // Non-USB addresses, re-read every few seconds and sent to the host on change.
+    let mut addresses = crate::link::network_addresses();
+    let mut addresses_at = Instant::now();
 
     while !done && !quitting() {
         let mut fds = input_fds.clone();
@@ -269,7 +276,8 @@ pub fn run(args: Args) -> Result<(), String> {
                 }
                 match link.spawn_reader(epd.fb) {
                     Ok((incoming, wake)) => {
-                        let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true };
+                        let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true, remote: None };
+                        h.send(&Msg::Addresses { addrs: addresses.clone() });
                         h.send(&Msg::Hello { version: remvnc_proto::VERSION, width: ui.size[0] as u16, height: ui.size[1] as u16, rotation });
                         sent_status = None; // sent with the next wake-up
                         host = Some(h);
@@ -291,6 +299,10 @@ pub fn run(args: Args) -> Result<(), String> {
                         h.target = 0;
                         ui.set_label(Button::Screen, &h.views[0]);
                         ui.set_enabled(Button::Screen, h.views.len() > 1);
+                    }
+                    Incoming::Msg(Msg::RemoteOk { addr }) => {
+                        h.remote = (!addr.is_empty()).then_some(addr);
+                        ui.set_enabled(Button::Net, h.remote.is_some() && crate::link::is_usb(h.link.peer));
                     }
                     Incoming::Msg(Msg::Mapping { device, shown, to }) => {
                         let f = |v: [u16; 4]| v.map(|x| x as f64 / 65535.0);
@@ -320,11 +332,24 @@ pub fn run(args: Args) -> Result<(), String> {
             h.flush();
             host_gone |= !h.alive;
         }
+        if addresses_at.elapsed() >= Duration::from_secs(5) {
+            addresses_at = Instant::now();
+            let now = crate::link::network_addresses();
+            if now != addresses {
+                addresses = now;
+                if let Some(h) = host.as_mut() {
+                    h.send(&Msg::Addresses { addrs: addresses.clone() });
+                }
+            }
+        }
         if host_gone {
             log!("remvnc: host went away");
             host = None;
+            ui.set_enabled(Button::Net, false);
             mappings = [Mapping::default(); 2];
             ui.set_label(Button::Side, "SIDE");
+    ui.set_label(Button::Net, "NET");
+    ui.set_enabled(Button::Net, false);
     ui.set_label(Button::Screen, "VIEW");
             ui.set_enabled(Button::Screen, false);
             // Streamed content would otherwise stay on the panel.
@@ -339,11 +364,12 @@ pub fn run(args: Args) -> Result<(), String> {
             _ => "USB  not connected",
         };
         let host_line = match &host {
-            Some(_) if hid_up => "HOST connected (display)",
-            Some(_) => "HOST connected (input, display)",
-            None => "HOST not connected",
+            Some(h) if !crate::link::is_usb(h.link.peer) => format!("HOST {} (unplug ok)", h.link.peer),
+            Some(_) if hid_up => "HOST connected (display)".into(),
+            Some(_) => "HOST connected (input, display)".into(),
+            None => "HOST not connected".into(),
         };
-        ui.set_status(usb_line, host_line);
+        ui.set_status(usb_line, &host_line);
 
         // Hold buttons.
         let held = touch.as_ref().and_then(|t| t.holding()).map(|b| Button::ALL[b as usize]).filter(|&b| ui.enabled(b));
@@ -402,6 +428,12 @@ pub fn run(args: Args) -> Result<(), String> {
                                 }
                             }
                             Button::Side => {}
+                            Button::Net => {
+                                if let Some(h) = host.as_mut().filter(|h| h.remote.is_some()) {
+                                    log!("remvnc: going remote via {}", h.remote.as_deref().unwrap_or(""));
+                                    h.send(&Msg::GoRemote);
+                                }
+                            }
                             Button::Screen => {
                                 if let Some(h) = host.as_mut().filter(|h| h.views.len() > 1) {
                                     h.target = (h.target + 1) % h.views.len() as u8;

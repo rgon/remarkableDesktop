@@ -261,8 +261,13 @@ fn run() -> Result<(), String> {
     // Settings changes are undone when this drops, across reconnects.
     let mut gs = gsettings::Outputs::default();
     let mut wait = Duration::from_secs(30);
+    // After "go remote": the tablet's address off USB, reached without SSH.
+    let mut remote: Option<(SocketAddr, [u8; 16])> = None;
     loop {
-        let (addr, token) = find_session(&args, wait)?;
+        let (addr, token) = match remote {
+            Some(r) => r,
+            None => find_session(&args, wait)?,
+        };
         let tcp = match connect(addr, &token) {
             Ok(t) => t,
             Err(e) => {
@@ -272,21 +277,95 @@ fn run() -> Result<(), String> {
             }
         };
         eprintln!("remvnc-host: connected to {addr}");
-        match session(tcp, &args, &mut gs) {
-            Ok(()) => return Ok(()),
+        match session(tcp, addr.port(), &args, &mut gs) {
+            Ok(End::Bye) => return Ok(()),
+            Ok(End::GoRemote(ip)) => {
+                eprintln!("remvnc-host: going remote via {ip}");
+                remote = Some((SocketAddr::new(ip, addr.port()), token));
+            }
             // USB re-enumeration or a network blip: the instance keeps
-            // running, so find it again.
-            Err(e) => eprintln!("remvnc-host: {e}; reconnecting"),
+            // running, so find it again (directly if we went remote).
+            Err(e) => {
+                eprintln!("remvnc-host: {e}; reconnecting");
+                if let Some((r, _)) = remote {
+                    if !wait_reachable(r, Duration::from_secs(30)) {
+                        eprintln!("remvnc-host: {r} unreachable; trying over USB");
+                        remote = None;
+                    }
+                }
+            }
         }
         wait = Duration::from_secs(20);
     }
 }
 
-/// One connection to the instance. Ok when the tablet ended the session.
-fn session(tcp: TcpStream, args: &Args, gs: &mut gsettings::Outputs) -> Result<(), String> {
+/// How a session ended without an error.
+enum End {
+    /// The tablet ended it.
+    Bye,
+    /// The tablet asked to move the connection off USB, to this address.
+    GoRemote(std::net::IpAddr),
+}
+
+fn reachable(addr: SocketAddr) -> bool {
+    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
+}
+
+fn wait_reachable(addr: SocketAddr, wait: Duration) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        if reachable(addr) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    false
+}
+
+/// Tests, every few seconds, which of the tablet's non-USB addresses we can
+/// reach its instance on, and tells the tablet (enabling its NET button).
+fn spawn_prober(
+    w: Writer,
+    port: u16,
+    addrs: Arc<Mutex<Vec<String>>>,
+    verified: Arc<Mutex<Option<std::net::IpAddr>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let mut last: Option<Option<std::net::IpAddr>> = None;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let candidates = addrs.lock().unwrap().clone();
+            let ok = candidates
+                .iter()
+                .filter_map(|a| a.parse::<std::net::IpAddr>().ok())
+                .find(|&ip| reachable(SocketAddr::new(ip, port)));
+            if last != Some(ok) {
+                match ok {
+                    Some(ip) => eprintln!("remvnc-host: tablet reachable without USB at {ip}"),
+                    None if !candidates.is_empty() => eprintln!("remvnc-host: tablet not reachable at {}", candidates.join(", ")),
+                    None => {}
+                }
+                *verified.lock().unwrap() = ok;
+                let addr = ok.map_or(String::new(), |ip| ip.to_string());
+                if send(&w, &Msg::RemoteOk { addr }).is_err() {
+                    return;
+                }
+                last = Some(ok);
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+}
+
+/// One connection to the instance.
+fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) -> Result<End, String> {
     let mut stream = BufReader::new(tcp.try_clone().map_err(|e| e.to_string())?);
     let closer = tcp.try_clone().map_err(|e| e.to_string())?;
     let writer: Writer = Arc::new(Mutex::new(Box::new(tcp)));
+    let tablet_addrs: Arc<Mutex<Vec<String>>> = Default::default();
+    let verified: Arc<Mutex<Option<std::net::IpAddr>>> = Default::default();
+    let stop_prober: Arc<std::sync::atomic::AtomicBool> = Default::default();
+    spawn_prober(writer.clone(), port, tablet_addrs.clone(), verified.clone(), stop_prober.clone());
 
     // Clock probes for latency stats, 10 Hz.
     let pinger = {
@@ -324,7 +403,8 @@ fn session(tcp: TcpStream, args: &Args, gs: &mut gsettings::Outputs) -> Result<(
         match Msg::read_from(&mut stream) {
             Ok(Some(Msg::Hello { version, width, height, rotation })) => {
                 if version != remvnc_proto::VERSION {
-                    break Ok(eprintln!("remvnc-host: tablet speaks protocol {version}, we speak {}", remvnc_proto::VERSION));
+                    eprintln!("remvnc-host: tablet speaks protocol {version}, we speak {}", remvnc_proto::VERSION);
+                    break Ok(End::Bye);
                 }
                 eprintln!("remvnc-host: tablet ready, {width}x{height} rotated {rotation}°");
                 logical = (width as u32, height as u32);
@@ -419,13 +499,20 @@ fn session(tcp: TcpStream, args: &Args, gs: &mut gsettings::Outputs) -> Result<(
             }
             Ok(Some(Msg::Bye)) => {
                 eprintln!("remvnc-host: tablet closed the session");
-                break Ok(());
+                break Ok(End::Bye);
+            }
+            Ok(Some(Msg::Addresses { addrs })) => *tablet_addrs.lock().unwrap() = addrs,
+            Ok(Some(Msg::GoRemote)) => {
+                if let Some(ip) = *verified.lock().unwrap() {
+                    break Ok(End::GoRemote(ip));
+                }
             }
             Ok(Some(_)) => {}
             Ok(None) => break Err("connection closed".into()),
             Err(e) => break Err(format!("connection lost: {e}")),
         }
     };
+    stop_prober.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(streamer);
     drop(devices);
     // The pinger exits once the socket is shut down.

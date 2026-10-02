@@ -65,17 +65,20 @@ pub enum Button {
     /// Clicks the pen's side button where the pen is (or last was). Acts
     /// on touch, no hold.
     Side = 0,
+    /// Moves the host connection off USB (to Wi-Fi), once the host has
+    /// verified it can reach us there; then USB can be unplugged.
+    Net = 1,
     /// Cycles which monitor absolute input maps to.
-    Screen = 1,
+    Screen = 2,
     /// Switches the pen between drawing tablet and absolute mouse.
-    Pen = 2,
+    Pen = 3,
     /// Switches touch between touchpad and touchscreen.
-    Mode = 3,
-    Close = 4,
+    Mode = 4,
+    Close = 5,
 }
 
 impl Button {
-    pub const ALL: [Button; 5] = [Button::Side, Button::Screen, Button::Pen, Button::Mode, Button::Close];
+    pub const ALL: [Button; 6] = [Button::Side, Button::Net, Button::Screen, Button::Pen, Button::Mode, Button::Close];
 
     /// How long the button must be held (zero: acts on touch).
     pub fn hold(self) -> std::time::Duration {
@@ -98,7 +101,7 @@ struct Slot {
 
 /// Lines of the info box in the bottom-left corner.
 const STATUS_LINES: usize = 3;
-const STATUS_W: u32 = 520;
+const STATUS_W: u32 = 800;
 const STATUS_LINE_H: i32 = 44;
 
 pub struct Ui<'a> {

@@ -62,8 +62,10 @@ impl Server {
             Ok(true) => {
                 log!("remvnc: host connected from {peer}");
                 let out = tcp.try_clone().ok()?;
-                Some(Link { out: BufWriter::new(Box::new(out)), tcp })
+                Some(Link { out: BufWriter::new(Box::new(out)), tcp, peer: peer.ip() })
             }
+            // Hosts test reachability by connecting and hanging up: not worth a log line.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => None,
             _ => {
                 log!("remvnc: rejected connection from {peer}");
                 None
@@ -81,6 +83,7 @@ impl Drop for Server {
 pub struct Link {
     pub out: BufWriter<Box<dyn Write>>,
     tcp: TcpStream,
+    pub peer: std::net::IpAddr,
 }
 
 impl Link {
@@ -121,6 +124,44 @@ impl Link {
     pub fn close(&self) {
         let _ = self.tcp.shutdown(std::net::Shutdown::Both);
     }
+}
+
+/// Whether an address belongs to the USB network (the tablet is 10.11.99.1).
+pub fn is_usb(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.octets()[..3] == [10, 11, 99],
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().is_some_and(|v4| v4.octets()[..3] == [10, 11, 99]),
+    }
+}
+
+/// IPv4 addresses on interfaces other than loopback and USB (e.g. Wi-Fi).
+pub fn network_addresses() -> Vec<String> {
+    let mut out = vec![];
+    unsafe {
+        let mut ifs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifs) != 0 {
+            return out;
+        }
+        let mut p = ifs;
+        while !p.is_null() {
+            let i = &*p;
+            p = i.ifa_next;
+            if i.ifa_addr.is_null() || (*i.ifa_addr).sa_family as i32 != libc::AF_INET {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(i.ifa_name).to_string_lossy();
+            if name == "lo" || name.starts_with("usb") {
+                continue;
+            }
+            let sin = &*(i.ifa_addr as *const libc::sockaddr_in);
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            if !is_usb(ip.into()) {
+                out.push(ip.to_string());
+            }
+        }
+        libc::freeifaddrs(ifs);
+    }
+    out
 }
 
 /// What the reader thread hands to the input thread.
