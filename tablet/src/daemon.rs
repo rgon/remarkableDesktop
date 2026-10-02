@@ -187,6 +187,10 @@ pub fn run(args: Args) -> Result<(), String> {
     realtime_priority();
 
     let mut encoder = Encoder::default();
+    // The pen stays off the computer over our buttons, and presses them instead.
+    let mut gate = crate::pen_gate::PenGate::default();
+    let mut pen_pressing: Option<Button> = None;
+    let pen_axes = ranges.as_ref().map(|r| r.pen);
     let mut mappings = [Mapping::default(); 2]; // pen, touch
     let mut display = Display::new(refresh);
     let mut host: Option<Host> = None;
@@ -220,7 +224,21 @@ pub fn run(args: Args) -> Result<(), String> {
         let mut frames = vec![];
         if let (Some(pen), Some(f)) = (pen.as_mut(), files[0].as_mut()) {
             let events = input::read_events(f).unwrap_or_default();
-            frames.extend(pen.feed(&events).into_iter().map(|(t, e)| (input::PEN_ID, t, e)));
+            let mouse = pen.mode() == PenMode::Mouse;
+            let size = ui.size;
+            let zone = |pos: [i32; 2]| match pen_axes {
+                Some(a) => ui.pen_zone([0, 1].map(|i| {
+                    ((pos[i] - a[i].min) as i64 * size[i] as i64 / (a[i].max - a[i].min).max(1) as i64) as i32
+                })),
+                None => crate::pen_gate::Zone::Outside,
+            };
+            for (t, e) in pen.feed(&events) {
+                let g = gate.filter(e, mouse, &zone);
+                pen_pressing = g.pressing.filter(|&b| ui.enabled(b));
+                if let Some(e) = g.events {
+                    frames.push((input::PEN_ID, t, e));
+                }
+            }
         }
         if let Some(touch) = touch.as_mut() {
             let now = remdesktop_proto::monotonic_us();
@@ -419,7 +437,10 @@ pub fn run(args: Args) -> Result<(), String> {
         ui.set_status(usb_line, &host_line);
 
         // Hold buttons.
-        let held = touch.as_ref().and_then(|t| t.holding()).map(|b| Button::ALL[b as usize]).filter(|&b| ui.enabled(b));
+        // A finger or the pen tip on a button.
+        let held = pen_pressing
+            .or_else(|| touch.as_ref().and_then(|t| t.holding()).map(|b| Button::ALL[b as usize]))
+            .filter(|&b| ui.enabled(b));
         match (held, hold) {
             (Some(b), Some((h, since, fired))) if b == h => {
                 if !fired {
@@ -547,7 +568,7 @@ pub fn run(args: Args) -> Result<(), String> {
                     if let Some(p) = pen.as_ref() {
                         let now = remdesktop_proto::monotonic_us();
                         let mouse = p.mode() == PenMode::Mouse;
-                        for mut events in p.side_click() {
+                        for mut events in p.side_click(gate.anchor, gate.host_in_range()) {
                             if let (true, Some(g), Some(r)) = (hid_up, gadget.as_ref(), ranges.as_ref()) {
                                 mappings[0].apply(&mut events, r.pen, false);
                                 g.send(&encoder.pen(&events, mouse));

@@ -220,6 +220,26 @@ impl<'a> Ui<'a> {
     }
 
 
+    /// Classifies a pen position (logical pixels): on a button, within the
+    /// grace margin around the buttons, or outside. Everything but
+    /// `Outside` is kept away from the computer.
+    pub fn pen_zone(&self, p: [i32; 2]) -> crate::pen_gate::Zone {
+        use crate::pen_gate::Zone;
+        const MARGIN: i32 = 12;
+        let inside = |b: Button, m: i32| {
+            let tl = self.buttons[b as usize].rect.top_left;
+            p[0] >= tl.x - m && p[0] < tl.x + BUTTON as i32 + m && p[1] >= tl.y - m && p[1] < tl.y + BUTTON as i32 + m
+        };
+        if let Some(b) = Button::ALL.into_iter().find(|&b| inside(b, 0)) {
+            return Zone::On(b);
+        }
+        // Margins around buttons, which also covers the gaps between them.
+        let first = self.buttons[0].rect.top_left;
+        let last = self.buttons[self.buttons.len() - 1].rect.top_left;
+        let in_bar = p[0] >= first.x - MARGIN && p[0] < last.x + BUTTON as i32 + MARGIN && p[1] >= first.y - MARGIN && p[1] < first.y + BUTTON as i32 + MARGIN;
+        if in_bar { Zone::Margin } else { Zone::Outside }
+    }
+
     /// The button under a logical pixel position (with a little slack).
     pub fn button_at(&self, p: [i32; 2]) -> Option<Button> {
         let slack = 14;

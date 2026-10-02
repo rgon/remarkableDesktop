@@ -570,7 +570,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "remdesktop-host"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "libc",
  "lz4_flex",
@@ -583,14 +583,14 @@ dependencies = [
 
 [[package]]
 name = "remdesktop-proto"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "remdesktop-tablet"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "embedded-graphics",
  "libc",

@@ -223,8 +223,6 @@ pub struct Pen {
     pending: Vec<Event>,
     /// Pen or eraser within hover range.
     pub in_range: bool,
-    /// Last position sent, for clicks at the pen's location.
-    last: [i32; 2],
 }
 
 impl Pen {
@@ -251,7 +249,7 @@ impl Pen {
             let m = i.max.max(-i.min);
             abs.push(Abs { code, min: -m, max: m, resolution: 0 });
         }
-        Ok(Self { mode, rubber: false, pressed: None, map, pos, abs, pending: vec![], in_range: false, last: [0; 2] })
+        Ok(Self { mode, rubber: false, pressed: None, map, pos, abs, pending: vec![], in_range: false })
     }
 
     pub fn mode(&self) -> PenMode {
@@ -274,11 +272,11 @@ impl Pen {
         release
     }
 
-    /// A side-button click (right click in mouse mode) at the pen's current
-    /// or last position: press and release frames. Out of range, the pen
+    /// A side-button click (right click in mouse mode) at `pos`: press and
+    /// release frames. If the computer doesn't see the pen in range, it
     /// briefly enters hover there so the click has a location.
-    pub fn side_click(&self) -> [Vec<Event>; 2] {
-        let at = [Event { kind: EV_ABS, code: ABS_X, value: self.last[0] }, Event { kind: EV_ABS, code: ABS_Y, value: self.last[1] }];
+    pub fn side_click(&self, pos: [i32; 2], host_in_range: bool) -> [Vec<Event>; 2] {
+        let at = [Event { kind: EV_ABS, code: ABS_X, value: pos[0] }, Event { kind: EV_ABS, code: ABS_Y, value: pos[1] }];
         let key = |code, value| Event { kind: EV_KEY, code, value };
         match self.mode {
             PenMode::Mouse => {
@@ -287,7 +285,7 @@ impl Pen {
                 [down, vec![key(BTN_RIGHT, 0)]]
             }
             PenMode::Tablet => {
-                let enter = !self.in_range;
+                let enter = !host_in_range;
                 let mut down = vec![];
                 if enter {
                     down.push(key(BTN_TOOL_PEN, 1));
@@ -362,7 +360,6 @@ impl Pen {
                     let raw = (e.code - ABS_X) as usize;
                     let (out, flipped) = self.map.to[raw];
                     let value = apply(e.value, self.pos[raw], flipped);
-                    self.last[out] = value;
                     pending.push(Event { kind: EV_ABS, code: [ABS_X, ABS_Y][out], value });
                 }
                 (EV_ABS, ABS_TILT_X | ABS_TILT_Y) => {

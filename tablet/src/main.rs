@@ -15,6 +15,7 @@ mod hid;
 mod hid_report;
 mod input;
 mod link;
+mod pen_gate;
 mod session;
 mod state;
 mod takeover;
