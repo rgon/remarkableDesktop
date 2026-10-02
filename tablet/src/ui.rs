@@ -133,6 +133,8 @@ impl<'a> Ui<'a> {
             .draw(&mut Scaled { target: &mut t, factor: 6 });
         let _ = Text::with_alignment("hold a button to use it", Point::new(w / 8, h / 8 + 40), big, Alignment::Center)
             .draw(&mut Scaled { target: &mut t, factor: 4 });
+        let version = concat!("remvnc v", env!("CARGO_PKG_VERSION"));
+        let _ = Text::new(version, Point::new(MARGIN / 2, (h - MARGIN) / 2), big).draw(&mut Scaled { target: &mut t, factor: 2 });
         drop(t);
         for b in Button::ALL {
             self.buttons[b as usize].drawn = None;
