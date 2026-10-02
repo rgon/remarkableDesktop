@@ -4,6 +4,7 @@
 mod capture;
 mod displayconfig;
 mod gsettings;
+mod keymap;
 mod mapping;
 mod outputs;
 mod stats;
@@ -393,6 +394,10 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
     let mut status = TabletStatus::default();
     // Messages we feed ourselves (resuming the tablet's saved view).
     let mut queued: std::collections::VecDeque<Msg> = Default::default();
+    // Undo/redo keys for the current keyboard layout, re-checked now and then
+    // (the user may switch input sources).
+    let mut keys_sent: Option<Vec<u16>> = None;
+    let mut keys_checked: Option<std::time::Instant> = None;
     let offset: stats::Offset = Default::default();
     let mut hid_probe: Option<stats::HidProbe> = None;
     let result = loop {
@@ -404,6 +409,22 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
             remap(&mut devices, &screens, &target, gs);
             if status.usb_hid {
                 remap_hid(&writer, &screens, &target, gs, status);
+            }
+        }
+        if keys_checked.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+            keys_checked = Some(std::time::Instant::now());
+            match keymap::keys_for(&['z', 'y']) {
+                Some((codes, layout)) if keys_sent.as_ref() != Some(&codes) => {
+                    eprintln!("remdesktop-host: keyboard layout {layout}: undo/redo on key codes {codes:?}");
+                    let _ = send(&writer, &Msg::Keys { undo: codes[0], redo: codes[1] });
+                    keys_sent = Some(codes);
+                }
+                Some(_) => {}
+                None if keys_sent.is_none() => {
+                    eprintln!("remdesktop-host: couldn't read the keyboard layout; undo/redo assume QWERTY");
+                    keys_sent = Some(vec![]);
+                }
+                None => {}
             }
         }
         let msg = match queued.pop_front() {

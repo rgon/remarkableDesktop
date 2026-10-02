@@ -73,6 +73,9 @@ struct Host {
     heard: Instant,
     /// Address the host verified it can reach us on without USB.
     remote: Option<String>,
+    /// Keys typing z and y in the host's keyboard layout. Undo/redo send
+    /// Ctrl + these while known, else the dedicated Undo/Redo keys.
+    keys: Option<(u16, u16)>,
 }
 
 impl Host {
@@ -238,7 +241,10 @@ pub fn run(args: Args) -> Result<(), String> {
                     .iter()
                     .map(|p| Msg::Device(p.device()))
                     .chain(touch.iter().map(|t| Msg::Device(t.device())))
-                    .chain([Msg::Device(input::keys_device())])
+                    .chain([Msg::Device({
+                        let (u, r) = h.keys.unwrap_or((input::KEY_Z, input::KEY_Y));
+                        input::keys_device(u, r)
+                    })])
                     .collect();
                 decls.iter().for_each(|m| h.send(m));
                 h.declared = true;
@@ -291,7 +297,7 @@ pub fn run(args: Args) -> Result<(), String> {
                 }
                 match link.spawn_reader(epd.fb) {
                     Ok((incoming, wake)) => {
-                        let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true, heard: Instant::now(), remote: None };
+                        let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true, heard: Instant::now(), remote: None, keys: None };
                         h.send(&Msg::Addresses { addrs: addresses.clone() });
                         h.send(&Msg::Hello {
                             version: remdesktop_proto::VERSION,
@@ -322,6 +328,15 @@ pub fn run(args: Args) -> Result<(), String> {
                         h.target = h.views.iter().position(|v| *v == state.view).unwrap_or(0) as u8;
                         ui.set_label(Button::Screen, &h.views[h.target as usize]);
                         ui.set_enabled(Button::Screen, h.views.len() > 1);
+                    }
+                    Incoming::Msg(Msg::Keys { undo, redo }) => {
+                        if h.keys != Some((undo, redo)) {
+                            log!("remdesktop: undo/redo now Ctrl + key codes {undo}/{redo}");
+                            h.keys = Some((undo, redo));
+                            if h.declared {
+                                h.send(&Msg::Device(input::keys_device(undo, redo)));
+                            }
+                        }
                     }
                     Incoming::Msg(Msg::RemoteOk { addr }) => {
                         h.remote = (!addr.is_empty()).then_some(addr);
@@ -496,19 +511,33 @@ pub fn run(args: Args) -> Result<(), String> {
                     // Acts on touch: a Ctrl+Z / Ctrl+Y key press.
                     hold = Some((b, Instant::now(), true));
                     ui.set_progress(b, ui::HOLD_STEPS);
-                    let (key, usage) = match b {
-                        Button::Undo => (input::KEY_Z, hid_report::USAGE_Z),
-                        _ => (input::KEY_Y, hid_report::USAGE_Y),
-                    };
-                    if let (true, Some(g)) = (hid_up, gadget.as_ref()) {
-                        g.send(&hid_report::keyboard(hid_report::MOD_LEFT_CTRL, Some(usage)));
-                        g.send(&hid_report::keyboard(0, None));
-                    } else if let Some(h) = host.as_mut() {
-                        let now = remdesktop_proto::monotonic_us();
-                        for events in input::ctrl_chord(key) {
-                            h.send(&Msg::Frame { device: input::KEYS_ID, time_us: now, events });
+                    let undo = b == Button::Undo;
+                    let now = remdesktop_proto::monotonic_us();
+                    // Ctrl + the layout's z/y while a host told us its layout;
+                    // otherwise the dedicated, layout-independent Undo/Redo keys.
+                    match (host.as_ref().and_then(|h| h.keys), hid_up, gadget.as_ref()) {
+                        (Some((u, r)), true, Some(g)) => {
+                            if let Some(usage) = hid_report::usage_for(if undo { u } else { r }) {
+                                g.send(&hid_report::keyboard(hid_report::MOD_LEFT_CTRL, Some(usage)));
+                                g.send(&hid_report::keyboard(0, None));
+                            }
                         }
-                        h.flush();
+                        (None, true, Some(g)) => {
+                            g.send(&hid_report::consumer(if undo { hid_report::AC_UNDO } else { hid_report::AC_REDO }));
+                            g.send(&hid_report::consumer(0));
+                        }
+                        (keys, _, _) => {
+                            if let Some(h) = host.as_mut() {
+                                let frames = match keys {
+                                    Some((u, r)) => input::ctrl_chord(if undo { u } else { r }),
+                                    None => input::tap(if undo { input::KEY_UNDO } else { input::KEY_REDO }),
+                                };
+                                for events in frames {
+                                    h.send(&Msg::Frame { device: input::KEYS_ID, time_us: now, events });
+                                }
+                                h.flush();
+                            }
+                        }
                     }
                 }
                 if b == Button::Side {

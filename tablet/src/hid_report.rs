@@ -14,6 +14,10 @@ const TOUCHSCREEN_MAX: u8 = 4;
 pub const MOUSE: u8 = 5;
 const TOUCHPAD_FEATURES: u8 = 6;
 pub const KEYBOARD: u8 = 7;
+pub const CONSUMER: u8 = 8;
+/// Consumer-page "AC Undo" and "AC Redo/Repeat" (Linux: KEY_UNDO, KEY_REDO).
+pub const AC_UNDO: u16 = 0x21a;
+pub const AC_REDO: u16 = 0x279;
 
 /// Contacts per touch report.
 pub const FINGERS: usize = 5;
@@ -211,13 +215,42 @@ pub fn descriptor(r: &Ranges) -> Vec<u8> {
     d.size(8, 1).input(CONST);
     d.page(0x07).uitem(0x18, 0).uitem(0x28, 0xff).logical(0, 255).size(8, 6).input(0x00); // array
     d.end();
+
+    // Consumer control: layout-independent Undo/Redo keys.
+    d.page(0x0c).usage(0x01).collection(APPLICATION).id(CONSUMER);
+    d.uitem(0x18, 0).uitem(0x28, 0x3ff).logical(0, 0x3ff).size(16, 1).input(0x00); // array
+    d.end();
     d.0
 }
 
-/// HID keyboard usages for the keys our buttons send.
-pub const USAGE_Z: u8 = 0x1d;
-pub const USAGE_Y: u8 = 0x1c;
+/// A consumer-control report with `usage` pressed (0 = released).
+pub fn consumer(usage: u16) -> Vec<u8> {
+    let [lo, hi] = usage.to_le_bytes();
+    vec![CONSUMER, lo, hi]
+}
+
 pub const MOD_LEFT_CTRL: u8 = 0x01;
+
+/// HID keyboard usage for a Linux key code (the main block: letters,
+/// digits, punctuation, space). Both name physical key positions.
+pub fn usage_for(code: u16) -> Option<u8> {
+    // Linux codes 2..=57 in order, paired with their HID usages.
+    const TABLE: [(u16, u8); 50] = [
+        (2, 0x1e), (3, 0x1f), (4, 0x20), (5, 0x21), (6, 0x22), (7, 0x23), (8, 0x24), (9, 0x25), (10, 0x26), (11, 0x27),
+        (12, 0x2d), (13, 0x2e), (14, 0x2a), (15, 0x2b),
+        (16, 0x14), (17, 0x1a), (18, 0x08), (19, 0x15), (20, 0x17), (21, 0x1c), (22, 0x18), (23, 0x0c), (24, 0x12), (25, 0x13),
+        (26, 0x2f), (27, 0x30), (28, 0x28),
+        (30, 0x04), (31, 0x16), (32, 0x07), (33, 0x09), (34, 0x0a), (35, 0x0b), (36, 0x0d), (37, 0x0e), (38, 0x0f),
+        (39, 0x33), (40, 0x34), (41, 0x35), (43, 0x31),
+        (44, 0x1d), (45, 0x1b), (46, 0x06), (47, 0x19), (48, 0x05), (49, 0x11), (50, 0x10),
+        (51, 0x36), (52, 0x37), (53, 0x38),
+    ];
+    match code {
+        57 => Some(0x2c), // space
+        86 => Some(0x64), // the extra key left of Z on ISO keyboards
+        _ => TABLE.iter().find(|&&(c, _)| c == code).map(|&(_, u)| u),
+    }
+}
 
 /// A keyboard report: modifier bits and up to one key pressed.
 pub fn keyboard(mods: u8, key: Option<u8>) -> Vec<u8> {
@@ -384,7 +417,10 @@ mod tests {
         let d = descriptor(&r);
         assert!(d.len() < 2048 && d.ends_with(&[0xc0]), "descriptor is {} bytes", d.len());
         // id + modifiers + reserved + 6 keys
-        assert_eq!(keyboard(MOD_LEFT_CTRL, Some(USAGE_Z)), vec![KEYBOARD, 1, 0, USAGE_Z, 0, 0, 0, 0, 0]);
+        assert_eq!(keyboard(MOD_LEFT_CTRL, Some(0x1d)), vec![KEYBOARD, 1, 0, 0x1d, 0, 0, 0, 0, 0]);
+        assert_eq!(consumer(AC_UNDO), vec![CONSUMER, 0x1a, 0x02]);
+        // Z, Y, and Programmer Dvorak's z (QWERTY slash) and y (QWERTY T).
+        assert_eq!([44, 21, 53, 20].map(usage_for), [Some(0x1d), Some(0x1c), Some(0x38), Some(0x17)]);
         let mut e = Encoder::default();
         // id + flags + x, y, pressure + 2 tilts
         assert_eq!(e.pen(&[Event { kind: EV_ABS, code: ABS_X, value: 5 }], false).len(), 1 + 1 + 6 + 4);

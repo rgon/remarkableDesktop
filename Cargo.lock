@@ -570,26 +570,27 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "remdesktop-host"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "libc",
  "lz4_flex",
  "remdesktop-proto",
  "wayland-client",
  "wayland-protocols",
+ "xkbcommon",
  "zbus",
 ]
 
 [[package]]
 name = "remdesktop-proto"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "remdesktop-tablet"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "embedded-graphics",
  "libc",
@@ -934,6 +935,22 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "xkbcommon"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7a974f48060a14e95705c01f24ad9c3345022f4d97441b8a36beb7ed5c4a02d"
+dependencies = [
+ "libc",
+ "xkeysym",
+]
+
+[[package]]
+name = "xkeysym"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "zbus"

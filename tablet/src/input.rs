@@ -54,10 +54,21 @@ pub const KEYS_ID: u8 = 3;
 pub const KEY_LEFTCTRL: u16 = 29;
 pub const KEY_Z: u16 = 44;
 pub const KEY_Y: u16 = 21;
+/// Dedicated, layout-independent keys, used when no host told us the layout.
+pub const KEY_UNDO: u16 = 131;
+pub const KEY_REDO: u16 = 182;
 
 /// A keyboard with just the keys our buttons press, for the uinput path.
-pub fn keys_device() -> Device {
-    Device { id: KEYS_ID, name: "remdesktop keys".into(), props: 0, keys: vec![KEY_LEFTCTRL, KEY_Z, KEY_Y], abs: vec![] }
+pub fn keys_device(undo: u16, redo: u16) -> Device {
+    let mut keys = vec![KEY_LEFTCTRL, KEY_UNDO, KEY_REDO, undo, redo];
+    keys.sort();
+    keys.dedup();
+    Device { id: KEYS_ID, name: "remdesktop keys".into(), props: 0, keys, abs: vec![] }
+}
+
+/// A plain key tap as press and release frames.
+pub fn tap(key: u16) -> [Vec<Event>; 2] {
+    [vec![Event { kind: EV_KEY, code: key, value: 1 }], vec![Event { kind: EV_KEY, code: key, value: 0 }]]
 }
 
 /// Ctrl+`key` as press and release frames.
