@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 7;
+pub const VERSION: u16 = 8;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Abs {
@@ -78,6 +78,9 @@ pub enum Msg {
     RemoteOk { addr: String },
     /// Tablet → host: the user asked to go remote; reconnect over `RemoteOk`'s address.
     GoRemote,
+    /// Host → tablet: Linux key codes that type `z` and `y` in the user's
+    /// keyboard layout, for the undo/redo buttons (Ctrl + these).
+    Keys { undo: u16, redo: u16 },
     /// The tablet is exiting on purpose (X button held, power button).
     Bye,
 }
@@ -98,6 +101,7 @@ const STATUS: u8 = 13;
 const ADDRESSES: u8 = 14;
 const REMOTE_OK: u8 = 15;
 const GO_REMOTE: u8 = 16;
+const KEYS: u8 = 17;
 
 impl Msg {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
@@ -199,6 +203,11 @@ impl Msg {
                 REMOTE_OK
             }
             Msg::GoRemote => GO_REMOTE,
+            Msg::Keys { undo, redo } => {
+                p.extend_from_slice(&undo.to_le_bytes());
+                p.extend_from_slice(&redo.to_le_bytes());
+                KEYS
+            }
         };
         w.write_all(&[tag])?;
         w.write_all(&(p.len() as u32).to_le_bytes())?;
@@ -274,6 +283,7 @@ impl Msg {
             ADDRESSES => Msg::Addresses { addrs: (0..c.u8()?).map(|_| c.str()).collect::<io::Result<_>>()? },
             REMOTE_OK => Msg::RemoteOk { addr: c.str()? },
             GO_REMOTE => Msg::GoRemote,
+            KEYS => Msg::Keys { undo: c.u16()?, redo: c.u16()? },
             t => return Err(bad(&format!("unknown message tag {t}"))),
         };
         Ok(Some(msg))
@@ -429,6 +439,7 @@ mod tests {
             Msg::Addresses { addrs: vec!["192.168.1.5".into()] },
             Msg::RemoteOk { addr: "192.168.1.5".into() },
             Msg::GoRemote,
+            Msg::Keys { undo: 53, redo: 20 },
             Msg::Bye,
         ];
         let mut buf = Vec::new();
