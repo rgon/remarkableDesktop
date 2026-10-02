@@ -11,6 +11,15 @@ extern "C" fn on_signal(_: libc::c_int) {
     QUIT.store(true, Ordering::Relaxed);
 }
 
+fn catch_signals() {
+    unsafe {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            libc::signal(sig, on_signal as *const () as libc::sighandler_t);
+        }
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
 pub fn quitting() -> bool {
     QUIT.load(Ordering::Relaxed)
 }
@@ -34,12 +43,10 @@ impl Session {
     /// `deadline_secs` (0 = none) bounds how long xochitl may stay paused.
     pub fn begin(deadline_secs: u64) -> Result<(Session, Epd), String> {
         let xochitl = takeover::xochitl_pid().ok_or("xochitl is not running")?;
-        unsafe {
-            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-                libc::signal(sig, on_signal as *const () as libc::sighandler_t);
-            }
-            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-        }
+        // No core dumps: this process holds a copy of xochitl's screen and the
+        // session token, and cores here go to reMarkable's crash reporter.
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        catch_signals();
         // Before Qt starts any threads.
         let guardian = Guardian::spawn(xochitl, deadline_secs).map_err(|e| format!("guardian: {e}"))?;
 
@@ -64,6 +71,11 @@ impl Session {
         let started = Instant::now();
         takeover::private_tmp().map_err(|e| format!("private /tmp: {e}"))?;
         let epd = Epd::open()?;
+        // The engine installs its own handlers and, on SIGTERM, tears itself
+        // down at once, while we may still be restoring the screen through it.
+        // Take the signals back: we quit through our loop, and the engine
+        // shuts down at process exit.
+        catch_signals();
 
         let (w, h) = (epd.width() as u32, epd.height() as u32);
         let saved = match takeover::learn_layout(epd.fb.pixels as usize, w, h, 32)
@@ -97,6 +109,7 @@ impl Session {
     /// once this process (and its engine) is gone.
     pub fn end(mut self, epd: &Epd) -> ! {
         if let Some(buf) = &self.saved {
+            log!("remvnc: putting xochitl's frame back");
             unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), epd.fb.pixels, buf.len()) };
             epd.swap(0, 0, epd.width(), epd.height(), Mode::Content, 0);
             let end = Instant::now() + Duration::from_millis(1500);
@@ -105,6 +118,7 @@ impl Session {
                 std::thread::sleep(Duration::from_millis(20));
             }
             self.guardian.restored();
+            log!("remvnc: screen restored");
         }
         log!("remvnc: xochitl was paused for {:?}", self.started.elapsed());
         drop(self.inputs);
