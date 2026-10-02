@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Abs {
@@ -36,7 +36,9 @@ pub struct Event {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Msg {
-    Hello { version: u16, width: u16, height: u16, rotation: u16 },
+    /// `view` is the label of the view the tablet last had selected (see
+    /// `Screens`), so the host can resume it; "" for the default.
+    Hello { version: u16, width: u16, height: u16, rotation: u16, view: String },
     Device(Device),
     /// Events for one device, ending in an implicit SYN_REPORT. `time_us`
     /// is the kernel timestamp of the batch (tablet CLOCK_MONOTONIC).
@@ -101,10 +103,11 @@ impl Msg {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
         let mut p = Vec::new();
         let tag = match self {
-            Msg::Hello { version, width, height, rotation } => {
+            Msg::Hello { version, width, height, rotation, view } => {
                 for v in [version, width, height, rotation] {
                     p.extend_from_slice(&v.to_le_bytes());
                 }
+                put_str(&mut p, view);
                 HELLO
             }
             Msg::Device(d) => {
@@ -217,7 +220,7 @@ impl Msg {
         r.read_exact(&mut p)?;
         let mut c = Cursor { buf: &p, at: 0 };
         let msg = match head[0] {
-            HELLO => Msg::Hello { version: c.u16()?, width: c.u16()?, height: c.u16()?, rotation: c.u16()? },
+            HELLO => Msg::Hello { version: c.u16()?, width: c.u16()?, height: c.u16()?, rotation: c.u16()?, view: c.str()? },
             DEVICE => {
                 let id = c.u8()?;
                 let name = c.str()?;
@@ -397,7 +400,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let msgs = vec![
-            Msg::Hello { version: VERSION, width: 1872, height: 1404, rotation: 90 },
+            Msg::Hello { version: VERSION, width: 1872, height: 1404, rotation: 90, view: "2".into() },
             Msg::Device(Device {
                 id: 1,
                 name: "remvnc pen".into(),
