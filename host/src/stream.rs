@@ -5,20 +5,56 @@
 use crate::capture::{Capture, Source};
 use remvnc_proto::{Msg, gray4};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct Shared {
     /// What to capture; `generation` bumps on every change.
     source: Option<Source>,
     generation: u64,
-    /// Newest frame as gray levels, and the generation it belongs to.
-    frame: Option<(u64, Vec<u8>)>,
+    /// Newest frame as gray levels, the generation it belongs to, and when
+    /// it was read from the capture pipeline.
+    frame: Option<(u64, Vec<u8>, Instant)>,
     fresh: bool,
     acked: bool,
     /// Set when a capture (re)started; carries the virtual monitor's name.
     started: Option<Option<String>>,
     stop: bool,
+    /// The update in flight: id, capture time, size in bytes.
+    in_flight: Option<(u32, Instant, usize)>,
+    stats: Option<DisplayStats>,
+}
+
+/// Capture → tablet-ack latency of screen updates, reported every 2 s.
+#[derive(Default)]
+struct DisplayStats {
+    since: Option<Instant>,
+    latencies_ms: Vec<f64>,
+    bytes: usize,
+    pixels: usize,
+}
+
+impl DisplayStats {
+    fn record(&mut self, latency: Duration, bytes: usize) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        self.latencies_ms.push(latency.as_secs_f64() * 1000.0);
+        self.bytes += bytes;
+        if since.elapsed() >= Duration::from_secs(2) {
+            let n = self.latencies_ms.len();
+            self.latencies_ms.sort_by(|a, b| a.total_cmp(b));
+            let pct = |p: f64| self.latencies_ms[((n - 1) as f64 * p) as usize];
+            eprintln!(
+                "remvnc-host: display {:.1}/s, {:.0} KB/update ({:.0} kpx), capture→ack p50 {:.1} p99 {:.1} max {:.1} ms",
+                n as f64 / since.elapsed().as_secs_f64(),
+                self.bytes as f64 / n as f64 / 1024.0,
+                self.pixels as f64 / n as f64 / 1000.0,
+                pct(0.5),
+                pct(0.99),
+                pct(1.0)
+            );
+            *self = DisplayStats::default();
+        }
+    }
 }
 
 pub struct Streamer {
@@ -52,8 +88,9 @@ fn changed(a: &[u8], b: &[u8], w: usize, h: usize) -> Option<(usize, usize, usiz
 impl Streamer {
     /// `logical` is the tablet's screen as the user sees it; frames are
     /// produced in panel portrait for `rotation`.
-    pub fn start(logical: (u32, u32), rotation: u16, mut send: Send) -> Streamer {
-        let shared = Arc::new((Mutex::new(Shared { acked: true, ..Default::default() }), Condvar::new()));
+    pub fn start(logical: (u32, u32), rotation: u16, stats: bool, mut send: Send) -> Streamer {
+        let stats = stats.then(DisplayStats::default);
+        let shared = Arc::new((Mutex::new(Shared { acked: true, stats, ..Default::default() }), Condvar::new()));
 
         let cap_shared = shared.clone();
         let capture = std::thread::spawn(move || {
@@ -92,9 +129,10 @@ impl Streamer {
                 let (_, cap) = current.as_mut().unwrap();
                 match cap.next_frame(&mut raw, Duration::from_millis(100)) {
                     Ok(true) => {
+                        let at = Instant::now();
                         let levels: Vec<u8> = raw.iter().map(|&v| gray4::level(v)).collect();
                         let mut s = lock.lock().unwrap();
-                        s.frame = Some((generation, levels));
+                        s.frame = Some((generation, levels, at));
                         s.fresh = true;
                         cv.notify_all();
                     }
@@ -116,7 +154,7 @@ impl Streamer {
             let mut last: Option<(u64, Vec<u8>)> = None;
             let mut id = 0u32;
             loop {
-                let (generation, frame) = {
+                let (generation, frame, captured) = {
                     let mut s = lock.lock().unwrap();
                     while !(s.stop || (s.fresh && s.acked)) {
                         s = cv.wait(s).unwrap();
@@ -139,7 +177,14 @@ impl Streamer {
                 let packed = gray4::pack(&frame, w, x, y, rw, rh);
                 let data = lz4_flex::block::compress_prepend_size(&packed);
                 id = id.wrapping_add(1);
-                lock.lock().unwrap().acked = false;
+                {
+                    let mut s = lock.lock().unwrap();
+                    s.acked = false;
+                    s.in_flight = Some((id, captured, data.len()));
+                    if let Some(st) = &mut s.stats {
+                        st.pixels += rw * rh;
+                    }
+                }
                 let msg = Msg::Rect { id, x: x as u16, y: y as u16, w: rw as u16, h: rh as u16, data };
                 if send(&msg).is_err() {
                     return;
@@ -160,9 +205,17 @@ impl Streamer {
         cv.notify_all();
     }
 
-    pub fn ack(&self) {
+    pub fn ack(&self, id: u32) {
         let (lock, cv) = &*self.shared;
-        lock.lock().unwrap().acked = true;
+        let mut s = lock.lock().unwrap();
+        if let Some((sent, captured, bytes)) = s.in_flight.take() {
+            if sent == id {
+                if let Some(st) = &mut s.stats {
+                    st.record(captured.elapsed(), bytes);
+                }
+            }
+        }
+        s.acked = true;
         cv.notify_all();
     }
 

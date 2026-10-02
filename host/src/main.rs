@@ -22,7 +22,8 @@ const USAGE: &str = "usage: remvnc-host [--ssh root@10.11.99.1] [--remote /home/
                    [--deploy <local remvnc binary>] [--stats] [--ssh-only] [--list-screens]
                    [--no-display]
                    [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
-                   [--palm-major N] [--pen-grace-ms N] [--log-touch]";
+                   [--palm-major N] [--pen-grace-ms N] [--log-touch]
+                   [--fast-mode M] [--settle-mode M] [--settle-ms N]";
 
 struct Args {
     ssh: String,
@@ -71,7 +72,7 @@ fn parse() -> Result<Args, String> {
                 }
                 std::process::exit(0);
             }
-            "--rotate" | "--touch" | "--pen" | "--palm-major" | "--pen-grace-ms" => {
+            "--rotate" | "--touch" | "--pen" | "--palm-major" | "--pen-grace-ms" | "--fast-mode" | "--settle-mode" | "--settle-ms" => {
                 let v = value()?;
                 a.run_args.extend([flag, v]);
             }
@@ -230,7 +231,7 @@ fn run() -> Result<(), String> {
                 }
                 if args.display {
                     let w = writer.clone();
-                    let s = stream::Streamer::start(logical, rotation, Box::new(move |m| send(&w, m)));
+                    let s = stream::Streamer::start(logical, rotation, args.stats, Box::new(move |m| send(&w, m)));
                     s.set_source(Some(capture::Source::Virtual));
                     streamer = Some(s);
                 }
@@ -277,9 +278,9 @@ fn run() -> Result<(), String> {
                     remap(&mut devices, &screens, &target);
                 }
             }
-            Ok(Some(Msg::Ack { .. })) => {
+            Ok(Some(Msg::Ack { id })) => {
                 if let Some(s) = &streamer {
-                    s.ack();
+                    s.ack(id);
                 }
             }
             Ok(Some(Msg::Pong { host_us, tablet_us })) => stats.pong(host_us, tablet_us),

@@ -40,6 +40,10 @@ pub enum Mode {
 
 impl Mode {
     pub const ALL: [Mode; 6] = [Mode::Pen, Mode::Mono, Mode::Animation, Mode::Ui, Mode::Content, Mode::Sleep];
+
+    pub fn parse(s: &str) -> Option<Mode> {
+        Mode::ALL.into_iter().find(|m| format!("{m:?}").eq_ignore_ascii_case(s))
+    }
 }
 
 // QImage::Format values we know how to address.

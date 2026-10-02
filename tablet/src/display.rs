@@ -6,13 +6,25 @@ use crate::epd::{Epd, ImageInfo, Mode};
 use remvnc_proto::gray4;
 use std::time::{Duration, Instant};
 
-/// How long an area must be still before its quality refresh.
-const SETTLE: Duration = Duration::from_millis(450);
+/// Refresh modes and timing for streamed content.
+#[derive(Debug, Clone, Copy)]
+pub struct Refresh {
+    /// Used for every update as it arrives. `Pen` is the engine's
+    /// lowest-latency (black/white) mode.
+    pub fast: Mode,
+    /// Used once an area stopped changing, to restore grays and clear
+    /// ghosting. `Ui` doesn't flash, so it never blocks for long; `Content`
+    /// is a flashing full-quality refresh.
+    pub settle: Mode,
+    /// How long an area must be still before its settle refresh.
+    pub settle_after: Duration,
+}
 
-/// Refresh used while content changes.
-const FAST: Mode = Mode::Animation;
-/// Refresh once it settles.
-const QUALITY: Mode = Mode::Content;
+impl Default for Refresh {
+    fn default() -> Self {
+        Self { fast: Mode::Pen, settle: Mode::Ui, settle_after: Duration::from_millis(1000) }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -70,6 +82,7 @@ impl Decoder {
 
 /// Refresh scheduling for screen updates. Runs on the input thread.
 pub struct Display {
+    refresh: Refresh,
     /// Updated in fast mode, waiting for a quality refresh.
     unsettled: Option<Rect>,
     last_update: Instant,
@@ -77,13 +90,13 @@ pub struct Display {
 }
 
 impl Display {
-    pub fn new() -> Self {
-        Self { unsettled: None, last_update: Instant::now(), frames: 0 }
+    pub fn new(refresh: Refresh) -> Self {
+        Self { refresh, unsettled: None, last_update: Instant::now(), frames: 0 }
     }
 
     /// Refreshes freshly written pixels in the fast mode.
     pub fn show(&mut self, epd: &Epd, r: Rect) {
-        epd.swap(r.x, r.y, r.w, r.h, FAST, 0);
+        epd.swap(r.x, r.y, r.w, r.h, self.refresh.fast, 0);
         self.unsettled = Some(self.unsettled.map_or(r, |u| u.union(r)));
         self.last_update = Instant::now();
         self.frames += 1;
@@ -92,8 +105,8 @@ impl Display {
     /// Gives settled areas their quality refresh. Call regularly.
     pub fn tick(&mut self, epd: &Epd) {
         if let Some(u) = self.unsettled {
-            if self.last_update.elapsed() >= SETTLE {
-                epd.swap(u.x, u.y, u.w, u.h, QUALITY, 0);
+            if self.last_update.elapsed() >= self.refresh.settle_after {
+                epd.swap(u.x, u.y, u.w, u.h, self.refresh.settle, 0);
                 self.unsettled = None;
             }
         }
@@ -101,6 +114,6 @@ impl Display {
 
     /// Milliseconds until `tick` has work, for the poll timeout.
     pub fn next_tick_ms(&self) -> Option<i32> {
-        self.unsettled.map(|_| SETTLE.saturating_sub(self.last_update.elapsed()).as_millis() as i32 + 1)
+        self.unsettled.map(|_| self.refresh.settle_after.saturating_sub(self.last_update.elapsed()).as_millis() as i32 + 1)
     }
 }

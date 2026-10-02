@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 const USAGE: &str = "usage:
   remvnc run [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
              [--palm-major N] [--pen-grace-ms N] [--log-touch] [--ssh-only]
+             [--fast-mode M] [--settle-mode M] [--settle-ms N]
+             (modes: pen, mono, animation, ui, content)
       Forward pen/touch to remvnc-host (on stdout, or a direct socket it
       is told about) until the X is held.
   remvnc probe     Draw test patterns for a few seconds.
@@ -62,6 +64,7 @@ fn main() {
 }
 
 struct RunArgs {
+    refresh: display::Refresh,
     rotation: u16,
     touch: TouchMode,
     pen: PenMode,
@@ -72,6 +75,7 @@ struct RunArgs {
 fn parse_run(args: &[String]) -> Result<RunArgs, String> {
     let (mut rotation, mut touch, mut palm, mut ssh_only) = (90, TouchMode::Touchpad, PalmConfig::default(), false);
     let mut pen = PenMode::Tablet;
+    let mut refresh = display::Refresh::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || it.next().ok_or(format!("{a} needs a value"));
@@ -93,6 +97,11 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                     _ => return Err("--pen: tablet or mouse".into()),
                 }
             }
+            "--fast-mode" => refresh.fast = Mode::parse(&value()?).ok_or("--fast-mode: unknown mode")?,
+            "--settle-mode" => refresh.settle = Mode::parse(&value()?).ok_or("--settle-mode: unknown mode")?,
+            "--settle-ms" => {
+                refresh.settle_after = Duration::from_millis(value()?.parse().map_err(|_| "--settle-ms: a number")?)
+            }
             "--palm-major" => palm.max_major = value()?.parse().map_err(|_| "--palm-major: a number")?,
             "--pen-grace-ms" => palm.pen_grace_us = value()?.parse::<u64>().map_err(|_| "--pen-grace-ms: a number")? * 1000,
             "--log-touch" => palm.log = true,
@@ -100,7 +109,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             _ => return Err(format!("unknown argument {a}\n{USAGE}")),
         }
     }
-    Ok(RunArgs { rotation, touch, pen, palm, ssh_only })
+    Ok(RunArgs { refresh, rotation, touch, pen, palm, ssh_only })
 }
 
 /// Pumps Qt events for `ms`; false if we were asked to quit.
@@ -141,7 +150,7 @@ fn pen_label(m: PenMode) -> &'static str {
 }
 
 fn run(args: RunArgs) -> Result<(), String> {
-    let RunArgs { rotation, touch: touch_mode, pen: pen_mode, palm, ssh_only } = args;
+    let RunArgs { refresh, rotation, touch: touch_mode, pen: pen_mode, palm, ssh_only } = args;
     // Before pausing xochitl: the host must answer within a few seconds.
     let mut link = link::Link::open(ssh_only);
     let (session, epd) = Session::begin(0)?;
@@ -158,7 +167,7 @@ fn run(args: RunArgs) -> Result<(), String> {
     let mut target: u8 = 0;
     // View labels from the host; the screen button cycles through them.
     let mut views: Vec<String> = vec!["ALL".into()];
-    let mut display = display::Display::new();
+    let mut display = display::Display::new(refresh);
     ui.set_label(Button::Screen, &views[0]);
     ui.set_label(Button::Mode, mode_label(touch_mode));
     ui.set_label(Button::Pen, pen_label(pen_mode));
@@ -246,6 +255,8 @@ fn run(args: RunArgs) -> Result<(), String> {
                     }
                     link::Incoming::Msg(_) => {}
                     link::Incoming::Decoded { id, rect } => {
+                        // Ack first: the host prepares the next update while we refresh.
+                        alive &= Msg::Ack { id }.write_to(&mut link.out).and_then(|_| link.out.flush()).is_ok();
                         match rect {
                             Ok(r) => {
                                 if r.intersects(ui.bar_phys()) {
@@ -255,7 +266,6 @@ fn run(args: RunArgs) -> Result<(), String> {
                             }
                             Err(e) => log!("remvnc: {e}"),
                         }
-                        alive &= Msg::Ack { id }.write_to(&mut link.out).is_ok();
                     }
                     link::Incoming::Closed => closed = true,
                 }

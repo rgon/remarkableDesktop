@@ -82,9 +82,13 @@ impl Capture {
             Source::Monitor(_) => String::new(),
         };
         let pipeline = format!(
-            "pipewiresrc path={node} always-copy=true ! {source_caps}videoconvert ! videoscale add-borders=true ! \
+            // Leaky single-buffer queues: when we are busy, stale frames are
+            // dropped instead of queued (latency over completeness).
+            "pipewiresrc path={node} always-copy=true ! {source_caps}queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! \
+             videoconvert ! videoscale add-borders=true ! \
              video/x-raw,format=GRAY8,width={lw},height={lh},pixel-aspect-ratio=1/1 ! videoflip method={} ! \
-             video/x-raw,format=GRAY8,width={pw},height={ph} ! fdsink fd=1 sync=false",
+             video/x-raw,format=GRAY8,width={pw},height={ph} ! \
+             queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! fdsink fd=1 sync=false",
             flip(rotation)
         );
         let mut gst = Command::new("gst-launch-1.0")
