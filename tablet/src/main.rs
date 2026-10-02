@@ -1,3 +1,12 @@
+/// Logs to stderr, ignoring failures: stderr is the SSH channel, which may
+/// already be gone while we restore the tablet (eprintln! would panic).
+macro_rules! log {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($t)*);
+    }};
+}
+
 mod epd;
 mod gfx;
 mod input;
@@ -46,7 +55,7 @@ fn main() {
         _ => Err(USAGE.into()),
     };
     if let Err(e) = result {
-        eprintln!("remvnc: {e}");
+        log!("remvnc: {e}");
         std::process::exit(1);
     }
 }
@@ -109,7 +118,7 @@ fn wait(epd: &Epd, ms: u64) -> bool {
 fn realtime_priority() {
     let param = libc::sched_param { sched_priority: 20 };
     if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) } != 0 {
-        eprintln!("remvnc: SCHED_FIFO: {}", std::io::Error::last_os_error());
+        log!("remvnc: SCHED_FIFO: {}", std::io::Error::last_os_error());
     }
 }
 
@@ -204,7 +213,7 @@ fn run(args: RunArgs) -> Result<(), String> {
         if let Some(f) = files[2].as_mut() {
             let power = input::read_events(f).unwrap_or_default();
             if power.iter().any(|e| e.kind == input::EV_KEY && e.code == input::KEY_POWER && e.value == 1) {
-                eprintln!("remvnc: power button pressed");
+                log!("remvnc: power button pressed");
                 done = true;
             }
         }
@@ -212,7 +221,7 @@ fn run(args: RunArgs) -> Result<(), String> {
             // ssh closed under a direct link.
             let mut b = [0u8; 64];
             if unsafe { libc::read(0, b.as_mut_ptr().cast(), b.len()) } <= 0 {
-                eprintln!("remvnc: ssh session ended");
+                log!("remvnc: ssh session ended");
                 break;
             }
         }
@@ -227,14 +236,14 @@ fn run(args: RunArgs) -> Result<(), String> {
                             }
                             Msg::Screens { names } => {
                                 screens = names.len().min(9) as u8;
-                                eprintln!("remvnc: host screens: {}", names.join(", "));
+                                log!("remvnc: host screens: {}", names.join(", "));
                             }
                             _ => {}
                         }
                     }
                 }
                 Ok(None) | Err(_) => {
-                    eprintln!("remvnc: host went away");
+                    log!("remvnc: host went away");
                     break;
                 }
             }
@@ -252,7 +261,7 @@ fn run(args: RunArgs) -> Result<(), String> {
                         hold = Some((b, since, true));
                         match b {
                             Button::Close => {
-                                eprintln!("remvnc: close button held");
+                                log!("remvnc: close button held");
                                 done = true;
                             }
                             Button::Mode => {
@@ -266,7 +275,7 @@ fn run(args: RunArgs) -> Result<(), String> {
                                         alive &= Msg::Frame { device: input::TOUCH_ID, time_us: now, events: lift }.write_to(&mut link.out).is_ok();
                                     }
                                     alive &= Msg::Device(t.device()).write_to(&mut link.out).is_ok();
-                                    eprintln!("remvnc: touch is now {next:?}");
+                                    log!("remvnc: touch is now {next:?}");
                                     ui.set_label(b, mode_label(next));
                                 }
                             }
@@ -281,7 +290,7 @@ fn run(args: RunArgs) -> Result<(), String> {
                                         alive &= Msg::Frame { device: input::PEN_ID, time_us: now, events: release }.write_to(&mut link.out).is_ok();
                                     }
                                     alive &= Msg::Device(p.device()).write_to(&mut link.out).is_ok();
-                                    eprintln!("remvnc: pen is now {next:?}");
+                                    log!("remvnc: pen is now {next:?}");
                                     ui.set_label(b, pen_label(next));
                                 }
                             }
@@ -313,7 +322,7 @@ fn run(args: RunArgs) -> Result<(), String> {
         }
     }
     if !alive {
-        eprintln!("remvnc: lost the host connection");
+        log!("remvnc: lost the host connection");
     }
     let _ = Msg::Bye.write_to(&mut link.out).and_then(|_| link.out.flush());
     drop(link);
@@ -337,7 +346,7 @@ fn probe() -> Result<(), String> {
             .draw(&mut Scaled { target: &mut canvas, factor: 3 });
         let t = Instant::now();
         canvas.flush(mode);
-        eprintln!("remvnc: swap {mode:?} returned in {:?}", t.elapsed());
+        log!("remvnc: swap {mode:?} returned in {:?}", t.elapsed());
         ok = wait(&epd, 1200);
     }
     drop(canvas);

@@ -106,7 +106,7 @@ unsafe fn forward_ctor(
         // From the executable, RTLD_NEXT lands on libQt6Gui's definition.
         let sym = unsafe { libc::dlvsym(libc::RTLD_NEXT, name.as_ptr(), c"Qt_6".as_ptr()) };
         if sym.is_null() {
-            eprintln!("remvnc: cannot resolve {name:?}");
+            log!("remvnc: cannot resolve {name:?}");
             std::process::abort();
         }
         sym as usize

@@ -2,19 +2,19 @@
 //!
 //! Layers of recovery, from normal to worst case:
 //! 1. Clean exit: we restore xochitl's screen, exit, and the guardian resumes it.
-//! 2. We crash or get killed: the guardian sees EOF without "restored" and
-//!    resumes + restarts xochitl so it repaints.
+//! 2. We crash or get killed: the guardian sees us exit without the restored
+//!    marker and resumes + restarts xochitl so it repaints.
 //! 3. Everything dies: nobody pets xochitl's systemd watchdog (60 s), so
 //!    systemd restarts it.
 //! 4. Manual: `remvnc restore`.
 
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub fn xochitl_pid() -> Option<i32> {
@@ -90,43 +90,65 @@ pub fn private_tmp() -> io::Result<()> {
     Ok(())
 }
 
-/// Handle to the guardian process. Dropping it without `restored()` makes the
-/// guardian restart xochitl.
+/// Handle to the guardian. Unless `restored()` was called before this
+/// process exits, the guardian restarts xochitl so it repaints.
 pub struct Guardian {
-    _child: Child,
-    stdin: Option<ChildStdin>,
+    marker: String,
+}
+
+fn marker_path(parent: i32) -> String {
+    format!("/run/remvnc/restored-{parent}")
 }
 
 impl Guardian {
-    /// Spawns `remvnc guardian`, detached into its own session so SSH
-    /// hang-ups and Ctrl-C don't reach it. Call before loading Qt.
+    /// Starts `remvnc guardian` as a transient systemd unit, so it outlives
+    /// the SSH session and logs to the journal. Falls back to a detached
+    /// child. Call before loading Qt.
     pub fn spawn(xochitl: i32, deadline_secs: u64) -> io::Result<Self> {
-        let mut child = unsafe {
-            Command::new(std::env::current_exe()?)
-                .args(["guardian", &xochitl.to_string(), &deadline_secs.to_string(), &std::process::id().to_string()])
-                .stdin(Stdio::piped())
-                .pre_exec(|| {
-                    libc::setsid();
-                    Ok(())
-                })
-                .spawn()?
-        };
-        let stdin = child.stdin.take();
-        Ok(Self { _child: child, stdin })
+        let me = std::process::id();
+        let exe = std::env::current_exe()?;
+        let args = ["guardian".to_string(), xochitl.to_string(), deadline_secs.to_string(), me.to_string()];
+        let _ = fs::remove_file(marker_path(me as i32));
+        let unit = format!("--unit=remvnc-guardian-{me}");
+        let systemd = Command::new("systemd-run")
+            .args(["--quiet", "--collect", &unit])
+            .arg(&exe)
+            .args(&args)
+            .stdout(Stdio::null())
+            .status();
+        if !matches!(systemd, Ok(s) if s.success()) {
+            log!("remvnc: systemd-run unavailable, guardian runs as a child");
+            unsafe {
+                Command::new(&exe)
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .pre_exec(|| {
+                        libc::setsid();
+                        Ok(())
+                    })
+                    .spawn()?;
+            }
+        }
+        Ok(Self { marker: marker_path(me as i32) })
     }
 
     /// Tells the guardian the screen is restored: it only needs to resume xochitl.
     pub fn restored(&mut self) {
-        use std::io::Write;
-        if let Some(s) = self.stdin.as_mut() {
-            let _ = s.write_all(b"restored\n");
-        }
+        let _ = fs::create_dir_all("/run/remvnc");
+        let _ = fs::write(&self.marker, b"");
     }
 }
 
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
 /// `remvnc guardian <xochitl pid> <deadline secs, 0 = none> <parent pid>`.
-/// Pets xochitl's watchdog while the parent lives; resumes xochitl when the
-/// parent's end of the pipe closes.
+/// Pets xochitl's watchdog while the parent lives; once the parent is gone
+/// (and its e-ink engine with it), resumes xochitl, restarting it unless the
+/// parent restored the screen.
 pub fn run_guardian(xochitl: i32, deadline_secs: u64, parent: i32) {
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
@@ -134,34 +156,26 @@ pub fn run_guardian(xochitl: i32, deadline_secs: u64, parent: i32) {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
     let start = Instant::now();
-    let stdin = io::stdin();
-    let fd = stdin.as_raw_fd();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut restored = false;
-    loop {
-        let _ = notify_as(xochitl, "WATCHDOG=1");
+    let mut last_pet: Option<Instant> = None;
+    while alive(parent) {
+        if last_pet.is_none_or(|t| t.elapsed() >= Duration::from_secs(15)) {
+            let _ = notify_as(xochitl, "WATCHDOG=1");
+            last_pet = Some(Instant::now());
+        }
         if deadline_secs > 0 && start.elapsed() > Duration::from_secs(deadline_secs) {
-            eprintln!("remvnc guardian: deadline reached, killing {parent}");
+            log!("remvnc guardian: deadline reached, killing {parent}");
             let _ = signal(parent, libc::SIGKILL);
-            break;
         }
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        if unsafe { libc::poll(&mut pfd, 1, 15_000) } <= 0 {
-            continue;
-        }
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) if line.trim() == "restored" => restored = true,
-            Ok(_) => {}
-        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    // Drain in case the deadline path left the parent writing.
-    let _ = reader.read_to_end(&mut Vec::new());
+    let marker = marker_path(parent);
+    let restored = fs::remove_file(&marker).is_ok();
     let _ = signal(xochitl, libc::SIGCONT);
-    if !restored {
-        eprintln!("remvnc guardian: unclean exit, restarting xochitl");
+    if restored {
+        log!("remvnc guardian: screen restored, resumed xochitl");
+    } else {
         restart_xochitl();
+        log!("remvnc guardian: no restored screen, restarted xochitl");
     }
 }
 
@@ -255,6 +269,24 @@ fn heap_mappings(pid: &str) -> Vec<Mapping> {
     mappings(pid).into_iter().filter(|m| m.perms.starts_with("rw") && (m.path.is_empty() || m.path == "[heap]")).collect()
 }
 
+/// Our own image's QImageData header words from `width` on, for comparing
+/// against xochitl's candidates.
+pub fn own_header(pixels: usize, w: u32, h: u32, depth: u32) -> Vec<u32> {
+    let Ok(mem) = fs::File::open("/proc/self/mem") else { return vec![] };
+    for m in heap_mappings("self") {
+        let mut buf = vec![0u8; m.end - m.start];
+        if mem.read_exact_at(&mut buf, m.start as u64).is_err() {
+            continue;
+        }
+        for (off, v) in words(&buf) {
+            if v == w && header_at(&buf, off, w, h, depth) && words(&buf[off..(off + 64).min(buf.len())]).any(|(_, p)| p as usize == pixels) {
+                return words(&buf[off..(off + 96).min(buf.len())]).map(|(_, v)| v).collect();
+            }
+        }
+    }
+    vec![]
+}
+
 /// Learns the `QImageData` layout from one of our own images.
 pub fn learn_layout(pixels: usize, w: u32, h: u32, depth: u32) -> io::Result<ImageDataLayout> {
     let mem = fs::File::open("/proc/self/mem")?;
@@ -275,8 +307,16 @@ pub fn learn_layout(pixels: usize, w: u32, h: u32, depth: u32) -> io::Result<Ima
 }
 
 /// Finds xochitl's screen-sized images of `depth` bits and copies their pixels.
-/// Returns (data address, pixels) for each match.
-pub fn snapshot_images(xochitl: i32, layout: ImageDataLayout, w: u32, h: u32, depth: u32, len: usize) -> io::Result<Vec<(usize, Vec<u8>)>> {
+/// Returns (data address, QImageData header words from `width` on, pixels)
+/// for each match.
+pub fn snapshot_images(
+    xochitl: i32,
+    layout: ImageDataLayout,
+    w: u32,
+    h: u32,
+    depth: u32,
+    len: usize,
+) -> io::Result<Vec<(usize, Vec<u32>, Vec<u8>)>> {
     let mem = fs::File::open(format!("/proc/{xochitl}/mem"))?;
     let mut out = vec![];
     let mut chunk = vec![0u8; 1 << 20];
@@ -294,7 +334,8 @@ pub fn snapshot_images(xochitl: i32, layout: ImageDataLayout, w: u32, h: u32, de
                     let data = u32::from_le_bytes(buf[off + layout.data_from_width..][..4].try_into().unwrap()) as usize;
                     let mut pixels = vec![0u8; len];
                     if data != 0 && mem.read_exact_at(&mut pixels, data as u64).is_ok() {
-                        out.push((data, pixels));
+                        let header = words(&buf[off..(off + 96).min(n)]).map(|(_, v)| v).collect();
+                        out.push((data, header, pixels));
                     }
                 }
             }

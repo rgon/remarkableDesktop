@@ -424,7 +424,7 @@ impl Touch {
         for code in [ABS_MT_PRESSURE, ABS_MT_TOUCH_MAJOR, ABS_MT_TOUCH_MINOR] {
             let i = abs_info(file, code)?;
             if palm.log {
-                eprintln!("remvnc: touch axis {code:#x}: {i:?}");
+                log!("remvnc: touch axis {code:#x}: {i:?}");
             }
             abs.push(Abs { code, min: i.min, max: i.max, resolution: 0 });
         }
@@ -606,7 +606,7 @@ impl Touch {
 
             if s.id < 0 {
                 if self.palm.log && s.start_us > 0 {
-                    eprintln!(
+                    log!(
                         "remvnc: touch slot {i}: {:?}, peak major {} minor {} pressure {}, tool {}, {} ms",
                         s.owner,
                         s.peak[0],

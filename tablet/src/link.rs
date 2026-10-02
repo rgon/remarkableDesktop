@@ -26,7 +26,7 @@ impl Link {
                     let out = tcp.try_clone().expect("clone tcp socket");
                     return Link { out: BufWriter::new(Box::new(out)), tcp: Some(tcp), buf: vec![] };
                 }
-                Err(e) => eprintln!("remvnc: direct link unavailable ({e}), using ssh"),
+                Err(e) => log!("remvnc: direct link unavailable ({e}), using ssh"),
             }
         }
         Link { out: BufWriter::new(Box::new(io::stdout())), tcp: None, buf: vec![] }
@@ -100,7 +100,7 @@ fn direct() -> Result<TcpStream, String> {
                 tcp.set_read_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
                 let mut got = [0u8; 16];
                 if (&tcp).read_exact(&mut got).is_err() || got != token {
-                    eprintln!("remvnc: rejected direct connection from {peer}: bad token");
+                    log!("remvnc: rejected direct connection from {peer}: bad token");
                     continue;
                 }
                 tcp.set_nodelay(true).map_err(|e| e.to_string())?;
@@ -108,7 +108,7 @@ fn direct() -> Result<TcpStream, String> {
                 tcp.set_nonblocking(true).map_err(|e| e.to_string())?;
                 return Ok(tcp);
             }
-            Ok((_, peer)) => eprintln!("remvnc: rejected direct connection from {peer}"),
+            Ok((_, peer)) => log!("remvnc: rejected direct connection from {peer}"),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
             Err(e) => return Err(e.to_string()),
         }

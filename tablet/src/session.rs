@@ -48,15 +48,15 @@ impl Session {
             let path = format!("/dev/input/event{i}");
             let grabbed = Grabbed::open(&path).inspect(|g| {
                 if let Err(e) = crate::input::use_monotonic_clock(&g.file) {
-                    eprintln!("remvnc: {path}: monotonic timestamps: {e}");
+                    log!("remvnc: {path}: monotonic timestamps: {e}");
                 }
             });
             match grabbed {
                 Ok(g) if g.name.contains("Wacom") => inputs.pen = Some(g),
                 Ok(g) if g.name.contains("pt_mt") => inputs.touch = Some(g),
                 Ok(g) if g.name.contains("powerkey") => inputs.power = Some(g),
-                Ok(g) => eprintln!("remvnc: ignoring {} ({})", g.path, g.name),
-                Err(e) => eprintln!("remvnc: grab {path}: {e}"),
+                Ok(g) => log!("remvnc: ignoring {} ({})", g.path, g.name),
+                Err(e) => log!("remvnc: grab {path}: {e}"),
             }
         }
 
@@ -69,27 +69,27 @@ impl Session {
         let saved = match takeover::learn_layout(epd.fb.pixels as usize, w, h, 32)
             .and_then(|layout| takeover::snapshot_images(xochitl, layout, w, h, 32, epd.fb.len()))
         {
-            Ok(mut found) if found.len() == 1 => Some(found.remove(0).1),
+            Ok(mut found) if found.len() == 1 => Some(found.remove(0).2),
             // Copies of the same frame (xochitl keeps more than one) are all fine.
-            Ok(mut found) if found.len() > 1 && found.iter().all(|f| f.1 == found[0].1) => {
-                eprintln!("remvnc: {} identical xochitl frames", found.len());
-                Some(found.remove(0).1)
+            Ok(mut found) if found.len() > 1 && found.iter().all(|f| f.2 == found[0].2) => {
+                log!("remvnc: {} identical xochitl frames", found.len());
+                Some(found.remove(0).2)
             }
             Ok(found) => {
-                let differing = found.iter().filter(|f| f.1 != found[0].1).count();
-                eprintln!(
-                    "remvnc: {} candidate xochitl frames ({differing} differ from the first) at {:x?}; will restart it on exit",
-                    found.len(),
-                    found.iter().map(|f| f.0).collect::<Vec<_>>()
-                );
+                log!("remvnc: {} differing xochitl frames; will restart it on exit", found.len());
+                // Diagnostics for telling the engine's frame apart next time.
+                log!("remvnc:   ours   {:08x?}", takeover::own_header(epd.fb.pixels as usize, w, h, 32));
+                for (addr, header, _) in &found {
+                    log!("remvnc:   {addr:08x} {header:08x?}");
+                }
                 None
             }
             Err(e) => {
-                eprintln!("remvnc: snapshot: {e}; will restart xochitl on exit");
+                log!("remvnc: snapshot: {e}; will restart xochitl on exit");
                 None
             }
         };
-        eprintln!("remvnc: paused xochitl ({xochitl}), engine up in {:?}, {} buffers", started.elapsed(), epd.candidates.len());
+        log!("remvnc: paused xochitl ({xochitl}), engine up in {:?}, {} buffers", started.elapsed(), epd.candidates.len());
         Ok((Session { guardian, inputs, saved, started }, epd))
     }
 
@@ -106,7 +106,7 @@ impl Session {
             }
             self.guardian.restored();
         }
-        eprintln!("remvnc: xochitl was paused for {:?}", self.started.elapsed());
+        log!("remvnc: xochitl was paused for {:?}", self.started.elapsed());
         drop(self.inputs);
         // The vendor engine has no clean shutdown; let process exit stop it.
         std::process::exit(0);
