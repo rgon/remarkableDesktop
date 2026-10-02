@@ -154,7 +154,7 @@ case $cmd in
         if running; then echo "remdesktop: running"; else echo "remdesktop: not running"; fi
         ;;
     -h | --help | help)
-        sed -n '2,21p' "$0"
+        sed -n '2,/^set /{/^#/p}' "$0"
         ;;
     "" | -*)
         build
@@ -162,7 +162,7 @@ case $cmd in
         client "$@"
         ;;
     *)
-        sed -n '2,21p' "$0" >&2
+        sed -n '2,/^set /{/^#/p}' "$0" >&2
         exit 1
         ;;
 esac
