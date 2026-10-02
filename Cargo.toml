@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["tablet"]
+members = ["proto", "tablet", "host"]
 
 [profile.release]
 opt-level = "s"
