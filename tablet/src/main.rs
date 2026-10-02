@@ -7,6 +7,7 @@ macro_rules! log {
     }};
 }
 
+mod display;
 mod epd;
 mod gfx;
 mod input;
@@ -139,10 +140,6 @@ fn pen_label(m: PenMode) -> &'static str {
     }
 }
 
-fn screen_label(target: u8) -> String {
-    if target == 0 { "ALL".into() } else { target.to_string() }
-}
-
 fn run(args: RunArgs) -> Result<(), String> {
     let RunArgs { rotation, touch: touch_mode, pen: pen_mode, palm, ssh_only } = args;
     // Before pausing xochitl: the host must answer within a few seconds.
@@ -159,8 +156,10 @@ fn run(args: RunArgs) -> Result<(), String> {
 
     let mut ui = ui::Ui::new(&epd, rotation);
     let mut target: u8 = 0;
-    let mut screens: u8 = 0;
-    ui.set_label(Button::Screen, &screen_label(target));
+    // View labels from the host; the screen button cycles through them.
+    let mut views: Vec<String> = vec!["ALL".into()];
+    let mut display = display::Display::new();
+    ui.set_label(Button::Screen, &views[0]);
     ui.set_label(Button::Mode, mode_label(touch_mode));
     ui.set_label(Button::Pen, pen_label(pen_mode));
     ui.draw_home();
@@ -185,7 +184,10 @@ fn run(args: RunArgs) -> Result<(), String> {
 
     while alive && !done && !quitting() {
         let mut pfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
-        let timeout = if hold.is_some() { 30 } else { QT_EVERY.as_millis() as i32 };
+        let mut timeout = if hold.is_some() { 30 } else { QT_EVERY.as_millis() as i32 };
+        if let Some(t) = display.next_tick_ms() {
+            timeout = timeout.min(t);
+        }
         unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, timeout) };
 
         // Pen first: its hover state gates touches in the same wake-up.
@@ -234,9 +236,24 @@ fn run(args: RunArgs) -> Result<(), String> {
                                 let pong = Msg::Pong { host_us, tablet_us: remvnc_proto::monotonic_us() };
                                 alive &= pong.write_to(&mut link.out).is_ok();
                             }
-                            Msg::Screens { names } => {
-                                screens = names.len().min(9) as u8;
-                                log!("remvnc: host screens: {}", names.join(", "));
+                            Msg::Screens { names } if !names.is_empty() => {
+                                log!("remvnc: host views: {}", names.join(", "));
+                                views = names;
+                                target = 0;
+                                ui.set_label(Button::Screen, &views[0]);
+                            }
+                            Msg::Rect { id, x, y, w, h, data } => {
+                                let r = display::Rect { x: x as i32, y: y as i32, w: w as i32, h: h as i32 };
+                                match display.write(&epd, r, &data) {
+                                    Ok(r) => {
+                                        if r.intersects(ui.bar_phys()) {
+                                            ui.redraw_buttons();
+                                        }
+                                        display.show(&epd, r);
+                                    }
+                                    Err(e) => log!("remvnc: {e}"),
+                                }
+                                alive &= Msg::Ack { id }.write_to(&mut link.out).is_ok();
                             }
                             _ => {}
                         }
@@ -295,9 +312,11 @@ fn run(args: RunArgs) -> Result<(), String> {
                                 }
                             }
                             Button::Screen => {
-                                target = (target + 1) % (screens + 1);
-                                alive &= Msg::Target { index: target }.write_to(&mut link.out).is_ok();
-                                ui.set_label(b, &screen_label(target));
+                                if views.len() > 1 {
+                                    target = (target + 1) % views.len() as u8;
+                                    alive &= Msg::Target { index: target }.write_to(&mut link.out).is_ok();
+                                    ui.set_label(b, &views[target as usize]);
+                                }
                             }
                         }
                         alive &= link.out.flush().is_ok();
@@ -316,6 +335,7 @@ fn run(args: RunArgs) -> Result<(), String> {
             }
             (None, None) => {}
         }
+        display.tick(&epd);
         if last_qt.elapsed() >= QT_EVERY {
             epd.process_events(0);
             last_qt = Instant::now();

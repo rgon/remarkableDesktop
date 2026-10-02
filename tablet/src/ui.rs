@@ -17,7 +17,7 @@ pub struct Rotated<'a, T> {
 }
 
 impl<T: OriginDimensions> Rotated<'_, T> {
-    fn phys(&self, p: Point) -> Point {
+    pub fn phys(&self, p: Point) -> Point {
         let s = self.target.size();
         let (w, h) = (s.width as i32, s.height as i32);
         match self.rotation {
@@ -112,6 +112,26 @@ impl<'a> Ui<'a> {
 
     fn target(&mut self) -> Rotated<'_, Canvas<'a>> {
         Rotated { target: &mut self.canvas, rotation: self.rotation }
+    }
+
+    /// The panel (portrait) area covered by the buttons, so updates under it
+    /// know to redraw them.
+    pub fn bar_phys(&mut self) -> crate::display::Rect {
+        let first = self.buttons[0].rect.top_left;
+        let last = self.buttons[self.buttons.len() - 1].rect.top_left + Point::new(BUTTON as i32 - 1, BUTTON as i32 - 1);
+        let t = self.target();
+        let (a, b) = (t.phys(first), t.phys(last));
+        let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+        crate::display::Rect { x, y, w: (a.x - b.x).abs() + 1, h: (a.y - b.y).abs() + 1 }
+    }
+
+    /// Draws all buttons again (after screen content overwrote them).
+    pub fn redraw_buttons(&mut self) {
+        for b in Button::ALL {
+            let steps = self.buttons[b as usize].drawn.unwrap_or(0);
+            self.draw_button(b, steps);
+        }
+        self.canvas.flush(Mode::Ui);
     }
 
     /// The button under a logical pixel position (with a little slack).
