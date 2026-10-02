@@ -54,9 +54,9 @@ impl<T: DrawTarget<Color = Gray8, Error = Infallible> + OriginDimensions> DrawTa
     }
 }
 
-const BUTTON: u32 = 180;
-const MARGIN: i32 = 48;
-const GAP: i32 = 40;
+const BUTTON: u32 = 104;
+const MARGIN: i32 = 20;
+const GAP: i32 = 16;
 pub const HOLD_STEPS: u32 = 12;
 
 /// The hold-to-activate buttons, left to right along the top edge.
@@ -136,7 +136,7 @@ impl<'a> Ui<'a> {
 
     /// The button under a logical pixel position (with a little slack).
     pub fn button_at(&self, p: [i32; 2]) -> Option<Button> {
-        let slack = GAP / 2;
+        let slack = 14;
         Button::ALL.into_iter().find(|&b| {
             let r = self.buttons[b as usize].rect;
             let tl = r.top_left;
@@ -192,7 +192,7 @@ impl<'a> Ui<'a> {
         let slot = &mut self.buttons[b as usize];
         slot.drawn = Some(steps);
         let (r, label) = (slot.rect, slot.label.clone());
-        let frame = PrimitiveStyleBuilder::new().fill_color(Gray8::WHITE).stroke_color(Gray8::BLACK).stroke_width(8).build();
+        let frame = PrimitiveStyleBuilder::new().fill_color(Gray8::WHITE).stroke_color(Gray8::BLACK).stroke_width(5).build();
         let fill_h = BUTTON * steps.min(HOLD_STEPS) / HOLD_STEPS;
         // White ink over the fill once the button is mostly covered.
         let ink = if steps * 2 > HOLD_STEPS { Gray8::WHITE } else { Gray8::BLACK };
@@ -203,14 +203,14 @@ impl<'a> Ui<'a> {
             let _ = fill.into_styled(PrimitiveStyle::with_fill(Gray8::BLACK)).draw(&mut t);
         }
         if b == Button::Close {
-            let pad = 48;
+            let pad = BUTTON as i32 / 4;
             let (tl, br) = (r.top_left + Point::new(pad, pad), r.top_left + Point::new(BUTTON as i32 - pad, BUTTON as i32 - pad));
-            let cross = PrimitiveStyle::with_stroke(ink, 14);
+            let cross = PrimitiveStyle::with_stroke(ink, 9);
             let _ = Line::new(tl, br).into_styled(cross).draw(&mut t);
             let _ = Line::new(Point::new(br.x, tl.y), Point::new(tl.x, br.y)).into_styled(cross).draw(&mut t);
         } else {
-            // Up to 4 characters fit at 4x; longer labels drop to 3x.
-            let factor = if label.len() <= 4 { 4 } else { 3 };
+            // 10 px glyphs: 3 characters fit at 3x, up to 5 at 2x.
+            let factor = if label.len() <= 3 { 3 } else { 2 };
             let style = MonoTextStyle::new(&FONT_10X20, ink);
             let c = r.center();
             let _ = Text::with_alignment(&label, Point::new(c.x / factor, c.y / factor + 6), style, Alignment::Center)
