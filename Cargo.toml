@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["tablet"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
