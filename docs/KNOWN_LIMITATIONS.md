@@ -16,6 +16,19 @@ and leaves the tablet untouched. The `EPScreenMode` values are inferred from
 the library's metadata (Pen, Mono, Animation, UI, Content, Sleep) rather than
 documented.
 
+## reMarkable Paper Pro / Move (aarch64)
+An aarch64 build exists and `run.sh` picks it from the tablet's `uname -m`.
+The 64-bit details are handled: the `QImage` hook symbol (`…iix…`),
+24-byte input events, pointer-sized scanning when restoring the screen, and
+the Qt version, which is read at runtime. **It has never run on a Paper Pro.**
+Still rM2-specific:
+- input detection by device name (`Wacom`, `pt_mt`, `powerkey`);
+- pen and touch orientation, and the panel size in mm;
+- the meaning of `EPScreenMode` values (quill reports 0 fast mono, 1 fast
+  gray, 3/4/5 color on the Paper Pro);
+- the USB gadget path `g_ether` and the 10.11.99.x USB subnet;
+- pausing (rather than stopping) xochitl, which quill avoids on the Paper Pro.
+
 ## Handing the screen back to xochitl
 xochitl is paused (`SIGSTOP`) while remdesktop runs. On exit remdesktop copies
 xochitl's last frame back to the panel and resumes it. That frame is found by

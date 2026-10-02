@@ -260,6 +260,21 @@ pub struct ImageDataLayout {
     data_from_width: usize,
 }
 
+const PTR: usize = size_of::<usize>();
+
+/// A pointer-sized value at `at`, if in bounds.
+fn ptr_at(buf: &[u8], at: usize) -> Option<usize> {
+    let b = buf.get(at..at + PTR)?;
+    let mut v = [0u8; 8];
+    v[..PTR].copy_from_slice(b);
+    Some(u64::from_le_bytes(v) as usize)
+}
+
+/// Offset (from `start`, 4-byte steps, within 64 bytes) of a pointer equal to `target`.
+fn find_ptr(buf: &[u8], start: usize, target: usize) -> Option<usize> {
+    (0..64).step_by(4).find(|&d| ptr_at(buf, start + d) == Some(target))
+}
+
 fn words(buf: &[u8]) -> impl Iterator<Item = (usize, u32)> + '_ {
     buf.chunks_exact(4).enumerate().map(|(i, c)| (i * 4, u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
 }
@@ -284,7 +299,7 @@ pub fn own_header(pixels: usize, w: u32, h: u32, depth: u32) -> Vec<u32> {
             continue;
         }
         for (off, v) in words(&buf) {
-            if v == w && header_at(&buf, off, w, h, depth) && words(&buf[off..(off + 64).min(buf.len())]).any(|(_, p)| p as usize == pixels) {
+            if v == w && header_at(&buf, off, w, h, depth) && find_ptr(&buf, off, pixels).is_some() {
                 return words(&buf[off..(off + 96).min(buf.len())]).map(|(_, v)| v).collect();
             }
         }
@@ -302,7 +317,7 @@ pub fn learn_layout(pixels: usize, w: u32, h: u32, depth: u32) -> io::Result<Ima
         }
         for (off, v) in words(&buf) {
             if v == w && header_at(&buf, off, w, h, depth) {
-                if let Some((d, _)) = words(&buf[off..(off + 64).min(buf.len())]).find(|&(_, p)| p as usize == pixels) {
+                if let Some(d) = find_ptr(&buf, off, pixels) {
                     return Ok(ImageDataLayout { data_from_width: d });
                 }
             }
@@ -337,12 +352,12 @@ pub fn snapshot_images(
             }
             // Headers straddling a chunk boundary are missed; images are rare enough not to care.
             for (off, v) in words(buf) {
-                if v == w && header_at(buf, off, w, h, depth) && off + layout.data_from_width + 4 <= n {
-                    let data = u32::from_le_bytes(buf[off + layout.data_from_width..][..4].try_into().unwrap()) as usize;
+                if v == w && header_at(buf, off, w, h, depth) && off + layout.data_from_width + PTR + 4 <= n {
+                    let data = ptr_at(buf, off + layout.data_from_width).unwrap_or(0);
                     let mut pixels = vec![0u8; len];
                     // QImage::Format sits right after the data pointer; other
                     // screen-sized images (e.g. ARGB32_Premultiplied) aren't the engine's.
-                    let fmt_at = off + layout.data_from_width + 4;
+                    let fmt_at = off + layout.data_from_width + PTR;
                     let format = buf.get(fmt_at..fmt_at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
                     if format != Some(format_wanted) {
                         continue;

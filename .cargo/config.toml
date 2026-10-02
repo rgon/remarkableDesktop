@@ -1,5 +1,10 @@
-# reMarkable 2: 32-bit ARM, glibc 2.39. Build with:
-#   cargo zigbuild -p remdesktop-tablet --release --target armv7-unknown-linux-gnueabihf.2.31
+# Tablet builds (glibc-linked, Qt loaded at runtime). run.sh picks the target
+# from the tablet's `uname -m`:
+#   reMarkable 2 (armv7l):        cargo zigbuild -p remdesktop-tablet --release --target armv7-unknown-linux-gnueabihf.2.31
+#   Paper Pro / Move (aarch64):   cargo zigbuild -p remdesktop-tablet --release --target aarch64-unknown-linux-gnu.2.31
+# Both export our QImage constructor so it interposes the one libqsgepaper.so binds to.
 [target.armv7-unknown-linux-gnueabihf]
-# Export our QImage constructor so it interposes the one libqsgepaper.so binds to.
+rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]
+
+[target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]

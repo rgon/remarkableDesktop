@@ -91,8 +91,21 @@ static CAPTURE: AtomicBool = AtomicBool::new(false);
 static CAPTURED: Mutex<Vec<ImageInfo>> = Mutex::new(Vec::new());
 
 type Cleanup = Option<unsafe extern "C" fn(*mut c_void)>;
+/// Qt's `qsizetype`: pointer-sized (int on 32-bit ARM, qint64 on aarch64).
+type QSize = isize;
 type ImageCtor =
-    unsafe extern "C" fn(*mut c_void, *mut u8, c_int, c_int, c_int, c_int, Cleanup, *mut c_void);
+    unsafe extern "C" fn(*mut c_void, *mut u8, c_int, c_int, QSize, c_int, Cleanup, *mut c_void);
+
+// Mangled QImage(uchar*, int, int, qsizetype, Format, QImageCleanupFunction, void*):
+// qsizetype mangles as `i` (int) on 32-bit targets and `x` (long long) on 64-bit.
+#[cfg(target_pointer_width = "32")]
+const QIMAGE_C1: &CStr = c"_ZN6QImageC1EPhiiiNS_6FormatEPFvPvES2_";
+#[cfg(target_pointer_width = "32")]
+const QIMAGE_C2: &CStr = c"_ZN6QImageC2EPhiiiNS_6FormatEPFvPvES2_";
+#[cfg(target_pointer_width = "64")]
+const QIMAGE_C1: &CStr = c"_ZN6QImageC1EPhiixNS_6FormatEPFvPvES2_";
+#[cfg(target_pointer_width = "64")]
+const QIMAGE_C2: &CStr = c"_ZN6QImageC2EPhiixNS_6FormatEPFvPvES2_";
 
 unsafe fn forward_ctor(
     name: &CStr,
@@ -101,7 +114,7 @@ unsafe fn forward_ctor(
     data: *mut u8,
     w: c_int,
     h: c_int,
-    stride: c_int,
+    stride: QSize,
     format: c_int,
     cleanup: Cleanup,
     info: *mut c_void,
@@ -118,41 +131,50 @@ unsafe fn forward_ctor(
     let real: ImageCtor = unsafe { std::mem::transmute(real) };
     unsafe { real(this, data, w, h, stride, format, cleanup, info) };
     if CAPTURE.load(Ordering::Acquire) {
-        let image = ImageInfo { pixels: data, width: w, height: h, stride, format };
+        let image = ImageInfo { pixels: data, width: w, height: h, stride: stride as i32, format };
         CAPTURED.lock().unwrap().push(image);
     }
 }
 
-// QImage(uchar*, int w, int h, qsizetype bytesPerLine, Format, QImageCleanupFunction, void*)
-// on 32-bit ARM, where qsizetype is int. Both the complete- and base-object
-// constructor aliases are provided, since callers may bind either.
-#[unsafe(export_name = "_ZN6QImageC1EPhiiiNS_6FormatEPFvPvES2_")]
+// Our definitions of QImage's external-buffer constructor, exported under
+// the mangled names (see QIMAGE_C1/C2) so they interpose libQt6Gui's. Both
+// the complete- and base-object aliases are provided, since callers may bind
+// either.
+#[cfg_attr(target_pointer_width = "32", unsafe(export_name = "_ZN6QImageC1EPhiiiNS_6FormatEPFvPvES2_"))]
+#[cfg_attr(target_pointer_width = "64", unsafe(export_name = "_ZN6QImageC1EPhiixNS_6FormatEPFvPvES2_"))]
 pub unsafe extern "C" fn qimage_ctor_c1(
-    this: *mut c_void, data: *mut u8, w: c_int, h: c_int, stride: c_int, format: c_int,
+    this: *mut c_void, data: *mut u8, w: c_int, h: c_int, stride: QSize, format: c_int,
     cleanup: Cleanup, info: *mut c_void,
 ) {
     static REAL: OnceLock<usize> = OnceLock::new();
-    unsafe {
-        forward_ctor(c"_ZN6QImageC1EPhiiiNS_6FormatEPFvPvES2_", &REAL, this, data, w, h, stride, format, cleanup, info)
-    }
+    unsafe { forward_ctor(QIMAGE_C1, &REAL, this, data, w, h, stride, format, cleanup, info) }
 }
 
-#[unsafe(export_name = "_ZN6QImageC2EPhiiiNS_6FormatEPFvPvES2_")]
+#[cfg_attr(target_pointer_width = "32", unsafe(export_name = "_ZN6QImageC2EPhiiiNS_6FormatEPFvPvES2_"))]
+#[cfg_attr(target_pointer_width = "64", unsafe(export_name = "_ZN6QImageC2EPhiixNS_6FormatEPFvPvES2_"))]
 pub unsafe extern "C" fn qimage_ctor_c2(
-    this: *mut c_void, data: *mut u8, w: c_int, h: c_int, stride: c_int, format: c_int,
+    this: *mut c_void, data: *mut u8, w: c_int, h: c_int, stride: QSize, format: c_int,
     cleanup: Cleanup, info: *mut c_void,
 ) {
     static REAL: OnceLock<usize> = OnceLock::new();
-    unsafe {
-        forward_ctor(c"_ZN6QImageC2EPhiiiNS_6FormatEPFvPvES2_", &REAL, this, data, w, h, stride, format, cleanup, info)
-    }
+    unsafe { forward_ctor(QIMAGE_C2, &REAL, this, data, w, h, stride, format, cleanup, info) }
 }
 
 type SwapFn = unsafe extern "C" fn(*mut c_void, QRect, c_int, c_int);
 type ProcessEventsFn = unsafe extern "C" fn(c_int, c_int);
 type AppCtor = unsafe extern "C" fn(*mut c_void, *mut c_int, *mut *mut c_char, c_int);
 
-const QT_VERSION: c_int = 0x060a03;
+/// The loaded Qt's version as QT_VERSION_CHECK packs it (0x060a03 for
+/// 6.10.3), read from `qVersion()`; QCoreApplication's constructor takes it.
+fn qt_version(core: *mut c_void) -> c_int {
+    let parsed = dlsym(core, c"qVersion").ok().and_then(|f| {
+        let f: unsafe extern "C" fn() -> *const c_char = unsafe { std::mem::transmute(f) };
+        let v = unsafe { CStr::from_ptr(f()) }.to_str().ok()?.to_string();
+        let mut parts = v.split('.').map(|p| p.parse::<c_int>().ok());
+        Some((parts.next()??) << 16 | (parts.next()??) << 8 | parts.next().flatten().unwrap_or(0))
+    });
+    parsed.unwrap_or(0x060000)
+}
 
 fn dlopen(path: &CStr) -> Result<*mut c_void, String> {
     let h = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
@@ -194,7 +216,9 @@ impl Epd {
         let argc: &'static mut c_int = Box::leak(Box::new(1));
         let argv: &'static mut [*mut c_char; 2] = Box::leak(Box::new([c"remdesktop".as_ptr() as *mut c_char, std::ptr::null_mut()]));
         let app: &'static mut [u64; 32] = Box::leak(Box::new([0; 32]));
-        unsafe { app_ctor(app.as_mut_ptr().cast(), argc, argv.as_mut_ptr(), QT_VERSION) };
+        let version = qt_version(core);
+        log!("remdesktop: Qt {}.{}.{}", version >> 16, version >> 8 & 0xff, version & 0xff);
+        unsafe { app_ctor(app.as_mut_ptr().cast(), argc, argv.as_mut_ptr(), version) };
 
         let epaper = dlopen(c"/usr/lib/plugins/scenegraph/libqsgepaper.so")?;
         let instance_fn: unsafe extern "C" fn() -> *mut c_void =

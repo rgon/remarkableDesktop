@@ -86,19 +86,32 @@ pub struct RawEvent {
     pub value: i32,
 }
 
-/// Drains a non-blocking evdev file (32-bit `struct input_event`, 16 bytes).
+/// `struct input_event`: a timeval of two longs, then type, code, value.
+/// 16 bytes on 32-bit ARM (rM2), 24 on aarch64.
+const LONG: usize = size_of::<libc::c_long>();
+const EVENT_SIZE: usize = 2 * LONG + 8;
+
+fn long_at(b: &[u8]) -> u64 {
+    let mut v = [0u8; 8];
+    v[..LONG].copy_from_slice(&b[..LONG]);
+    u64::from_le_bytes(v)
+}
+
+/// Drains a non-blocking evdev file.
 pub fn read_events(file: &mut File) -> io::Result<Vec<RawEvent>> {
     let mut out = vec![];
-    let mut buf = [0u8; 16 * 64];
+    let mut buf = [0u8; EVENT_SIZE * 64];
     loop {
         match file.read(&mut buf) {
             Ok(0) => break,
-            Ok(n) => out.extend(buf[..n].chunks_exact(16).map(|e| RawEvent {
-                time_us: u32::from_le_bytes([e[0], e[1], e[2], e[3]]) as u64 * 1_000_000
-                    + u32::from_le_bytes([e[4], e[5], e[6], e[7]]) as u64,
-                kind: u16::from_le_bytes([e[8], e[9]]),
-                code: u16::from_le_bytes([e[10], e[11]]),
-                value: i32::from_le_bytes([e[12], e[13], e[14], e[15]]),
+            Ok(n) => out.extend(buf[..n].chunks_exact(EVENT_SIZE).map(|e| {
+                let t = &e[2 * LONG..];
+                RawEvent {
+                    time_us: long_at(e) * 1_000_000 + long_at(&e[LONG..]),
+                    kind: u16::from_le_bytes([t[0], t[1]]),
+                    code: u16::from_le_bytes([t[2], t[3]]),
+                    value: i32::from_le_bytes([t[4], t[5], t[6], t[7]]),
+                }
             })),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),

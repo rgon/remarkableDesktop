@@ -21,12 +21,23 @@ cd "$(dirname "$0")"
 
 RM=${RM:-root@10.11.99.1}
 REMOTE=${REMOTE:-/home/root/remdesktop}
-TARGET=armv7-unknown-linux-gnueabihf
-BIN=target/$TARGET/release/remdesktop
 CLIENT=target/release/remdesktop-host
 SSH=(ssh -o ConnectTimeout=5 -o ServerAliveInterval=1 -o ServerAliveCountMax=3 -o BatchMode=yes "$RM")
 
+# The tablet binary's target, from the tablet's CPU: armv7l on the
+# reMarkable 2, aarch64 on the Paper Pro / Move.
+tablet_target() {
+    case $("${SSH[@]}" uname -m) in
+        aarch64) echo aarch64-unknown-linux-gnu ;;
+        armv7l) echo armv7-unknown-linux-gnueabihf ;;
+        *) echo "unsupported tablet CPU" >&2; exit 1 ;;
+    esac
+}
+
 build() {
+    wait_ssh
+    TARGET=$(tablet_target)
+    BIN=target/$TARGET/release/remdesktop
     cargo zigbuild -q -p remdesktop-tablet --release --target "$TARGET.2.31"
     cargo build -q -p remdesktop-host --release
 }
