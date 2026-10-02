@@ -16,6 +16,7 @@ mod hid_report;
 mod input;
 mod link;
 mod session;
+mod state;
 mod takeover;
 mod ui;
 
@@ -75,8 +76,9 @@ fn main() {
 }
 
 fn parse_run(args: &[String]) -> Result<daemon::Args, String> {
-    let (mut rotation, mut touch, mut palm, mut usb) = (90, TouchMode::Touchpad, PalmConfig::default(), true);
-    let mut pen = PenMode::Tablet;
+    let (mut rotation, mut touch, mut palm, mut usb) = (90, None, PalmConfig::default(), true);
+    // Unset modes come from the saved state.
+    let mut pen = None;
     let mut refresh = display::Refresh::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -86,18 +88,18 @@ fn parse_run(args: &[String]) -> Result<daemon::Args, String> {
                 rotation = value()?.parse().ok().filter(|r| [0, 90, 180, 270].contains(r)).ok_or("--rotate: 0, 90, 180 or 270")?
             }
             "--touch" => {
-                touch = match value()?.as_str() {
+                touch = Some(match value()?.as_str() {
                     "touchpad" => TouchMode::Touchpad,
                     "touchscreen" => TouchMode::Touchscreen,
                     _ => return Err("--touch: touchpad or touchscreen".into()),
-                }
+                })
             }
             "--pen" => {
-                pen = match value()?.as_str() {
+                pen = Some(match value()?.as_str() {
                     "tablet" => PenMode::Tablet,
                     "mouse" => PenMode::Mouse,
                     _ => return Err("--pen: tablet or mouse".into()),
-                }
+                })
             }
             "--fast-mode" => refresh.fast = Mode::parse(&value()?).ok_or("--fast-mode: unknown mode")?,
             "--settle-mode" => refresh.settle = Mode::parse(&value()?).ok_or("--settle-mode: unknown mode")?,

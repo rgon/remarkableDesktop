@@ -391,6 +391,8 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
     let mut logical = (0u32, 0u32);
     let mut streamer: Option<stream::Streamer> = None;
     let mut status = TabletStatus::default();
+    // Messages we feed ourselves (resuming the tablet's saved view).
+    let mut queued: std::collections::VecDeque<Msg> = Default::default();
     let offset: stats::Offset = Default::default();
     let mut hid_probe: Option<stats::HidProbe> = None;
     let result = loop {
@@ -404,8 +406,12 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
                 remap_hid(&writer, &screens, &target, gs, status);
             }
         }
-        match Msg::read_from(&mut stream) {
-            Ok(Some(Msg::Hello { version, width, height, rotation })) => {
+        let msg = match queued.pop_front() {
+            Some(m) => Ok(Some(m)),
+            None => Msg::read_from(&mut stream),
+        };
+        match msg {
+            Ok(Some(Msg::Hello { version, width, height, rotation, view })) => {
                 if version != remvnc_proto::VERSION {
                     eprintln!("remvnc-host: tablet speaks protocol {version}, we speak {}", remvnc_proto::VERSION);
                     break Ok(End::Bye);
@@ -420,14 +426,23 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
                 for (i, s) in monitors.iter().enumerate() {
                     eprintln!("remvnc-host: screen {}: {} {}x{} at {},{}", i + 1, s.name, s.w, s.h, s.x, s.y);
                 }
-                if let Err(e) = send(&writer, &Msg::Screens { names: view_labels(args.display, monitors.len()) }) {
+                let labels = view_labels(args.display, monitors.len());
+                // Resume the view the tablet had selected (e.g. after USB was replugged).
+                let initial = labels.iter().position(|l| *l == view).unwrap_or(0) as u8;
+                if let Err(e) = send(&writer, &Msg::Screens { names: labels }) {
                     break Err(format!("send: {e}"));
                 }
                 if args.display {
                     let w = writer.clone();
                     let s = stream::Streamer::start(logical, rotation, args.stats, Box::new(move |m| send(&w, m)));
-                    s.set_source(Some(capture::Source::Virtual), mapping::FULL);
+                    if initial == 0 {
+                        s.set_source(Some(capture::Source::Virtual), mapping::FULL);
+                    }
                     streamer = Some(s);
+                }
+                if initial != 0 {
+                    eprintln!("remvnc-host: resuming view {view}");
+                    queued.push_back(Msg::Target { index: initial });
                 }
             }
             Ok(Some(Msg::Status { usb_hid, pen_mouse, touchpad })) => {

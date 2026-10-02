@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 pub struct Args {
     pub refresh: display::Refresh,
     pub rotation: u16,
-    pub touch: TouchMode,
-    pub pen: PenMode,
+    /// None: the saved mode (or the default).
+    pub touch: Option<TouchMode>,
+    pub pen: Option<PenMode>,
     pub palm: PalmConfig,
     /// Add the USB HID function.
     pub usb: bool,
@@ -122,7 +123,12 @@ impl Mapping {
 }
 
 pub fn run(args: Args) -> Result<(), String> {
-    let Args { refresh, rotation, touch: touch_mode, pen: pen_mode, palm, usb } = args;
+    let Args { refresh, rotation, touch: touch_arg, pen: pen_arg, palm, usb } = args;
+    let mut state = crate::state::State::load();
+    let touch_mode = touch_arg.or(state.touch).unwrap_or(TouchMode::Touchpad);
+    let pen_mode = pen_arg.or(state.pen).unwrap_or(PenMode::Tablet);
+    state.touch = Some(touch_mode);
+    state.pen = Some(pen_mode);
     let (session, epd) = Session::begin(0)?;
     let inputs = &session.inputs;
     let mut pen = inputs.pen.as_ref().map(|g| Pen::new(&g.file, rotation, pen_mode)).transpose().map_err(|e| format!("pen: {e}"))?;
@@ -280,7 +286,13 @@ pub fn run(args: Args) -> Result<(), String> {
                     Ok((incoming, wake)) => {
                         let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true, heard: Instant::now(), remote: None };
                         h.send(&Msg::Addresses { addrs: addresses.clone() });
-                        h.send(&Msg::Hello { version: remvnc_proto::VERSION, width: ui.size[0] as u16, height: ui.size[1] as u16, rotation });
+                        h.send(&Msg::Hello {
+                            version: remvnc_proto::VERSION,
+                            width: ui.size[0] as u16,
+                            height: ui.size[1] as u16,
+                            rotation,
+                            view: state.view.clone(),
+                        });
                         sent_status = None; // sent with the next wake-up
                         host = Some(h);
                     }
@@ -299,8 +311,9 @@ pub fn run(args: Args) -> Result<(), String> {
                     Incoming::Msg(Msg::Screens { names }) if !names.is_empty() => {
                         log!("remvnc: host views: {}", names.join(", "));
                         h.views = names;
-                        h.target = 0;
-                        ui.set_label(Button::Screen, &h.views[0]);
+                        // The host resumes the view named in our Hello.
+                        h.target = h.views.iter().position(|v| *v == state.view).unwrap_or(0) as u8;
+                        ui.set_label(Button::Screen, &h.views[h.target as usize]);
                         ui.set_enabled(Button::Screen, h.views.len() > 1);
                     }
                     Incoming::Msg(Msg::RemoteOk { addr }) => {
@@ -415,6 +428,8 @@ pub fn run(args: Args) -> Result<(), String> {
                                     }
                                     log!("remvnc: touch is now {next:?}");
                                     ui.set_label(b, mode_label(next));
+                                    state.touch = Some(next);
+                                    state.save();
                                 }
                             }
                             Button::Pen => {
@@ -435,6 +450,8 @@ pub fn run(args: Args) -> Result<(), String> {
                                     }
                                     log!("remvnc: pen is now {next:?}");
                                     ui.set_label(b, pen_label(next));
+                                    state.pen = Some(next);
+                                    state.save();
                                 }
                             }
                             Button::Side => {}
@@ -450,6 +467,8 @@ pub fn run(args: Args) -> Result<(), String> {
                                     let (target, label) = (h.target, h.views[h.target as usize].clone());
                                     h.send(&Msg::Target { index: target });
                                     ui.set_label(b, &label);
+                                    state.view = label;
+                                    state.save();
                                 }
                             }
                         }
