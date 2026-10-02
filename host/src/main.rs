@@ -332,14 +332,14 @@ fn spawn_prober(
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        let mut last: Option<Option<std::net::IpAddr>> = None;
+        let mut last: Option<(Option<std::net::IpAddr>, Vec<String>)> = None;
         while !stop.load(std::sync::atomic::Ordering::Relaxed) {
             let candidates = addrs.lock().unwrap().clone();
             let ok = candidates
                 .iter()
                 .filter_map(|a| a.parse::<std::net::IpAddr>().ok())
                 .find(|&ip| reachable(SocketAddr::new(ip, port)));
-            if last != Some(ok) {
+            if last.as_ref() != Some(&(ok, candidates.clone())) {
                 match ok {
                     Some(ip) => eprintln!("remvnc-host: tablet reachable without USB at {ip}"),
                     None if !candidates.is_empty() => eprintln!("remvnc-host: tablet not reachable at {}", candidates.join(", ")),
@@ -350,7 +350,7 @@ fn spawn_prober(
                 if send(&w, &Msg::RemoteOk { addr }).is_err() {
                     return;
                 }
-                last = Some(ok);
+                last = Some((ok, candidates));
             }
             std::thread::sleep(Duration::from_secs(5));
         }
