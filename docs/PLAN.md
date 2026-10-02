@@ -10,7 +10,14 @@
   updates with acks. Fast refresh, then a settle refresh. The monitor layout
   is kept. Pen and touch are mapped through GNOME's per-device settings.
 
-## Next: the tablet as a USB HID device
+## Done in v0.6: the tablet as a USB HID device
+Implemented as planned below: the FunctionFS gadget, a tablet-owned instance
+(`remvnc start`, `stop`, `session`) with host reconnects, an info box,
+greyed-out host-only options, and a SIDE button. Verified on Linux (GNOME):
+`hid-multitouch` creates Stylus, Touchscreen and Touchpad inputs. Windows and
+macOS are untested.
+
+## Design notes (kept for reference)
 **Goal:** input works on any computer with no host software. The tablet itself
 is a USB tablet (pen digitizer, touch, mouse), next to the existing USB
 network, which stays up. `remvnc-host` becomes optional, for screen streaming

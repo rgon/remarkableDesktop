@@ -124,7 +124,15 @@ impl HidProbe {
             e.file_name().to_string_lossy().starts_with("event")
                 && std::fs::read_to_string(e.path().join("device/name")).is_ok_and(|n| n.trim() == "reMarkable 2 Stylus")
         })?;
-        let mut file = std::fs::File::open(format!("/dev/input/{}", dev.file_name().to_string_lossy())).ok()?;
+        let path = format!("/dev/input/{}", dev.file_name().to_string_lossy());
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("remvnc-host: hid latency probe: {path}: {e}");
+                return None;
+            }
+        };
+        eprintln!("remvnc-host: measuring USB HID pen latency on {path}");
         let clock: libc::c_int = libc::CLOCK_MONOTONIC;
         unsafe { libc::ioctl(file.as_raw_fd(), 0x4004_45a0, &clock) }; // EVIOCSCLOCKID
         let (tx, rx) = std::sync::mpsc::channel::<u64>();
@@ -132,6 +140,7 @@ impl HidProbe {
             let mut markers = std::collections::VecDeque::new();
             let mut arrivals = std::collections::VecDeque::new();
             let mut lat: Vec<f64> = vec![];
+            let (mut seen_m, mut seen_a, mut resyncs) = (0usize, 0usize, 0usize);
             let mut since = std::time::Instant::now();
             let mut buf = [0u8; 24 * 64];
             while let Ok(n) = file.read(&mut buf) {
@@ -141,14 +150,21 @@ impl HidProbe {
                         let sec = i64::from_ne_bytes(ev[0..8].try_into().unwrap());
                         let usec = i64::from_ne_bytes(ev[8..16].try_into().unwrap());
                         arrivals.push_back((sec * 1_000_000 + usec) as u64);
+                        seen_a += 1;
                     }
                 }
+                let before = markers.len();
                 markers.extend(rx.try_iter());
+                seen_m += markers.len() - before;
                 let Some(off) = *offset.lock().unwrap() else { continue };
                 while let (Some(&m), Some(&a)) = (markers.front(), arrivals.front()) {
                     let l = a as i64 - (m as i64 - off);
                     if !(-5_000..200_000).contains(&l) {
                         // Out of step (a report or marker went missing): resync.
+                        if resyncs < 3 {
+                            eprintln!("remvnc-host: hid probe resync: {:.1} ms apart", l as f64 / 1000.0);
+                        }
+                        resyncs += 1;
                         markers.clear();
                         arrivals.clear();
                         break;
@@ -156,6 +172,10 @@ impl HidProbe {
                     lat.push(l as f64 / 1000.0);
                     markers.pop_front();
                     arrivals.pop_front();
+                }
+                if since.elapsed() >= std::time::Duration::from_secs(2) && lat.is_empty() {
+                    eprintln!("remvnc-host: hid probe: {seen_m} markers, {seen_a} reports, {resyncs} resyncs, offset known: {}", offset.lock().unwrap().is_some());
+                    since = std::time::Instant::now();
                 }
                 if since.elapsed() >= std::time::Duration::from_secs(2) && !lat.is_empty() {
                     lat.sort_by(|a, b| a.total_cmp(b));

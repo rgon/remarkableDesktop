@@ -1,6 +1,6 @@
 # Known limitations
 
-As of v0.4.2 (reMarkable 2, OS 3.28.0.169, GNOME Wayland host).
+As of v0.6.1 (reMarkable 2, OS 3.28.0.169, GNOME Wayland host).
 
 ## Firmware coupling
 remvnc drives the panel through internal, unexported parts of reMarkable's
@@ -36,15 +36,35 @@ logs to the journal.
 - If the guardian dies too, xochitl's 60 s systemd watchdog restarts it.
 - `remvnc restore` does the same by hand.
 
+## USB HID mode
+- **Re-enumeration:** adding or removing our HID function makes USB
+  re-enumerate. The USB network drops for about 1–2 s, and any SSH session
+  over USB with it. `remvnc start` therefore runs the instance detached, and
+  `remvnc-host` reconnects by itself.
+- **RNDIS instead of ECM:** with our HID function present, Linux picks the
+  gadget's first configuration (RNDIS) instead of ECM. The network still
+  works, but under a different interface name.
+- **Untested on Windows and macOS.** macOS has no RNDIS driver and may not pick
+  the ECM configuration.
+- **Mapping without a host:** with no `remvnc-host`, the OS maps the HID
+  stylus and touchscreen by itself: GNOME picks a monitor, and the aspect
+  ratio may be stretched.
+- **Engine signals:** the e-ink engine installs its own SIGTERM/SIGINT
+  handlers; we take them back after it loads, so stopping goes through our
+  clean exit.
+- **No core dumps:** they are disabled for remvnc, because on this tablet they
+  go to reMarkable's crash reporter (memfault).
+- **HID latency probe:** `--stats` pairs tablet markers with host events in
+  order, and resyncs whenever a report goes missing, so it samples only part
+  of the reports.
+
 ## Network and security
-- **Direct link:** by default input travels over a direct TCP socket with
-  `TCP_NODELAY`, unencrypted. SSH still launches and authenticates the session:
-  the socket only listens on the address the SSH client connected to, only
-  accepts the SSH client's IP, and requires a one-time token sent over SSH.
-  This is fine over USB (10.11.99.x). Over shared Wi-Fi, others on the network
-  can see the input.
-- **`--ssh-only`:** keeps everything inside SSH, but dropbear leaves Nagle on
-  for non-PTY sessions, which adds stalls of about 40 ms.
+- **Host link:** the instance listens on a TCP port with `TCP_NODELAY`, on
+  all interfaces, unencrypted. A host must present a one-time token, which it
+  reads from `/run/remvnc/session` (root-only) over SSH, so SSH is what
+  authenticates. This is fine over USB (10.11.99.x). Over shared Wi-Fi,
+  others on the network can see the streamed screen, and input when not on
+  USB HID.
 
 ## Input
 - **Monitor targeting:** relies on the compositor mapping an unassigned
