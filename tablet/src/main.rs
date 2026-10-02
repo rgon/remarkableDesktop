@@ -132,8 +132,10 @@ fn realtime_priority() {
     }
 }
 
-/// Qt only needs servicing for the engine's own bookkeeping, not per event.
-const QT_EVERY: Duration = Duration::from_millis(100);
+/// Idle wake-up interval. The engine hands refresh work through Qt's event
+/// loop, so it is serviced on every wake-up (and right after each refresh);
+/// servicing it less often delays and bunches up screen updates.
+const IDLE_WAKE: Duration = Duration::from_millis(100);
 
 fn mode_label(m: TouchMode) -> &'static str {
     match m {
@@ -189,12 +191,11 @@ fn run(args: RunArgs) -> Result<(), String> {
     let mut files = grabbed.map(|g| g.and_then(|g| g.file.try_clone().ok()));
     // (button, since, already fired): a hold fires once, then needs a release.
     let mut hold: Option<(Button, Instant, bool)> = None;
-    let mut last_qt = Instant::now();
     let mut done = false;
 
     while alive && !done && !quitting() {
         let mut pfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
-        let mut timeout = if hold.is_some() { 30 } else { QT_EVERY.as_millis() as i32 };
+        let mut timeout = if hold.is_some() { 30 } else { IDLE_WAKE.as_millis() as i32 };
         if let Some(t) = display.next_tick_ms() {
             timeout = timeout.min(t);
         }
@@ -346,10 +347,7 @@ fn run(args: RunArgs) -> Result<(), String> {
             (None, None) => {}
         }
         display.tick(&epd);
-        if last_qt.elapsed() >= QT_EVERY {
-            epd.process_events(0);
-            last_qt = Instant::now();
-        }
+        epd.process_events(0);
     }
     if !alive {
         log!("remvnc: lost the host connection");

@@ -97,6 +97,7 @@ impl Display {
     /// Refreshes freshly written pixels in the fast mode.
     pub fn show(&mut self, epd: &Epd, r: Rect) {
         epd.swap(r.x, r.y, r.w, r.h, self.refresh.fast, 0);
+        epd.process_events(0);
         self.unsettled = Some(self.unsettled.map_or(r, |u| u.union(r)));
         self.last_update = Instant::now();
         self.frames += 1;
@@ -107,6 +108,7 @@ impl Display {
         if let Some(u) = self.unsettled {
             if self.last_update.elapsed() >= self.refresh.settle_after {
                 epd.swap(u.x, u.y, u.w, u.h, self.refresh.settle, 0);
+                epd.process_events(0);
                 self.unsettled = None;
             }
         }
