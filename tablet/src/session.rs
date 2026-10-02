@@ -70,8 +70,18 @@ impl Session {
             .and_then(|layout| takeover::snapshot_images(xochitl, layout, w, h, 32, epd.fb.len()))
         {
             Ok(mut found) if found.len() == 1 => Some(found.remove(0).1),
+            // Copies of the same frame (xochitl keeps more than one) are all fine.
+            Ok(mut found) if found.len() > 1 && found.iter().all(|f| f.1 == found[0].1) => {
+                eprintln!("remvnc: {} identical xochitl frames", found.len());
+                Some(found.remove(0).1)
+            }
             Ok(found) => {
-                eprintln!("remvnc: {} candidate xochitl frames; will restart it on exit", found.len());
+                let differing = found.iter().filter(|f| f.1 != found[0].1).count();
+                eprintln!(
+                    "remvnc: {} candidate xochitl frames ({differing} differ from the first) at {:x?}; will restart it on exit",
+                    found.len(),
+                    found.iter().map(|f| f.0).collect::<Vec<_>>()
+                );
                 None
             }
             Err(e) => {
