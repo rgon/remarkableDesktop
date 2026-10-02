@@ -454,6 +454,7 @@ pub fn run(args: Args) -> Result<(), String> {
     }
 
     // Release anything held, tell the host, take our USB function out.
+    log!("remvnc: shutting down");
     if let (Some(g), true) = (gadget.as_ref(), hid_was_up) {
         for r in encoder.release_all(touch.as_ref().is_some_and(|t| t.mode() == TouchMode::Touchpad), pen.as_ref().is_some_and(|p| p.mode() == PenMode::Mouse)) {
             g.send(&r);
@@ -465,10 +466,12 @@ pub fn run(args: Args) -> Result<(), String> {
     }
     drop(server);
     if gadget.is_some() {
+        log!("remvnc: removing the usb hid function");
         drop(gadget);
         hid::restore();
     }
     drop(ui);
+    log!("remvnc: restoring the screen");
     let _ = std::io::stderr().flush();
     session.end(&epd)
 }
