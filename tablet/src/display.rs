@@ -2,7 +2,7 @@
 //! buffer and refreshed in a fast mode at once; areas that then stay still
 //! get a full-quality refresh, which clears the fast mode's ghosting.
 
-use crate::epd::{Epd, Mode};
+use crate::epd::{Epd, ImageInfo, Mode};
 use remvnc_proto::gray4;
 use std::time::{Duration, Instant};
 
@@ -34,27 +34,23 @@ impl Rect {
     }
 }
 
-pub struct Display {
+/// Writes `Rect` payloads into the framebuffer. Runs on the reader thread.
+pub struct Decoder {
     /// Level → RGB32 pixel.
     lut: [u32; 16],
-    /// Updated in fast mode, waiting for a quality refresh.
-    unsettled: Option<Rect>,
-    last_update: Instant,
-    pub frames: u32,
 }
 
-impl Display {
+impl Decoder {
     pub fn new() -> Self {
         let lut = std::array::from_fn(|l| {
             let g = gray4::gray(l as u8) as u32;
             0xff00_0000 | g << 16 | g << 8 | g
         });
-        Self { lut, unsettled: None, last_update: Instant::now(), frames: 0 }
+        Self { lut }
     }
 
     /// Writes one update into the framebuffer (no refresh yet).
-    pub fn write(&mut self, epd: &Epd, r: Rect, packed_lz4: &[u8]) -> Result<Rect, String> {
-        let fb = epd.fb;
+    pub fn write(&self, fb: &ImageInfo, r: Rect, packed_lz4: &[u8]) -> Result<Rect, String> {
         if r.x < 0 || r.y < 0 || r.w <= 0 || r.h <= 0 || r.x + r.w > fb.width || r.y + r.h > fb.height {
             return Err(format!("update {r:?} outside the panel"));
         }
@@ -69,6 +65,20 @@ impl Display {
             gray4::unpack_row(&packed[row * rb..][..rb], r.w as usize, |i, l| unsafe { line.add(i).write(lut[l as usize]) });
         }
         Ok(r)
+    }
+}
+
+/// Refresh scheduling for screen updates. Runs on the input thread.
+pub struct Display {
+    /// Updated in fast mode, waiting for a quality refresh.
+    unsettled: Option<Rect>,
+    last_update: Instant,
+    pub frames: u32,
+}
+
+impl Display {
+    pub fn new() -> Self {
+        Self { unsettled: None, last_update: Instant::now(), frames: 0 }
     }
 
     /// Refreshes freshly written pixels in the fast mode.

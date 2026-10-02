@@ -172,8 +172,9 @@ fn run(args: RunArgs) -> Result<(), String> {
     let mut alive = hello.iter().try_for_each(|m| m.write_to(out)).and_then(|_| out.flush()).is_ok();
 
     let grabbed = [inputs.pen.as_ref(), inputs.touch.as_ref(), inputs.power.as_ref()];
+    let (incoming, mut wake) = link.spawn_reader(epd.fb).map_err(|e| format!("reader: {e}"))?;
     let mut fds: Vec<i32> = grabbed.iter().map(|g| g.map_or(-1, |g| g.file.as_raw_fd())).collect();
-    fds.push(link.input_fd());
+    fds.push(wake.as_raw_fd());
     // With a direct link, ssh's stdin still tells us when the host is gone.
     fds.push(if link.is_direct() { 0 } else { -1 });
     let mut files = grabbed.map(|g| g.and_then(|g| g.file.try_clone().ok()));
@@ -228,41 +229,40 @@ fn run(args: RunArgs) -> Result<(), String> {
             }
         }
         if pfds[3].revents != 0 {
-            match link.receive() {
-                Ok(Some(msgs)) => {
-                    for m in msgs {
-                        match m {
-                            Msg::Ping { host_us } => {
-                                let pong = Msg::Pong { host_us, tablet_us: remvnc_proto::monotonic_us() };
-                                alive &= pong.write_to(&mut link.out).is_ok();
-                            }
-                            Msg::Screens { names } if !names.is_empty() => {
-                                log!("remvnc: host views: {}", names.join(", "));
-                                views = names;
-                                target = 0;
-                                ui.set_label(Button::Screen, &views[0]);
-                            }
-                            Msg::Rect { id, x, y, w, h, data } => {
-                                let r = display::Rect { x: x as i32, y: y as i32, w: w as i32, h: h as i32 };
-                                match display.write(&epd, r, &data) {
-                                    Ok(r) => {
-                                        if r.intersects(ui.bar_phys()) {
-                                            ui.redraw_buttons();
-                                        }
-                                        display.show(&epd, r);
-                                    }
-                                    Err(e) => log!("remvnc: {e}"),
-                                }
-                                alive &= Msg::Ack { id }.write_to(&mut link.out).is_ok();
-                            }
-                            _ => {}
-                        }
+            let mut drain = [0u8; 64];
+            let _ = std::io::Read::read(&mut wake, &mut drain);
+            let mut closed = false;
+            while let Ok(item) = incoming.try_recv() {
+                match item {
+                    link::Incoming::Msg(Msg::Ping { host_us }) => {
+                        let pong = Msg::Pong { host_us, tablet_us: remvnc_proto::monotonic_us() };
+                        alive &= pong.write_to(&mut link.out).is_ok();
                     }
+                    link::Incoming::Msg(Msg::Screens { names }) if !names.is_empty() => {
+                        log!("remvnc: host views: {}", names.join(", "));
+                        views = names;
+                        target = 0;
+                        ui.set_label(Button::Screen, &views[0]);
+                    }
+                    link::Incoming::Msg(_) => {}
+                    link::Incoming::Decoded { id, rect } => {
+                        match rect {
+                            Ok(r) => {
+                                if r.intersects(ui.bar_phys()) {
+                                    ui.redraw_buttons();
+                                }
+                                display.show(&epd, r);
+                            }
+                            Err(e) => log!("remvnc: {e}"),
+                        }
+                        alive &= Msg::Ack { id }.write_to(&mut link.out).is_ok();
+                    }
+                    link::Incoming::Closed => closed = true,
                 }
-                Ok(None) | Err(_) => {
-                    log!("remvnc: host went away");
-                    break;
-                }
+            }
+            if closed {
+                log!("remvnc: host went away");
+                break;
             }
         }
         alive &= link.out.flush().is_ok();

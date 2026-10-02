@@ -6,16 +6,19 @@
 //! accepts only the SSH client's IP, and requires a one-time token sent over
 //! SSH. Input events then travel unencrypted on that link.
 
+use crate::display::{Decoder, Rect};
+use crate::epd::ImageInfo;
 use remvnc_proto::Msg;
+use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::FromRawFd;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub struct Link {
     pub out: BufWriter<Box<dyn Write>>,
     tcp: Option<TcpStream>,
-    buf: Vec<u8>,
 }
 
 impl Link {
@@ -24,50 +27,73 @@ impl Link {
             match direct() {
                 Ok(tcp) => {
                     let out = tcp.try_clone().expect("clone tcp socket");
-                    return Link { out: BufWriter::new(Box::new(out)), tcp: Some(tcp), buf: vec![] };
+                    return Link { out: BufWriter::new(Box::new(out)), tcp: Some(tcp) };
                 }
                 Err(e) => log!("remvnc: direct link unavailable ({e}), using ssh"),
             }
         }
-        Link { out: BufWriter::new(Box::new(io::stdout())), tcp: None, buf: vec![] }
-    }
-
-    /// Where host messages arrive.
-    pub fn input_fd(&self) -> RawFd {
-        self.tcp.as_ref().map_or(0, |t| t.as_raw_fd())
+        Link { out: BufWriter::new(Box::new(io::stdout())), tcp: None }
     }
 
     pub fn is_direct(&self) -> bool {
         self.tcp.is_some()
     }
 
-    /// Reads what is available from the host. `Ok(None)` once it closed.
-    pub fn receive(&mut self) -> io::Result<Option<Vec<Msg>>> {
-        let mut chunk = [0u8; 4096];
-        let n = match &mut self.tcp {
-            Some(t) => match t.read(&mut chunk) {
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Some(vec![])),
-                r => r?,
-            },
-            None => {
-                let n = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
-                if n < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                n as usize
+    /// Moves receiving off the (real-time) input thread. Screen updates are
+    /// decoded straight into the framebuffer on the reader thread; everything
+    /// arrives on the returned channel, and the returned fd becomes readable
+    /// whenever something is waiting.
+    pub fn spawn_reader(&mut self, fb: ImageInfo) -> io::Result<(mpsc::Receiver<Incoming>, File)> {
+        let source: Box<dyn Read + Send> = match &self.tcp {
+            Some(t) => {
+                // Shared with the writer half: both block from now on.
+                t.set_nonblocking(false)?;
+                Box::new(t.try_clone()?)
             }
+            None => Box::new(io::stdin()),
         };
-        if n == 0 {
-            return Ok(None);
-        }
-        self.buf.extend_from_slice(&chunk[..n]);
-        let mut msgs = vec![];
-        while let Some((m, used)) = Msg::parse(&self.buf)? {
-            self.buf.drain(..used);
-            msgs.push(m);
-        }
-        Ok(Some(msgs))
+        let (mut wake_tx, wake_rx) = pipe()?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Threads inherit the spawner's SCHED_FIFO; decoding must not
+            // compete with input forwarding.
+            let normal = libc::sched_param { sched_priority: 0 };
+            unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &normal) };
+            let mut source = io::BufReader::with_capacity(1 << 16, source);
+            let decoder = Decoder::new();
+            loop {
+                let item = match Msg::read_from(&mut source) {
+                    Ok(Some(Msg::Rect { id, x, y, w, h, data })) => {
+                        let r = Rect { x: x as i32, y: y as i32, w: w as i32, h: h as i32 };
+                        Incoming::Decoded { id, rect: decoder.write(&fb, r, &data) }
+                    }
+                    Ok(Some(m)) => Incoming::Msg(m),
+                    Ok(None) | Err(_) => Incoming::Closed,
+                };
+                let closed = matches!(item, Incoming::Closed);
+                if tx.send(item).is_err() || wake_tx.write_all(&[0]).is_err() || closed {
+                    return;
+                }
+            }
+        });
+        Ok((rx, wake_rx))
     }
+}
+
+/// What the reader thread hands to the input thread.
+pub enum Incoming {
+    Msg(Msg),
+    /// A screen update already in the framebuffer, ready to refresh.
+    Decoded { id: u32, rect: Result<Rect, String> },
+    Closed,
+}
+
+fn pipe() -> io::Result<(File, File)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { Ok((File::from_raw_fd(fds[1]), File::from_raw_fd(fds[0]))) }
 }
 
 fn unmap(ip: &str) -> Result<IpAddr, String> {
