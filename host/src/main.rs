@@ -20,11 +20,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const USAGE: &str = "usage: remdesktop-host [--ssh root@10.11.99.1] [--remote /home/root/remdesktop]
-                   [--deploy <local remdesktop binary>] [--stats] [--no-usb] [--list-screens]
-                   [--no-display]
-                   [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
-                   [--palm-major N] [--pen-grace-ms N] [--log-touch]
-                   [--fast-mode M] [--settle-mode M] [--settle-ms N]";
+                       [--deploy <local remdesktop binary>] [--stats] [--no-usb] [--list-screens]
+                       [--no-display]
+                       [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
+                       [--palm-major N] [--pen-grace-ms N] [--log-touch]
+                       [--fast-mode M] [--settle-mode M] [--settle-ms N]";
 
 struct Args {
     ssh: String,

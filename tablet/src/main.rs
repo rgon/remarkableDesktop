@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:
   remdesktop start [options]   Start the instance (detached): takes over the panel,
-                           adds the USB HID function, waits for remdesktop-host.
+                               adds the USB HID function, waits for remdesktop-host.
   remdesktop stop              End it (hold X or press power on the tablet also works).
   remdesktop session           Print \"port token\" for remdesktop-host, if running.
   remdesktop daemon [options]  Run the instance in the foreground.
