@@ -18,6 +18,9 @@ const INPUT_PROP_DIRECT: u32 = 1;
 struct Axis {
     min: i32,
     max: i32,
+    /// Part of the tablet showing the target, as fractions of the device
+    /// range (less than 0..1 when the picture is letterboxed).
+    shown: (f64, f64),
     /// Target span as fractions of the desktop bounding box.
     from: f64,
     to: f64,
@@ -27,9 +30,22 @@ impl Axis {
     fn map(&self, v: i32) -> i32 {
         let range = (self.max - self.min) as f64;
         let f = (v - self.min) as f64 / range;
+        let f = ((f - self.shown.0) / (self.shown.1 - self.shown.0)).clamp(0.0, 1.0);
         (self.min as f64 + (self.from + f * (self.to - self.from)) * range).round() as i32
     }
 }
+
+/// Where a target monitor appears on the tablet when its picture is fitted
+/// into the tablet's `logical` size: (x0, x1, y0, y1) as fractions.
+pub fn letterbox(logical: (u32, u32), target: &Output) -> [f64; 4] {
+    let (lw, lh) = (logical.0 as f64, logical.1 as f64);
+    let s = (lw / target.w as f64).min(lh / target.h as f64);
+    let (cw, ch) = (target.w as f64 * s / lw, target.h as f64 * s / lh);
+    [(1.0 - cw) / 2.0, (1.0 + cw) / 2.0, (1.0 - ch) / 2.0, (1.0 + ch) / 2.0]
+}
+
+/// The whole tablet shows the target.
+pub const FULL: [f64; 4] = [0.0, 1.0, 0.0, 1.0];
 
 /// Per-device remapping of X/Y axes.
 #[derive(Default)]
@@ -38,8 +54,9 @@ pub struct Mapper {
 }
 
 impl Mapper {
-    /// `target` = None maps across the whole desktop (no change).
-    pub fn new(device: &Device, outputs: &[Output], target: Option<&Output>) -> Self {
+    /// `target` = None maps across the whole desktop (no change). `shown`
+    /// is the part of the tablet that shows it (see `letterbox`).
+    pub fn new(device: &Device, outputs: &[Output], target: Option<&Output>, shown: [f64; 4]) -> Self {
         let Some(t) = target else { return Self::default() };
         // Touchpads move a relative pointer; only absolute devices are confined.
         let absolute = device.name.contains("pen") || device.props & (1 << INPUT_PROP_DIRECT) != 0;
@@ -56,8 +73,8 @@ impl Mapper {
         let (bw, bh) = ((x1 - x0) as f64, (y1 - y0) as f64);
         Self {
             axes: Some([
-                Axis { min: xmin, max: xmax, from: (t.x - x0) as f64 / bw, to: (t.x + t.w - x0) as f64 / bw },
-                Axis { min: ymin, max: ymax, from: (t.y - y0) as f64 / bh, to: (t.y + t.h - y0) as f64 / bh },
+                Axis { min: xmin, max: xmax, shown: (shown[0], shown[1]), from: (t.x - x0) as f64 / bw, to: (t.x + t.w - x0) as f64 / bw },
+                Axis { min: ymin, max: ymax, shown: (shown[2], shown[3]), from: (t.y - y0) as f64 / bh, to: (t.y + t.h - y0) as f64 / bh },
             ]),
         }
     }
@@ -92,9 +109,12 @@ mod tests {
             keys: vec![],
             abs: vec![Abs { code: ABS_X, min: 0, max: 100, resolution: 0 }, Abs { code: ABS_Y, min: 0, max: 100, resolution: 0 }],
         };
-        let m = Mapper::new(&dev, &outs, Some(&outs[1]));
+        let m = Mapper::new(&dev, &outs, Some(&outs[1]), FULL);
         let mut ev = [Event { kind: EV_ABS, code: ABS_X, value: 0 }, Event { kind: EV_ABS, code: ABS_X, value: 100 }];
         m.apply(&mut ev);
         assert_eq!((ev[0].value, ev[1].value), (50, 100));
+        // 16:9 monitor on a 4:3 tablet: bars above and below.
+        let lb = letterbox((1600, 1200), &Output { name: "W".into(), x: 0, y: 0, w: 1600, h: 900 });
+        assert_eq!(lb, [0.0, 1.0, 0.125, 0.875]);
     }
 }

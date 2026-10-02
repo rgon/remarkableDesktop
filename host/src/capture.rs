@@ -92,6 +92,8 @@ impl Capture {
             .args(pipeline.split_whitespace())
             .stdout(Stdio::piped())
             .stdin(Stdio::null())
+            // Its only output is noise about the stream closing when we stop.
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("gst-launch-1.0: {e}"))?;
         let out = gst.stdout.take().unwrap();
@@ -109,10 +111,17 @@ impl Capture {
         Ok(Capture { virtual_name, _conn: conn, session, gst, out, width: pw as usize, height: ph as usize })
     }
 
-    /// Blocks until the next full frame.
-    pub fn next_frame(&mut self, buf: &mut Vec<u8>) -> std::io::Result<()> {
+    /// Waits up to `timeout` for a frame to start arriving, then reads all
+    /// of it. Ok(false) if none came (Mutter only sends frames on change).
+    pub fn next_frame(&mut self, buf: &mut Vec<u8>, timeout: std::time::Duration) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let mut pfd = libc::pollfd { fd: self.out.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        if unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as i32) } <= 0 {
+            return Ok(false);
+        }
         buf.resize(self.width * self.height, 0);
-        self.out.read_exact(buf)
+        self.out.read_exact(buf)?;
+        Ok(true)
     }
 
 }
