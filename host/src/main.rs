@@ -359,6 +359,10 @@ fn spawn_prober(
 
 /// One connection to the instance.
 fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) -> Result<End, String> {
+    // The tablet answers our 100 ms pings, so 1.5 s of silence is a dead
+    // link (e.g. USB unplugged), which TCP alone would not report.
+    tcp.set_read_timeout(Some(Duration::from_millis(1500))).map_err(|e| e.to_string())?;
+    tcp.set_write_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
     let mut stream = BufReader::new(tcp.try_clone().map_err(|e| e.to_string())?);
     let closer = tcp.try_clone().map_err(|e| e.to_string())?;
     let writer: Writer = Arc::new(Mutex::new(Box::new(tcp)));

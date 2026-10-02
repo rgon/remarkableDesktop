@@ -68,6 +68,8 @@ struct Host {
     views: Vec<String>,
     target: u8,
     alive: bool,
+    /// Last time anything arrived (the host pings every 100 ms).
+    heard: Instant,
     /// Address the host verified it can reach us on without USB.
     remote: Option<String>,
 }
@@ -276,7 +278,7 @@ pub fn run(args: Args) -> Result<(), String> {
                 }
                 match link.spawn_reader(epd.fb) {
                     Ok((incoming, wake)) => {
-                        let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true, remote: None };
+                        let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true, heard: Instant::now(), remote: None };
                         h.send(&Msg::Addresses { addrs: addresses.clone() });
                         h.send(&Msg::Hello { version: remvnc_proto::VERSION, width: ui.size[0] as u16, height: ui.size[1] as u16, rotation });
                         sent_status = None; // sent with the next wake-up
@@ -290,6 +292,7 @@ pub fn run(args: Args) -> Result<(), String> {
         if let Some(h) = host.as_mut().filter(|_| pfds[4].revents != 0) {
             let mut drain = [0u8; 64];
             let _ = std::io::Read::read(&mut h.wake, &mut drain);
+            h.heard = Instant::now();
             while let Ok(item) = h.incoming.try_recv() {
                 match item {
                     Incoming::Msg(Msg::Ping { host_us }) => h.send(&Msg::Pong { host_us, tablet_us: remvnc_proto::monotonic_us() }),
@@ -331,6 +334,13 @@ pub fn run(args: Args) -> Result<(), String> {
         if let Some(h) = host.as_mut() {
             h.flush();
             host_gone |= !h.alive;
+            // Silence means the link is dead (e.g. USB unplugged): TCP alone
+            // would not notice for minutes.
+            if h.heard.elapsed() > Duration::from_millis(1500) {
+                log!("remvnc: host silent for {:?}", h.heard.elapsed());
+                h.link.close();
+                host_gone = true;
+            }
         }
         if addresses_at.elapsed() >= Duration::from_secs(5) {
             addresses_at = Instant::now();

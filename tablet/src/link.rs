@@ -55,6 +55,8 @@ impl Server {
             let mut got = [0u8; 16];
             (&tcp).read_exact(&mut got)?;
             tcp.set_read_timeout(None)?;
+            // A dead link (cable pulled) must never stall the input loop.
+            tcp.set_write_timeout(Some(Duration::from_millis(250)))?;
             tcp.set_nodelay(true)?;
             Ok(got == self.token)
         };
