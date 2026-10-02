@@ -1,8 +1,10 @@
 [package]
 name = "remvnc-host"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
 libc = "0.2"
 remvnc-proto = { path = "../proto" }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
