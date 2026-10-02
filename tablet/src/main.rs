@@ -10,6 +10,7 @@ macro_rules! log {
 mod display;
 mod epd;
 mod gfx;
+mod hid;
 mod input;
 mod link;
 mod session;
@@ -54,6 +55,11 @@ fn main() {
             Ok(())
         }
         Some("probe") => probe(),
+        Some("hid-test") => hid::test(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10)),
+        Some("hid-restore") => {
+            hid::restore();
+            Ok(())
+        }
         Some("run") => parse_run(&args[2..]).and_then(run),
         _ => Err(USAGE.into()),
     };
