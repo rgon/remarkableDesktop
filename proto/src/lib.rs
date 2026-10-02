@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Abs {
@@ -47,10 +47,18 @@ pub enum Msg {
     /// Tablet → host over SSH: connect to `addr:port` and send `token` to
     /// move the session to a TCP_NODELAY socket.
     Direct { addr: String, port: u16, token: [u8; 16] },
-    /// Host → tablet: monitors that can be targeted, in order.
+    /// Host → tablet: labels of the views the screen button cycles through;
+    /// index 0 is the default (e.g. "ALL" or "VIRT").
     Screens { names: Vec<String> },
-    /// Tablet → host: map absolute input to screen `index` (0 = all).
+    /// Tablet → host: switch to view `index` of `Screens`.
     Target { index: u8 },
+    /// Host → tablet: new pixels for a rectangle of the panel, in panel
+    /// (portrait) coordinates. `data` is LZ4 (size-prepended block) of
+    /// 4-bit gray, two pixels per byte (high nibble first), rows padded to
+    /// whole bytes.
+    Rect { id: u32, x: u16, y: u16, w: u16, h: u16, data: Vec<u8> },
+    /// Tablet → host: `Rect` `id` is on its way to the panel; send the next.
+    Ack { id: u32 },
     /// The tablet is exiting on purpose (X button held, power button).
     Bye,
 }
@@ -64,6 +72,8 @@ const PONG: u8 = 6;
 const DIRECT: u8 = 7;
 const SCREENS: u8 = 8;
 const TARGET: u8 = 9;
+const RECT: u8 = 10;
+const ACK: u8 = 11;
 
 impl Msg {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
@@ -129,6 +139,18 @@ impl Msg {
                 p.push(*index);
                 TARGET
             }
+            Msg::Rect { id, x, y, w, h, data } => {
+                p.extend_from_slice(&id.to_le_bytes());
+                for v in [x, y, w, h] {
+                    p.extend_from_slice(&v.to_le_bytes());
+                }
+                p.extend_from_slice(data);
+                RECT
+            }
+            Msg::Ack { id } => {
+                p.extend_from_slice(&id.to_le_bytes());
+                ACK
+            }
         };
         w.write_all(&[tag])?;
         w.write_all(&(p.len() as u32).to_le_bytes())?;
@@ -143,7 +165,7 @@ impl Msg {
             other => other?,
         }
         let len = u32::from_le_bytes(head[1..].try_into().unwrap()) as usize;
-        if len > 1 << 20 {
+        if len > 8 << 20 {
             return Err(bad("message too large"));
         }
         let mut p = vec![0u8; len];
@@ -176,6 +198,11 @@ impl Msg {
             DIRECT => Msg::Direct { addr: c.str()?, port: c.u16()?, token: c.take(16)?.try_into().unwrap() },
             SCREENS => Msg::Screens { names: (0..c.u8()?).map(|_| c.str()).collect::<io::Result<_>>()? },
             TARGET => Msg::Target { index: c.u8()? },
+            RECT => {
+                let (id, x, y, w, h) = (c.u32()?, c.u16()?, c.u16()?, c.u16()?, c.u16()?);
+                Msg::Rect { id, x, y, w, h, data: c.take(len - c.at)?.to_vec() }
+            }
+            ACK => Msg::Ack { id: c.u32()? },
             t => return Err(bad(&format!("unknown message tag {t}"))),
         };
         Ok(Some(msg))
@@ -195,6 +222,49 @@ impl Msg {
         }
         let mut r = &buf[..total];
         Ok(Msg::read_from(&mut r)?.map(|m| (m, total)))
+    }
+}
+
+/// 16-level gray, the panel's native depth, packed two pixels per byte.
+pub mod gray4 {
+    /// 8-bit gray → level 0..=15.
+    pub fn level(v: u8) -> u8 {
+        ((v as u16 * 15 + 127) / 255) as u8
+    }
+
+    /// Level 0..=15 → 8-bit gray.
+    pub fn gray(level: u8) -> u8 {
+        level * 17
+    }
+
+    pub fn row_bytes(w: usize) -> usize {
+        w.div_ceil(2)
+    }
+
+    /// Packs the `w`×`h` window at (`x`, `y`) of a one-level-per-byte image
+    /// with row length `stride`.
+    pub fn pack(levels: &[u8], stride: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+        let rb = row_bytes(w);
+        let mut out = vec![0u8; rb * h];
+        for r in 0..h {
+            let src = &levels[(y + r) * stride + x..][..w];
+            let dst = &mut out[r * rb..][..rb];
+            for (i, pair) in src.chunks(2).enumerate() {
+                dst[i] = pair[0] << 4 | pair.get(1).copied().unwrap_or(0);
+            }
+        }
+        out
+    }
+
+    /// Calls `put(column, level)` for each pixel of one packed row.
+    #[inline]
+    pub fn unpack_row(row: &[u8], w: usize, mut put: impl FnMut(usize, u8)) {
+        for (i, &b) in row.iter().enumerate() {
+            put(2 * i, b >> 4);
+            if 2 * i + 1 < w {
+                put(2 * i + 1, b & 15);
+            }
+        }
     }
 }
 
@@ -252,6 +322,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gray4_round_trip() {
+        // 3x2 window out of a 4-wide image, odd width to exercise padding.
+        let levels = [0, 1, 2, 3, 4, 5, 6, 7];
+        let packed = gray4::pack(&levels, 4, 1, 0, 3, 2);
+        assert_eq!(packed, vec![0x12, 0x30, 0x56, 0x70]);
+        let mut row = vec![];
+        gray4::unpack_row(&packed[2..4], 3, |i, l| row.push((i, l)));
+        assert_eq!(row, vec![(0, 5), (1, 6), (2, 7)]);
+        assert_eq!(gray4::level(255), 15);
+        assert_eq!(gray4::gray(15), 255);
+    }
+
+    #[test]
     fn round_trip() {
         let msgs = vec![
             Msg::Hello { version: VERSION, width: 1872, height: 1404, rotation: 90 },
@@ -268,6 +351,8 @@ mod tests {
             Msg::Direct { addr: "10.11.99.1".into(), port: 4242, token: [9; 16] },
             Msg::Screens { names: vec!["DP-6".into(), "HDMI-2".into()] },
             Msg::Target { index: 2 },
+            Msg::Rect { id: 3, x: 8, y: 16, w: 3, h: 2, data: vec![1, 2, 3] },
+            Msg::Ack { id: 3 },
             Msg::Bye,
         ];
         let mut buf = Vec::new();
