@@ -220,7 +220,15 @@ impl Msg {
         r.read_exact(&mut p)?;
         let mut c = Cursor { buf: &p, at: 0 };
         let msg = match head[0] {
-            HELLO => Msg::Hello { version: c.u16()?, width: c.u16()?, height: c.u16()?, rotation: c.u16()?, view: c.str()? },
+            // Fields added later are optional, so an older peer's Hello still
+            // parses and the version mismatch can be reported as such.
+            HELLO => Msg::Hello {
+                version: c.u16()?,
+                width: c.u16()?,
+                height: c.u16()?,
+                rotation: c.u16()?,
+                view: if c.at < len { c.str()? } else { String::new() },
+            },
             DEVICE => {
                 let id = c.u8()?;
                 let name = c.str()?;
