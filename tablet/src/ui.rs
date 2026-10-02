@@ -232,8 +232,6 @@ impl<'a> Ui<'a> {
         let big = MonoTextStyle::new(&FONT_10X20, Gray8::BLACK);
         let _ = Text::with_alignment("remote controlling", Point::new(w / 12, h / 12), big, Alignment::Center)
             .draw(&mut Scaled { target: &mut t, factor: 6 });
-        let _ = Text::with_alignment("hold a button to use it", Point::new(w / 8, h / 8 + 40), big, Alignment::Center)
-            .draw(&mut Scaled { target: &mut t, factor: 4 });
         drop(t);
         for b in Button::ALL {
             self.buttons[b as usize].drawn = None;
