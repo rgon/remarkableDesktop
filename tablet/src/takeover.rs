@@ -306,7 +306,8 @@ pub fn learn_layout(pixels: usize, w: u32, h: u32, depth: u32) -> io::Result<Ima
     Err(io::Error::other("our own QImageData not found"))
 }
 
-/// Finds xochitl's screen-sized images of `depth` bits and copies their pixels.
+/// Finds xochitl's screen-sized images of `depth` bits in QImage::Format
+/// `format_wanted` and copies their pixels.
 /// Returns (data address, QImageData header words from `width` on, pixels)
 /// for each match.
 pub fn snapshot_images(
@@ -315,6 +316,7 @@ pub fn snapshot_images(
     w: u32,
     h: u32,
     depth: u32,
+    format_wanted: u32,
     len: usize,
 ) -> io::Result<Vec<(usize, Vec<u32>, Vec<u8>)>> {
     let mem = fs::File::open(format!("/proc/{xochitl}/mem"))?;
@@ -333,6 +335,13 @@ pub fn snapshot_images(
                 if v == w && header_at(buf, off, w, h, depth) && off + layout.data_from_width + 4 <= n {
                     let data = u32::from_le_bytes(buf[off + layout.data_from_width..][..4].try_into().unwrap()) as usize;
                     let mut pixels = vec![0u8; len];
+                    // QImage::Format sits right after the data pointer; other
+                    // screen-sized images (e.g. ARGB32_Premultiplied) aren't the engine's.
+                    let fmt_at = off + layout.data_from_width + 4;
+                    let format = buf.get(fmt_at..fmt_at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                    if format != Some(format_wanted) {
+                        continue;
+                    }
                     if data != 0 && mem.read_exact_at(&mut pixels, data as u64).is_ok() {
                         let header = words(&buf[off..(off + 96).min(n)]).map(|(_, v)| v).collect();
                         out.push((data, header, pixels));

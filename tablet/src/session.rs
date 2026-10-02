@@ -67,7 +67,7 @@ impl Session {
 
         let (w, h) = (epd.width() as u32, epd.height() as u32);
         let saved = match takeover::learn_layout(epd.fb.pixels as usize, w, h, 32)
-            .and_then(|layout| takeover::snapshot_images(xochitl, layout, w, h, 32, epd.fb.len()))
+            .and_then(|layout| takeover::snapshot_images(xochitl, layout, w, h, 32, epd.fb.format as u32, epd.fb.len()))
         {
             Ok(mut found) if found.len() == 1 => Some(found.remove(0).2),
             // Copies of the same frame (xochitl keeps more than one) are all fine.
