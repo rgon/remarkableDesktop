@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Abs {
@@ -44,6 +44,13 @@ pub enum Msg {
     /// Host → tablet clock probe; answered with `Pong`.
     Ping { host_us: u64 },
     Pong { host_us: u64, tablet_us: u64 },
+    /// Tablet → host over SSH: connect to `addr:port` and send `token` to
+    /// move the session to a TCP_NODELAY socket.
+    Direct { addr: String, port: u16, token: [u8; 16] },
+    /// Host → tablet: monitors that can be targeted, in order.
+    Screens { names: Vec<String> },
+    /// Tablet → host: map absolute input to screen `index` (0 = all).
+    Target { index: u8 },
     /// The tablet is exiting on purpose (X button held, power button).
     Bye,
 }
@@ -54,6 +61,9 @@ const FRAME: u8 = 3;
 const BYE: u8 = 4;
 const PING: u8 = 5;
 const PONG: u8 = 6;
+const DIRECT: u8 = 7;
+const SCREENS: u8 = 8;
+const TARGET: u8 = 9;
 
 impl Msg {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
@@ -67,8 +77,7 @@ impl Msg {
             }
             Msg::Device(d) => {
                 p.push(d.id);
-                p.extend_from_slice(&(d.name.len() as u16).to_le_bytes());
-                p.extend_from_slice(d.name.as_bytes());
+                put_str(&mut p, &d.name);
                 p.extend_from_slice(&d.props.to_le_bytes());
                 p.extend_from_slice(&(d.keys.len() as u16).to_le_bytes());
                 for k in &d.keys {
@@ -103,6 +112,23 @@ impl Msg {
                 p.extend_from_slice(&tablet_us.to_le_bytes());
                 PONG
             }
+            Msg::Direct { addr, port, token } => {
+                put_str(&mut p, addr);
+                p.extend_from_slice(&port.to_le_bytes());
+                p.extend_from_slice(token);
+                DIRECT
+            }
+            Msg::Screens { names } => {
+                p.push(names.len() as u8);
+                for n in names {
+                    put_str(&mut p, n);
+                }
+                SCREENS
+            }
+            Msg::Target { index } => {
+                p.push(*index);
+                TARGET
+            }
         };
         w.write_all(&[tag])?;
         w.write_all(&(p.len() as u32).to_le_bytes())?;
@@ -127,8 +153,7 @@ impl Msg {
             HELLO => Msg::Hello { version: c.u16()?, width: c.u16()?, height: c.u16()?, rotation: c.u16()? },
             DEVICE => {
                 let id = c.u8()?;
-                let n = c.u16()? as usize;
-                let name = String::from_utf8_lossy(c.take(n)?).into_owned();
+                let name = c.str()?;
                 let props = c.u32()?;
                 let keys = (0..c.u16()?).map(|_| c.u16()).collect::<io::Result<_>>()?;
                 let abs = (0..c.u16()?)
@@ -148,6 +173,9 @@ impl Msg {
             BYE => Msg::Bye,
             PING => Msg::Ping { host_us: c.u64()? },
             PONG => Msg::Pong { host_us: c.u64()?, tablet_us: c.u64()? },
+            DIRECT => Msg::Direct { addr: c.str()?, port: c.u16()?, token: c.take(16)?.try_into().unwrap() },
+            SCREENS => Msg::Screens { names: (0..c.u8()?).map(|_| c.str()).collect::<io::Result<_>>()? },
+            TARGET => Msg::Target { index: c.u8()? },
             t => return Err(bad(&format!("unknown message tag {t}"))),
         };
         Ok(Some(msg))
@@ -178,6 +206,11 @@ pub fn monotonic_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
+fn put_str(p: &mut Vec<u8>, s: &str) {
+    p.extend_from_slice(&(s.len() as u16).to_le_bytes());
+    p.extend_from_slice(s.as_bytes());
+}
+
 fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
@@ -192,6 +225,10 @@ impl<'a> Cursor<'a> {
         let s = self.buf.get(self.at..self.at + n).ok_or_else(|| bad("truncated message"))?;
         self.at += n;
         Ok(s)
+    }
+    fn str(&mut self) -> io::Result<String> {
+        let n = self.u16()? as usize;
+        Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
     }
     fn u8(&mut self) -> io::Result<u8> {
         Ok(self.take(1)?[0])
@@ -228,6 +265,9 @@ mod tests {
             Msg::Frame { device: 1, time_us: 123_456_789, events: vec![Event { kind: 3, code: 0, value: -5 }] },
             Msg::Ping { host_us: 42 },
             Msg::Pong { host_us: 42, tablet_us: 7 },
+            Msg::Direct { addr: "10.11.99.1".into(), port: 4242, token: [9; 16] },
+            Msg::Screens { names: vec!["DP-6".into(), "HDMI-2".into()] },
+            Msg::Target { index: 2 },
             Msg::Bye,
         ];
         let mut buf = Vec::new();
