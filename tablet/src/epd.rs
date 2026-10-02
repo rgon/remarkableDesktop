@@ -44,8 +44,6 @@ impl Mode {
 
 // QImage::Format values we know how to address.
 pub const FORMAT_RGB32: i32 = 4;
-pub const FORMAT_ARGB32: i32 = 5;
-pub const FORMAT_ARGB32_PREMUL: i32 = 6;
 pub const FORMAT_RGB16: i32 = 7;
 pub const FORMAT_GRAYSCALE8: i32 = 24;
 
@@ -62,15 +60,6 @@ pub struct ImageInfo {
 unsafe impl Send for ImageInfo {}
 
 impl ImageInfo {
-    pub fn bytes_per_pixel(&self) -> Option<usize> {
-        match self.format {
-            FORMAT_RGB32 | FORMAT_ARGB32 | FORMAT_ARGB32_PREMUL => Some(4),
-            FORMAT_RGB16 => Some(2),
-            FORMAT_GRAYSCALE8 => Some(1),
-            _ => None,
-        }
-    }
-
     pub fn len(&self) -> usize {
         self.stride as usize * self.height as usize
     }
@@ -240,12 +229,13 @@ impl Epd {
         }
 
         let candidates = std::mem::take(&mut *CAPTURED.lock().unwrap());
+        // The engine converts the RGB32 image into its Grayscale8 one on every
+        // swap, so RGB32 is the one to draw into.
         let fb = candidates
             .iter()
-            .filter(|c| !c.pixels.is_null() && c.bytes_per_pixel().is_some() && c.width >= 1000 && c.height >= 1000)
-            .max_by_key(|c| c.width * c.height)
+            .find(|c| !c.pixels.is_null() && c.format == FORMAT_RGB32 && c.width >= 1000 && c.height >= 1000)
             .copied()
-            .ok_or_else(|| format!("no screen-sized framebuffer among {candidates:?}"))?;
+            .ok_or_else(|| format!("no screen-sized RGB32 framebuffer among {candidates:?}"))?;
 
         Ok(Self { instance, swap_fn, process_events_fn, candidates, fb })
     }
@@ -274,8 +264,4 @@ impl Epd {
         unsafe { (self.process_events_fn)(0, max_ms) };
     }
 
-    /// The screen-sized candidate in `format`, if the engine made one.
-    pub fn image(&self, format: i32) -> Option<ImageInfo> {
-        self.candidates.iter().find(|c| c.format == format && c.width == self.fb.width && c.height == self.fb.height).copied()
-    }
 }

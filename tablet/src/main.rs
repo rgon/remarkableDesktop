@@ -105,30 +105,24 @@ fn probe() -> Result<(), String> {
     let (w, h) = (epd.width(), epd.height());
     let ours = unsafe { std::slice::from_raw_parts(epd.fb.pixels, epd.fb.len()) };
     write_pgm(&format!("{dir}/ours-initial.pgm"), w, h, &epd.fb.to_gray(ours));
-    let images: Vec<epd::ImageInfo> = [epd::FORMAT_GRAYSCALE8, epd::FORMAT_RGB32].iter().filter_map(|&f| epd.image(f)).collect();
-    let buffers: Vec<(usize, usize)> = images.iter().map(|im| (im.pixels as usize, im.len())).collect();
-    let saved = takeover::snapshot_via_engine(xpid, epd.instance as usize, &buffers).unwrap_or_else(|e| {
-        eprintln!("remvnc: snapshot: {e}");
-        vec![]
-    });
-    for (i, buf) in saved.iter().enumerate() {
-        write_pgm(&format!("{dir}/xochitl-{}.pgm", images[i].format), w, h, &images[i].to_gray(buf));
+    // xochitl's own copy of the screen, found by its QImageData header.
+    let t = Instant::now();
+    let saved = takeover::learn_layout(epd.fb.pixels as usize, w as u32, h as u32, 32)
+        .and_then(|layout| takeover::snapshot_images(xpid, layout, w as u32, h as u32, 32, epd.fb.len()))
+        .unwrap_or_else(|e| {
+            eprintln!("remvnc: snapshot: {e}");
+            vec![]
+        });
+    for (i, (addr, buf)) in saved.iter().enumerate() {
+        eprintln!("remvnc: xochitl screen image {i} at {addr:#x}");
+        write_pgm(&format!("{dir}/xochitl-{i}.pgm"), w, h, &epd.fb.to_gray(buf));
     }
+    eprintln!("remvnc: snapshot scan took {:?}", t.elapsed());
 
-    // Which buffer reaches the panel? Label each with its own name, then refresh both areas.
     let text = MonoTextStyle::new(&FONT_10X20, Gray8::BLACK);
     let panel = PrimitiveStyleBuilder::new().fill_color(Gray8::WHITE).stroke_color(Gray8::BLACK).stroke_width(6).build();
-    for (i, im) in images.iter().enumerate() {
-        let mut c = Canvas::new(&epd, vec![*im]);
-        let x = 100 + i as i32 * 620;
-        let _ = Rectangle::new(Point::new(x, 100), Size::new(584, 200)).into_styled(panel).draw(&mut c);
-        let name = if im.format == epd::FORMAT_GRAYSCALE8 { "GRAY" } else { "RGB" };
-        let _ = Text::new(name, Point::new(x / 4 + 12, 50), text).draw(&mut Scaled { target: &mut c, factor: 4 });
-    }
-    epd.swap(100, 100, 1204, 200, Mode::Content, 0);
-    let mut ok = wait(&epd, 2500);
-
-    let mut canvas = Canvas::new(&epd, images.clone());
+    let mut ok = true;
+    let mut canvas = Canvas::new(&epd, vec![epd.fb]);
 
     for (i, mode) in Mode::ALL.into_iter().enumerate() {
         if !ok {
@@ -186,10 +180,9 @@ fn probe() -> Result<(), String> {
         if wd_before != wd_after { "petting works" } else { "NOT updated" });
 
     // Put xochitl's last frame back so its idea of the panel matches reality.
-    if saved.len() == images.len() && !saved.is_empty() {
-        for (im, buf) in images.iter().zip(&saved) {
-            unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), im.pixels, buf.len()) };
-        }
+    // Only restore when the match is unambiguous.
+    if let [(_, buf)] = &saved[..] {
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), epd.fb.pixels, buf.len()) };
         epd.swap(0, 0, w, h, Mode::Content, 0);
         epd.process_events(20);
         std::thread::sleep(Duration::from_millis(1500));

@@ -237,104 +237,73 @@ pub fn mappings(pid: &str) -> Vec<Mapping> {
         .collect()
 }
 
-/// Copies of xochitl's buffers that are laid out like ours: same mapping size,
-/// permissions and backing, read at the same offset into the mapping.
-pub fn snapshot_like(xochitl: i32, ours: *const u8, len: usize) -> io::Result<Vec<(Mapping, Vec<u8>)>> {
-    let addr = ours as usize;
-    let mine = mappings("self")
-        .into_iter()
-        .find(|m| m.start <= addr && addr < m.end)
-        .ok_or_else(|| io::Error::other("our framebuffer is not in any mapping"))?;
-    let offset = addr - mine.start;
-    let mem = fs::File::open(format!("/proc/{xochitl}/mem"))?;
-    let mut out = vec![];
-    for m in mappings(&xochitl.to_string()) {
-        if m.end - m.start == mine.end - mine.start && m.perms == mine.perms && m.path == mine.path {
-            let mut buf = vec![0u8; len];
-            if mem.read_exact_at(&mut buf, (m.start + offset) as u64).is_ok() {
-                out.push((m, buf));
+
+/// Where `QImageData` keeps the fields we match on, relative to `width`.
+#[derive(Debug, Clone, Copy)]
+pub struct ImageDataLayout {
+    /// Offset of the `data` pointer from the `width` field.
+    data_from_width: usize,
+}
+
+fn words(buf: &[u8]) -> impl Iterator<Item = (usize, u32)> + '_ {
+    buf.chunks_exact(4).enumerate().map(|(i, c)| (i * 4, u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+}
+
+/// Whether `buf[at..]` starts with `width, height, depth` of a screen-sized image.
+fn header_at(buf: &[u8], at: usize, w: u32, h: u32, depth: u32) -> bool {
+    let word = |o: usize| buf.get(at + o..at + o + 4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    word(0) == Some(w) && word(4) == Some(h) && word(8) == Some(depth)
+}
+
+fn heap_mappings(pid: &str) -> Vec<Mapping> {
+    mappings(pid).into_iter().filter(|m| m.perms.starts_with("rw") && (m.path.is_empty() || m.path == "[heap]")).collect()
+}
+
+/// Learns the `QImageData` layout from one of our own images.
+pub fn learn_layout(pixels: usize, w: u32, h: u32, depth: u32) -> io::Result<ImageDataLayout> {
+    let mem = fs::File::open("/proc/self/mem")?;
+    for m in heap_mappings("self") {
+        let mut buf = vec![0u8; m.end - m.start];
+        if mem.read_exact_at(&mut buf, m.start as u64).is_err() {
+            continue;
+        }
+        for (off, v) in words(&buf) {
+            if v == w && header_at(&buf, off, w, h, depth) {
+                if let Some((d, _)) = words(&buf[off..(off + 64).min(buf.len())]).find(|&(_, p)| p as usize == pixels) {
+                    return Ok(ImageDataLayout { data_from_width: d });
+                }
             }
         }
     }
-    eprintln!("remvnc: our fb mapping {mine:?} offset {offset:#x}; {} xochitl candidates", out.len());
-    Ok(out)
+    Err(io::Error::other("our own QImageData not found"))
 }
 
-fn readable(maps: &[Mapping], addr: usize, len: usize) -> bool {
-    maps.iter().any(|m| m.perms.starts_with('r') && m.start <= addr && addr + len <= m.end)
-}
-
-/// Finds a chain of offsets from `from` to a word equal to `target`:
-/// `[o1, o2, .., k]` means `*( *(*(from + o1) + o2) .. + k) == target`.
-/// Only follows pointers into readable mappings of this process.
-fn find_path(maps: &[Mapping], from: usize, target: usize, depth: u32, span: usize) -> Option<Vec<usize>> {
-    for off in (0..span).step_by(4) {
-        if !readable(maps, from + off, 4) {
-            return None;
-        }
-        let v = unsafe { ((from + off) as *const usize).read() };
-        if v == target {
-            return Some(vec![off]);
-        }
-    }
-    if depth == 0 {
-        return None;
-    }
-    for off in (0..span).step_by(4) {
-        let v = unsafe { ((from + off) as *const usize).read() };
-        if v % 4 == 0 && readable(maps, v, span) {
-            if let Some(mut rest) = find_path(maps, v, target, depth - 1, 256) {
-                rest.insert(0, off);
-                return Some(rest);
-            }
-        }
-    }
-    None
-}
-
-fn read_word(mem: &fs::File, addr: usize) -> io::Result<usize> {
-    let mut b = [0u8; 4];
-    mem.read_exact_at(&mut b, addr as u64)?;
-    Ok(u32::from_le_bytes(b) as usize)
-}
-
-/// Copies xochitl's engine buffers, located by replaying in xochitl the
-/// pointer path that leads from the engine singleton to each of our buffers.
-/// The singleton is found through its static slot in libqsgepaper.so.
-pub fn snapshot_via_engine(xochitl: i32, instance: usize, buffers: &[(usize, usize)]) -> io::Result<Vec<Vec<u8>>> {
-    const LIB: &str = "libqsgepaper.so";
-    let maps = mappings("self");
-    let lib: Vec<&Mapping> = maps.iter().filter(|m| m.path.ends_with(LIB)).collect();
-    let base = lib.iter().map(|m| m.start).min().ok_or_else(|| io::Error::other("libqsgepaper not mapped"))?;
-    // Writable data plus the anonymous .bss right after the library's last mapping.
-    let last_end = lib.iter().map(|m| m.end).max().unwrap();
-    let mut regions: Vec<&Mapping> = lib.iter().copied().filter(|m| m.perms.starts_with("rw")).collect();
-    regions.extend(maps.iter().filter(|m| m.start == last_end && m.path.is_empty()));
-    let slot = regions
-        .iter()
-        .flat_map(|m| (m.start..m.end).step_by(4))
-        .find(|&a| unsafe { (a as *const usize).read() } == instance)
-        .ok_or_else(|| io::Error::other("engine singleton slot not found"))?;
-
-    let xmaps = mappings(&xochitl.to_string());
-    let xbase = xmaps.iter().filter(|m| m.path.ends_with(LIB)).map(|m| m.start).min()
-        .ok_or_else(|| io::Error::other("libqsgepaper not mapped in xochitl"))?;
+/// Finds xochitl's screen-sized images of `depth` bits and copies their pixels.
+/// Returns (data address, pixels) for each match.
+pub fn snapshot_images(xochitl: i32, layout: ImageDataLayout, w: u32, h: u32, depth: u32, len: usize) -> io::Result<Vec<(usize, Vec<u8>)>> {
     let mem = fs::File::open(format!("/proc/{xochitl}/mem"))?;
-    let xinstance = read_word(&mem, xbase + (slot - base))?;
-    eprintln!("remvnc: singleton slot lib+{:#x}; ours {instance:#x}, xochitl's {xinstance:#x}", slot - base);
-
     let mut out = vec![];
-    for &(pixels, len) in buffers {
-        let path = find_path(&maps, instance, pixels, 2, 1024)
-            .ok_or_else(|| io::Error::other(format!("no pointer path to {pixels:#x}")))?;
-        let mut addr = xinstance;
-        for off in &path {
-            addr = read_word(&mem, addr + off)?;
+    let mut chunk = vec![0u8; 1 << 20];
+    for m in heap_mappings(&xochitl.to_string()) {
+        let mut at = m.start;
+        while at < m.end {
+            let n = (m.end - at).min(chunk.len());
+            let buf = &mut chunk[..n];
+            if mem.read_exact_at(buf, at as u64).is_err() {
+                break;
+            }
+            // Headers straddling a chunk boundary are missed; images are rare enough not to care.
+            for (off, v) in words(buf) {
+                if v == w && header_at(buf, off, w, h, depth) && off + layout.data_from_width + 4 <= n {
+                    let data = u32::from_le_bytes(buf[off + layout.data_from_width..][..4].try_into().unwrap()) as usize;
+                    let mut pixels = vec![0u8; len];
+                    if data != 0 && mem.read_exact_at(&mut pixels, data as u64).is_ok() {
+                        out.push((data, pixels));
+                    }
+                }
+            }
+            at += n;
         }
-        eprintln!("remvnc: path {path:x?} -> xochitl buffer {addr:#x}");
-        let mut buf = vec![0u8; len];
-        mem.read_exact_at(&mut buf, addr as u64)?;
-        out.push(buf);
     }
     Ok(out)
 }
