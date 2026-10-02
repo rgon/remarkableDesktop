@@ -13,6 +13,8 @@
 #   --fast-mode M  --settle-mode M  --settle-ms N
 # Client options: --stats  --no-display  --list-screens (the client passes tablet
 #   options on when it starts the tablet side).
+# Before the client starts, checks that /dev/uinput is writable (needed for
+#   input over the network, without USB) and offers to install the udev rule.
 # Environment: RM=root@10.11.99.1  REMOTE=/home/root/remdesktop
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -78,8 +80,54 @@ deploy() {
     echo "remdesktop: deployed $(du -h "$BIN" | cut -f1)"
 }
 
+RULE=host/99-remdesktop-uinput.rules
+
+# Input over the network (no USB, e.g. after "go remote") is replayed through
+# /dev/uinput, which needs a udev rule plus membership of the input group.
+# USB HID input works without either, so this only asks, never insists.
+ensure_uinput() {
+    [ -w /dev/uinput ] && return 0
+    local rule_present=no in_group=no
+    grep -qs 'KERNEL=="uinput"' /etc/udev/rules.d/*.rules && rule_present=yes
+    id -nG | tr ' ' '\n' | grep -qx input && in_group=yes
+    echo "remdesktop: /dev/uinput is not writable, so input over the network (without USB) won't work."
+    echo "            USB input is unaffected."
+    local steps=()
+    if [ "$rule_present" = no ]; then
+        steps+=("sudo install -m644 $RULE /etc/udev/rules.d/")
+        steps+=("sudo udevadm control --reload")
+    fi
+    steps+=("sudo chgrp input /dev/uinput && sudo chmod 660 /dev/uinput")
+    if [ "$in_group" = no ]; then
+        steps+=("sudo usermod -aG input $USER   # then log out and back in")
+    fi
+    if [ ! -t 0 ]; then
+        echo "            To enable it, run:"
+        printf '              %s\n' "${steps[@]}"
+        return 0
+    fi
+    echo "            This would run:"
+    printf '              %s\n' "${steps[@]}"
+    read -r -p "remdesktop: enable it now? [y/N] " answer
+    case $answer in
+        y | Y | yes)
+            if [ "$rule_present" = no ]; then
+                sudo install -m644 "$RULE" /etc/udev/rules.d/
+                sudo udevadm control --reload
+            fi
+            sudo chgrp input /dev/uinput && sudo chmod 660 /dev/uinput
+            if [ "$in_group" = no ]; then
+                sudo usermod -aG input "$USER"
+                echo "remdesktop: added $USER to the input group; log out and back in for it to apply."
+            fi
+            ;;
+        *) echo "remdesktop: skipped; continuing with USB input only." ;;
+    esac
+}
+
 client() {
     [ -x "$CLIENT" ] || build
+    ensure_uinput
     exec "$CLIENT" --ssh "$RM" --remote "$REMOTE" "$@"
 }
 
@@ -106,7 +154,7 @@ case $cmd in
         if running; then echo "remdesktop: running"; else echo "remdesktop: not running"; fi
         ;;
     -h | --help | help)
-        sed -n '2,19p' "$0"
+        sed -n '2,21p' "$0"
         ;;
     "" | -*)
         build
@@ -114,7 +162,7 @@ case $cmd in
         client "$@"
         ;;
     *)
-        sed -n '2,19p' "$0" >&2
+        sed -n '2,21p' "$0" >&2
         exit 1
         ;;
 esac
