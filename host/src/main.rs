@@ -17,7 +17,7 @@ use std::time::Duration;
 
 const USAGE: &str = "usage: remvnc-host [--ssh root@10.11.99.1] [--remote /home/root/remvnc]
                    [--deploy <local remvnc binary>] [--stats] [--ssh-only] [--list-screens]
-                   [--rotate 0|90|180|270] [--touch touchpad|touchscreen]
+                   [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
                    [--palm-major N] [--pen-grace-ms N] [--log-touch]";
 
 struct Args {
@@ -44,7 +44,7 @@ fn parse() -> Result<Args, String> {
                 }
                 std::process::exit(0);
             }
-            "--rotate" | "--touch" | "--palm-major" | "--pen-grace-ms" => {
+            "--rotate" | "--touch" | "--pen" | "--palm-major" | "--pen-grace-ms" => {
                 let v = value()?;
                 a.run_args.extend([flag, v]);
             }

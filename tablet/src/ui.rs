@@ -64,13 +64,15 @@ pub const HOLD_STEPS: u32 = 12;
 pub enum Button {
     /// Cycles which monitor absolute input maps to.
     Screen = 0,
+    /// Switches the pen between drawing tablet and absolute mouse.
+    Pen = 1,
     /// Switches touch between touchpad and touchscreen.
-    Mode = 1,
-    Close = 2,
+    Mode = 2,
+    Close = 3,
 }
 
 impl Button {
-    pub const ALL: [Button; 3] = [Button::Screen, Button::Mode, Button::Close];
+    pub const ALL: [Button; 4] = [Button::Screen, Button::Pen, Button::Mode, Button::Close];
 
     /// How long the button must be held.
     pub fn hold(self) -> std::time::Duration {

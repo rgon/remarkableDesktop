@@ -14,6 +14,7 @@ pub const SYN_REPORT: u16 = 0;
 
 pub const KEY_POWER: u16 = 116;
 const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
 const BTN_TOOL_PEN: u16 = 0x140;
 const BTN_TOOL_RUBBER: u16 = 0x141;
 const BTN_TOOL_FINGER: u16 = 0x145;
@@ -172,7 +173,22 @@ fn resolution(info: AbsInfo, portrait: usize) -> i32 {
 }
 
 /// Wacom digitizer → virtual drawing tablet, events mapped one by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PenMode {
+    /// Drawing tablet: pressure, tilt, hover, eraser. Apps must draw their
+    /// own pen cursor (Chromium on Wayland doesn't).
+    Tablet,
+    /// Absolute mouse: hover moves the normal cursor, tip = left button,
+    /// eraser tip = right button. Works everywhere, no pressure.
+    Mouse,
+}
+
 pub struct Pen {
+    mode: PenMode,
+    /// Eraser end in range (mouse mode: tip means right button).
+    rubber: bool,
+    /// Button currently pressed on the host in mouse mode.
+    pressed: Option<u16>,
     map: AxisMap,
     pos: [AbsInfo; 2],
     abs: Vec<Abs>,
@@ -186,7 +202,7 @@ impl Pen {
     /// portrait X, raw X against its portrait Y.
     const PORTRAIT: Xform = Xform { swap: true, flip: [false, true] };
 
-    pub fn new(file: &File, rotation: u16) -> io::Result<Self> {
+    pub fn new(file: &File, rotation: u16, mode: PenMode) -> io::Result<Self> {
         let map = AxisMap::new(&[Self::PORTRAIT, Xform::rotation(rotation)]);
         let pos = [abs_info(file, ABS_X)?, abs_info(file, ABS_Y)?];
         let mut abs = vec![];
@@ -205,16 +221,45 @@ impl Pen {
             let m = i.max.max(-i.min);
             abs.push(Abs { code, min: -m, max: m, resolution: 0 });
         }
-        Ok(Self { map, pos, abs, pending: vec![], in_range: false })
+        Ok(Self { mode, rubber: false, pressed: None, map, pos, abs, pending: vec![], in_range: false })
+    }
+
+    pub fn mode(&self) -> PenMode {
+        self.mode
+    }
+
+    /// Switches mode; returns a frame releasing anything held on the old
+    /// device. The caller then re-declares `device()`.
+    pub fn set_mode(&mut self, mode: PenMode) -> Option<Vec<Event>> {
+        let release = match (self.mode, self.pressed.take()) {
+            (PenMode::Mouse, Some(b)) => Some(vec![Event { kind: EV_KEY, code: b, value: 0 }]),
+            (PenMode::Tablet, _) if self.in_range => Some(vec![
+                Event { kind: EV_KEY, code: BTN_TOUCH, value: 0 },
+                Event { kind: EV_KEY, code: if self.rubber { BTN_TOOL_RUBBER } else { BTN_TOOL_PEN }, value: 0 },
+            ]),
+            _ => None,
+        };
+        self.mode = mode;
+        self.pending.clear();
+        release
     }
 
     pub fn device(&self) -> Device {
-        Device {
-            id: PEN_ID,
-            name: "remvnc pen".into(),
-            props: 1 << INPUT_PROP_POINTER,
-            keys: vec![BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_TOUCH, BTN_STYLUS, BTN_STYLUS2],
-            abs: self.abs.clone(),
+        match self.mode {
+            PenMode::Tablet => Device {
+                id: PEN_ID,
+                name: "remvnc pen".into(),
+                props: 1 << INPUT_PROP_POINTER,
+                keys: vec![BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_TOUCH, BTN_STYLUS, BTN_STYLUS2],
+                abs: self.abs.clone(),
+            },
+            PenMode::Mouse => Device {
+                id: PEN_ID,
+                name: "remvnc pen (mouse)".into(),
+                props: 0,
+                keys: vec![BTN_LEFT, BTN_RIGHT],
+                abs: self.abs.iter().filter(|a| a.code == ABS_X || a.code == ABS_Y).cloned().collect(),
+            },
         }
     }
 
@@ -232,8 +277,28 @@ impl Pen {
                 }
                 (EV_KEY, BTN_TOOL_PEN | BTN_TOOL_RUBBER) => {
                     self.in_range = e.value != 0;
-                    pending.push(Event { kind: e.kind, code: e.code, value: e.value });
+                    if e.code == BTN_TOOL_RUBBER {
+                        self.rubber = e.value != 0;
+                    }
+                    if self.mode == PenMode::Tablet {
+                        pending.push(Event { kind: e.kind, code: e.code, value: e.value });
+                    }
                 }
+                (EV_KEY, BTN_TOUCH) if self.mode == PenMode::Mouse => {
+                    let button = if self.rubber { BTN_RIGHT } else { BTN_LEFT };
+                    match (e.value != 0, self.pressed) {
+                        (true, None) => {
+                            self.pressed = Some(button);
+                            pending.push(Event { kind: EV_KEY, code: button, value: 1 });
+                        }
+                        (false, Some(b)) => {
+                            self.pressed = None;
+                            pending.push(Event { kind: EV_KEY, code: b, value: 0 });
+                        }
+                        _ => {}
+                    }
+                }
+                (EV_KEY, _) | (EV_ABS, ABS_TILT_X | ABS_TILT_Y | ABS_PRESSURE | ABS_DISTANCE) if self.mode == PenMode::Mouse => {}
                 (EV_ABS, ABS_X | ABS_Y) => {
                     let raw = (e.code - ABS_X) as usize;
                     let (out, flipped) = self.map.to[raw];

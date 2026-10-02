@@ -13,7 +13,7 @@ use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::text::Text;
 use epd::{Epd, Mode};
 use gfx::{Canvas, Scaled};
-use input::{PalmConfig, Pen, Touch, TouchMode};
+use input::{PalmConfig, Pen, PenMode, Touch, TouchMode};
 use ui::Button;
 use remvnc_proto::Msg;
 use session::{Session, quitting};
@@ -22,7 +22,7 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:
-  remvnc run [--rotate 0|90|180|270] [--touch touchpad|touchscreen]
+  remvnc run [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
              [--palm-major N] [--pen-grace-ms N] [--log-touch] [--ssh-only]
       Forward pen/touch to remvnc-host (on stdout, or a direct socket it
       is told about) until the X is held.
@@ -54,12 +54,14 @@ fn main() {
 struct RunArgs {
     rotation: u16,
     touch: TouchMode,
+    pen: PenMode,
     palm: PalmConfig,
     ssh_only: bool,
 }
 
 fn parse_run(args: &[String]) -> Result<RunArgs, String> {
     let (mut rotation, mut touch, mut palm, mut ssh_only) = (90, TouchMode::Touchpad, PalmConfig::default(), false);
+    let mut pen = PenMode::Tablet;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || it.next().ok_or(format!("{a} needs a value"));
@@ -74,6 +76,13 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
                     _ => return Err("--touch: touchpad or touchscreen".into()),
                 }
             }
+            "--pen" => {
+                pen = match value()?.as_str() {
+                    "tablet" => PenMode::Tablet,
+                    "mouse" => PenMode::Mouse,
+                    _ => return Err("--pen: tablet or mouse".into()),
+                }
+            }
             "--palm-major" => palm.max_major = value()?.parse().map_err(|_| "--palm-major: a number")?,
             "--pen-grace-ms" => palm.pen_grace_us = value()?.parse::<u64>().map_err(|_| "--pen-grace-ms: a number")? * 1000,
             "--log-touch" => palm.log = true,
@@ -81,7 +90,7 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             _ => return Err(format!("unknown argument {a}\n{USAGE}")),
         }
     }
-    Ok(RunArgs { rotation, touch, palm, ssh_only })
+    Ok(RunArgs { rotation, touch, pen, palm, ssh_only })
 }
 
 /// Pumps Qt events for `ms`; false if we were asked to quit.
@@ -114,17 +123,24 @@ fn mode_label(m: TouchMode) -> &'static str {
     }
 }
 
+fn pen_label(m: PenMode) -> &'static str {
+    match m {
+        PenMode::Tablet => "PEN",
+        PenMode::Mouse => "MOUSE",
+    }
+}
+
 fn screen_label(target: u8) -> String {
     if target == 0 { "ALL".into() } else { target.to_string() }
 }
 
 fn run(args: RunArgs) -> Result<(), String> {
-    let RunArgs { rotation, touch: touch_mode, palm, ssh_only } = args;
+    let RunArgs { rotation, touch: touch_mode, pen: pen_mode, palm, ssh_only } = args;
     // Before pausing xochitl: the host must answer within a few seconds.
     let mut link = link::Link::open(ssh_only);
     let (session, epd) = Session::begin(0)?;
     let inputs = &session.inputs;
-    let mut pen = inputs.pen.as_ref().map(|g| Pen::new(&g.file, rotation)).transpose().map_err(|e| format!("pen: {e}"))?;
+    let mut pen = inputs.pen.as_ref().map(|g| Pen::new(&g.file, rotation, pen_mode)).transpose().map_err(|e| format!("pen: {e}"))?;
     let mut touch = inputs
         .touch
         .as_ref()
@@ -137,6 +153,7 @@ fn run(args: RunArgs) -> Result<(), String> {
     let mut screens: u8 = 0;
     ui.set_label(Button::Screen, &screen_label(target));
     ui.set_label(Button::Mode, mode_label(touch_mode));
+    ui.set_label(Button::Pen, pen_label(pen_mode));
     ui.draw_home();
     realtime_priority();
 
@@ -251,6 +268,21 @@ fn run(args: RunArgs) -> Result<(), String> {
                                     alive &= Msg::Device(t.device()).write_to(&mut link.out).is_ok();
                                     eprintln!("remvnc: touch is now {next:?}");
                                     ui.set_label(b, mode_label(next));
+                                }
+                            }
+                            Button::Pen => {
+                                if let Some(p) = pen.as_mut() {
+                                    let next = match p.mode() {
+                                        PenMode::Tablet => PenMode::Mouse,
+                                        PenMode::Mouse => PenMode::Tablet,
+                                    };
+                                    let now = remvnc_proto::monotonic_us();
+                                    if let Some(release) = p.set_mode(next) {
+                                        alive &= Msg::Frame { device: input::PEN_ID, time_us: now, events: release }.write_to(&mut link.out).is_ok();
+                                    }
+                                    alive &= Msg::Device(p.device()).write_to(&mut link.out).is_ok();
+                                    eprintln!("remvnc: pen is now {next:?}");
+                                    ui.set_label(b, pen_label(next));
                                 }
                             }
                             Button::Screen => {
