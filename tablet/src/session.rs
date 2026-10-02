@@ -46,7 +46,12 @@ impl Session {
         let mut inputs = Inputs { pen: None, touch: None, power: None };
         for i in 0..3 {
             let path = format!("/dev/input/event{i}");
-            match Grabbed::open(&path) {
+            let grabbed = Grabbed::open(&path).inspect(|g| {
+                if let Err(e) = crate::input::use_monotonic_clock(&g.file) {
+                    eprintln!("remvnc: {path}: monotonic timestamps: {e}");
+                }
+            });
+            match grabbed {
                 Ok(g) if g.name.contains("Wacom") => inputs.pen = Some(g),
                 Ok(g) if g.name.contains("pt_mt") => inputs.touch = Some(g),
                 Ok(g) if g.name.contains("powerkey") => inputs.power = Some(g),

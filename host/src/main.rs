@@ -5,22 +5,26 @@ mod uinput;
 
 use remvnc_proto::Msg;
 use std::collections::HashMap;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::process::{Command, ExitCode, Stdio};
 
+mod stats;
+
 const USAGE: &str = "usage: remvnc-host [--ssh root@10.11.99.1] [--remote /home/root/remvnc]
-                   [--deploy <local remvnc binary>] [--rotate 0|90|180|270]
-                   [--touch touchpad|touchscreen]";
+                   [--deploy <local remvnc binary>] [--stats]
+                   [--rotate 0|90|180|270] [--touch touchpad|touchscreen]
+                   [--palm-major N] [--pen-grace-ms N] [--log-touch]";
 
 struct Args {
     ssh: String,
     remote: String,
     deploy: Option<String>,
+    stats: bool,
     run_args: Vec<String>,
 }
 
 fn parse() -> Result<Args, String> {
-    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remvnc".into(), deploy: None, run_args: vec![] };
+    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remvnc".into(), deploy: None, stats: false, run_args: vec![] };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value\n{USAGE}"));
@@ -28,10 +32,12 @@ fn parse() -> Result<Args, String> {
             "--ssh" => a.ssh = value()?,
             "--remote" => a.remote = value()?,
             "--deploy" => a.deploy = Some(value()?),
-            "--rotate" | "--touch" => {
+            "--stats" => a.stats = true,
+            "--rotate" | "--touch" | "--palm-major" | "--pen-grace-ms" => {
                 let v = value()?;
                 a.run_args.extend([flag, v]);
             }
+            "--log-touch" => a.run_args.push(flag),
             "-h" | "--help" => return Err(USAGE.into()),
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
@@ -70,8 +76,21 @@ fn run() -> Result<(), String> {
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("ssh: {e}"))?;
-    let _keep_stdin = child.stdin.take();
+    let mut to_tablet = child.stdin.take().unwrap();
     let mut stream = BufReader::new(child.stdout.take().unwrap());
+
+    // Clock probes: 10 Hz, for latency measurement. They also keep the
+    // channel busy in both directions, so ACKs piggyback on data.
+    let pinger = std::thread::spawn(move || {
+        loop {
+            let ping = Msg::Ping { host_us: remvnc_proto::monotonic_us() };
+            if ping.write_to(&mut to_tablet).and_then(|_| to_tablet.flush()).is_err() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    let mut stats = stats::Stats::new(args.stats);
 
     let mut devices: HashMap<u8, uinput::VirtualDevice> = HashMap::new();
     let result = loop {
@@ -89,13 +108,16 @@ fn run() -> Result<(), String> {
                 }
                 Err(e) => break Err(format!("creating \"{}\": {e}", d.name)),
             },
-            Ok(Some(Msg::Frame { device, events })) => {
+            Ok(Some(Msg::Frame { device, time_us, events })) => {
                 if let Some(v) = devices.get_mut(&device) {
                     if let Err(e) = v.emit(&events) {
                         eprintln!("remvnc-host: write to device {device}: {e}");
                     }
                 }
+                stats.frame(device, time_us);
             }
+            Ok(Some(Msg::Pong { host_us, tablet_us })) => stats.pong(host_us, tablet_us),
+            Ok(Some(Msg::Ping { .. })) => {}
             Ok(Some(Msg::Bye)) => {
                 eprintln!("remvnc-host: tablet closed the session");
                 break Ok(());
@@ -105,7 +127,9 @@ fn run() -> Result<(), String> {
         }
     };
     drop(devices);
-    drop(_keep_stdin);
+    // Closing ssh ends the session on the tablet; the pinger then exits on EPIPE.
+    let _ = child.kill();
     let _ = child.wait();
+    let _ = pinger.join();
     result
 }

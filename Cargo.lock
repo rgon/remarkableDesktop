@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "remvnc-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "remvnc-proto",
@@ -83,11 +83,14 @@ dependencies = [
 
 [[package]]
 name = "remvnc-proto"
-version = "0.1.0"
+version = "0.2.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "remvnc-tablet"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "embedded-graphics",
  "libc",

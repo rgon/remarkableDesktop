@@ -50,6 +50,8 @@ pub const TOUCH_ID: u8 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RawEvent {
+    /// Kernel timestamp, CLOCK_MONOTONIC once `use_monotonic_clock` ran.
+    pub time_us: u64,
     pub kind: u16,
     pub code: u16,
     pub value: i32,
@@ -63,6 +65,8 @@ pub fn read_events(file: &mut File) -> io::Result<Vec<RawEvent>> {
         match file.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => out.extend(buf[..n].chunks_exact(16).map(|e| RawEvent {
+                time_us: u32::from_le_bytes([e[0], e[1], e[2], e[3]]) as u64 * 1_000_000
+                    + u32::from_le_bytes([e[4], e[5], e[6], e[7]]) as u64,
                 kind: u16::from_le_bytes([e[8], e[9]]),
                 code: u16::from_le_bytes([e[10], e[11]]),
                 value: i32::from_le_bytes([e[12], e[13], e[14], e[15]]),
@@ -72,6 +76,17 @@ pub fn read_events(file: &mut File) -> io::Result<Vec<RawEvent>> {
         }
     }
     Ok(out)
+}
+
+/// Makes the device timestamp events with CLOCK_MONOTONIC, so latency can
+/// be measured against `remvnc_proto::monotonic_us`.
+pub fn use_monotonic_clock(file: &File) -> io::Result<()> {
+    let clock: libc::c_int = libc::CLOCK_MONOTONIC;
+    // EVIOCSCLOCKID
+    if unsafe { libc::ioctl(file.as_raw_fd(), 0x4004_45a0u32 as _, &clock) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -161,6 +176,9 @@ pub struct Pen {
     map: AxisMap,
     pos: [AbsInfo; 2],
     abs: Vec<Abs>,
+    pending: Vec<Event>,
+    /// Pen or eraser within hover range.
+    pub in_range: bool,
 }
 
 impl Pen {
@@ -187,7 +205,7 @@ impl Pen {
             let m = i.max.max(-i.min);
             abs.push(Abs { code, min: -m, max: m, resolution: 0 });
         }
-        Ok(Self { map, pos, abs })
+        Ok(Self { map, pos, abs, pending: vec![], in_range: false })
     }
 
     pub fn device(&self) -> Device {
@@ -200,14 +218,21 @@ impl Pen {
         }
     }
 
-    /// Maps raw events; returns finished frames (one per SYN_REPORT).
-    pub fn feed(&self, events: &[RawEvent], pending: &mut Vec<Event>, frames: &mut Vec<Vec<Event>>) {
+    /// Maps raw events; returns finished frames (one per SYN_REPORT) with
+    /// their kernel timestamps.
+    pub fn feed(&mut self, events: &[RawEvent]) -> Vec<(u64, Vec<Event>)> {
+        let mut frames = vec![];
+        let pending = &mut self.pending;
         for e in events {
             match (e.kind, e.code) {
                 (EV_SYN, SYN_REPORT) => {
                     if !pending.is_empty() {
-                        frames.push(std::mem::take(pending));
+                        frames.push((e.time_us, std::mem::take(pending)));
                     }
+                }
+                (EV_KEY, BTN_TOOL_PEN | BTN_TOOL_RUBBER) => {
+                    self.in_range = e.value != 0;
+                    pending.push(Event { kind: e.kind, code: e.code, value: e.value });
                 }
                 (EV_ABS, ABS_X | ABS_Y) => {
                     let raw = (e.code - ABS_X) as usize;
@@ -226,6 +251,7 @@ impl Pen {
                 _ => {}
             }
         }
+        frames
     }
 }
 
@@ -237,7 +263,42 @@ pub enum TouchMode {
     Touchscreen,
 }
 
+/// Palm rejection settings.
+#[derive(Debug, Clone, Copy)]
+pub struct PalmConfig {
+    /// Contacts whose ABS_MT_TOUCH_MAJOR exceeds this are palms.
+    pub max_major: i32,
+    /// Touches stay blocked this long after the pen leaves hover range.
+    pub pen_grace_us: u64,
+    /// Log a summary of every contact when it lifts.
+    pub log: bool,
+}
+
+impl Default for PalmConfig {
+    fn default() -> Self {
+        Self { max_major: 40, pen_grace_us: 500_000, log: false }
+    }
+}
+
+const MT_TOOL_PALM: i32 = 2;
+const ABS_MT_TOOL_TYPE: u16 = 0x37;
 const SLOTS: usize = 16;
+
+/// Who a contact belongs to. Decided when it lands; a forwarded contact can
+/// still turn into a palm, but a rejected one never comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Owner {
+    #[default]
+    Host,
+    /// Our own UI (the close button).
+    Ui,
+    /// Landed while the pen was near: a resting hand.
+    PenNear,
+    /// The touch controller flagged it as a palm.
+    Palm,
+    /// Contact area too large for a fingertip.
+    Large,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct Slot {
@@ -246,33 +307,41 @@ struct Slot {
     pressure: i32,
     major: i32,
     minor: i32,
+    tool: i32,
     dirty: bool,
     began: bool,
-    /// Started on our UI: never forwarded.
-    held: bool,
-    /// A held contact that is still over our UI.
+    owner: Owner,
+    /// The host currently sees this contact down.
+    forwarded: bool,
+    /// A UI contact that is still over the UI.
     inside: bool,
+    start_us: u64,
+    peak: [i32; 3],
 }
 
-/// Multitouch screen → virtual touchpad/touchscreen. Rebuilds each frame
-/// from slot state so held-back contacts never reach the host.
+/// Multitouch screen → virtual touchpad/touchscreen, with palm rejection.
+/// Frames are rebuilt from slot state, so rejected contacts never reach the
+/// host, and contacts that turn out to be palms are lifted cleanly.
 pub struct Touch {
     map: AxisMap,
     raw: [AbsInfo; 2],
     /// Output ranges, for converting to logical pixels.
     out: [AbsInfo; 2],
     mode: TouchMode,
+    palm: PalmConfig,
     abs: Vec<Abs>,
     slots: [Slot; SLOTS],
     current: usize,
     last_count: usize,
+    pen_in_range: bool,
+    pen_left_us: Option<u64>,
 }
 
 impl Touch {
     /// Touch X matches the screen; Y runs bottom to top.
     const PORTRAIT: Xform = Xform { swap: false, flip: [false, true] };
 
-    pub fn new(file: &File, rotation: u16, mode: TouchMode) -> io::Result<Self> {
+    pub fn new(file: &File, rotation: u16, mode: TouchMode, palm: PalmConfig) -> io::Result<Self> {
         let map = AxisMap::new(&[Self::PORTRAIT, Xform::rotation(rotation)]);
         let raw = [abs_info(file, ABS_MT_POSITION_X)?, abs_info(file, ABS_MT_POSITION_Y)?];
         let out = [raw[map.source(0)], raw[map.source(1)]];
@@ -287,10 +356,13 @@ impl Touch {
         abs.push(Abs { code: ABS_MT_TRACKING_ID, min: 0, max: 65535, resolution: 0 });
         for code in [ABS_MT_PRESSURE, ABS_MT_TOUCH_MAJOR, ABS_MT_TOUCH_MINOR] {
             let i = abs_info(file, code)?;
+            if palm.log {
+                eprintln!("remvnc: touch axis {code:#x}: {i:?}");
+            }
             abs.push(Abs { code, min: i.min, max: i.max, resolution: 0 });
         }
         let slots = [Slot { id: -1, ..Default::default() }; SLOTS];
-        Ok(Self { map, raw, out, mode, abs, slots, current: 0, last_count: 0 })
+        Ok(Self { map, raw, out, mode, palm, abs, slots, current: 0, last_count: 0, pen_in_range: false, pen_left_us: None })
     }
 
     pub fn device(&self) -> Device {
@@ -307,13 +379,39 @@ impl Touch {
 
     /// True while a contact that started on our UI is down and still on it.
     pub fn holding(&self) -> bool {
-        self.slots.iter().any(|s| s.held && s.inside && s.id >= 0)
+        self.slots.iter().any(|s| s.owner == Owner::Ui && s.inside && s.id >= 0)
+    }
+
+    fn pen_blocks(&self, now_us: u64) -> bool {
+        self.pen_in_range || self.pen_left_us.is_some_and(|t| now_us.saturating_sub(t) < self.palm.pen_grace_us)
+    }
+
+    /// Tracks pen hover. When the pen arrives, every touch already down is
+    /// treated as the writing hand: lifted on the host and ignored until it
+    /// leaves the screen. Returns the frame that lifts them, if any.
+    pub fn set_pen(&mut self, in_range: bool, now_us: u64) -> Option<Vec<Event>> {
+        let was = std::mem::replace(&mut self.pen_in_range, in_range);
+        if was && !in_range {
+            self.pen_left_us = Some(now_us);
+        }
+        if in_range && !was {
+            let mut lifted = false;
+            for s in self.slots.iter_mut().filter(|s| s.id >= 0 && matches!(s.owner, Owner::Host | Owner::Ui)) {
+                s.owner = Owner::PenNear;
+                s.dirty = true;
+                lifted = true;
+            }
+            if lifted {
+                return self.frame(now_us, &|_| false);
+            }
+        }
+        None
     }
 
     /// Feeds raw events. `on_ui(pixel)` decides, in logical screen pixels of
     /// a `size` screen, whether a contact belongs to our own UI. Returns
-    /// forwarded frames.
-    pub fn feed(&mut self, events: &[RawEvent], size: [i32; 2], on_ui: impl Fn([i32; 2]) -> bool) -> Vec<Vec<Event>> {
+    /// forwarded frames with their kernel timestamps.
+    pub fn feed(&mut self, events: &[RawEvent], size: [i32; 2], on_ui: impl Fn([i32; 2]) -> bool) -> Vec<(u64, Vec<Event>)> {
         let out = self.out;
         let on_ui = move |pos: [i32; 2]| on_ui([0, 1].map(|i| to_pixels(out[i], pos[i], size[i])));
         let mut frames = vec![];
@@ -327,6 +425,7 @@ impl Touch {
                         ABS_MT_TRACKING_ID => {
                             if e.value >= 0 && s.id < 0 {
                                 s.began = true;
+                                s.start_us = e.time_us;
                             }
                             s.id = e.value;
                         }
@@ -338,12 +437,13 @@ impl Touch {
                         ABS_MT_PRESSURE => s.pressure = e.value,
                         ABS_MT_TOUCH_MAJOR => s.major = e.value,
                         ABS_MT_TOUCH_MINOR => s.minor = e.value,
+                        ABS_MT_TOOL_TYPE => s.tool = e.value,
                         _ => {}
                     }
                 }
                 (EV_SYN, SYN_REPORT) => {
-                    if let Some(f) = self.frame(&on_ui) {
-                        frames.push(f);
+                    if let Some(f) = self.frame(e.time_us, &on_ui) {
+                        frames.push((e.time_us, f));
                     }
                 }
                 _ => {}
@@ -352,40 +452,87 @@ impl Touch {
         frames
     }
 
-    fn frame(&mut self, on_ui: &impl Fn([i32; 2]) -> bool) -> Option<Vec<Event>> {
+    /// Palm signals that can appear at any point of a contact.
+    fn palm_reason(&self, s: &Slot) -> Option<Owner> {
+        if s.tool == MT_TOOL_PALM {
+            Some(Owner::Palm)
+        } else if s.major > self.palm.max_major {
+            Some(Owner::Large)
+        } else {
+            None
+        }
+    }
+
+    fn frame(&mut self, now_us: u64, on_ui: &impl Fn([i32; 2]) -> bool) -> Option<Vec<Event>> {
         let abs = |code, value| Event { kind: EV_ABS, code, value };
         let key = |code, down: bool| Event { kind: EV_KEY, code, value: down as i32 };
+        let pen_blocks = self.pen_blocks(now_us);
         let mut ev = vec![];
-        for (i, s) in self.slots.iter_mut().enumerate() {
-            if !s.dirty {
+        for i in 0..SLOTS {
+            if !self.slots[i].dirty {
                 continue;
             }
+            let palm = self.palm_reason(&self.slots[i]);
+            let s = &mut self.slots[i];
             s.dirty = false;
             if s.began {
                 s.began = false;
-                s.held = on_ui(s.pos);
-            }
-            if s.held {
-                s.inside = on_ui(s.pos);
-                if s.id < 0 {
-                    s.held = false;
+                s.peak = [0; 3];
+                s.owner = if pen_blocks {
+                    Owner::PenNear
+                } else if let Some(p) = palm {
+                    p
+                } else if on_ui(s.pos) {
+                    Owner::Ui
+                } else {
+                    Owner::Host
+                };
+            } else if s.id >= 0 && matches!(s.owner, Owner::Host | Owner::Ui) {
+                // A fingertip that grew into a palm.
+                if let Some(p) = palm {
+                    s.owner = p;
                 }
-                continue;
             }
-            ev.push(abs(ABS_MT_SLOT, i as i32));
-            ev.push(abs(ABS_MT_TRACKING_ID, s.id));
             if s.id >= 0 {
-                ev.extend([
-                    abs(ABS_MT_POSITION_X, s.pos[0]),
-                    abs(ABS_MT_POSITION_Y, s.pos[1]),
-                    abs(ABS_MT_PRESSURE, s.pressure),
-                    abs(ABS_MT_TOUCH_MAJOR, s.major),
-                    abs(ABS_MT_TOUCH_MINOR, s.minor),
-                ]);
+                s.peak = [s.peak[0].max(s.major), s.peak[1].max(s.minor), s.peak[2].max(s.pressure)];
+            }
+            if s.owner == Owner::Ui {
+                s.inside = on_ui(s.pos);
+            }
+
+            let send = s.owner == Owner::Host && s.id >= 0;
+            if send || s.forwarded {
+                ev.push(abs(ABS_MT_SLOT, i as i32));
+                ev.push(abs(ABS_MT_TRACKING_ID, if send { s.id } else { -1 }));
+                if send {
+                    ev.extend([
+                        abs(ABS_MT_POSITION_X, s.pos[0]),
+                        abs(ABS_MT_POSITION_Y, s.pos[1]),
+                        abs(ABS_MT_PRESSURE, s.pressure),
+                        abs(ABS_MT_TOUCH_MAJOR, s.major),
+                        abs(ABS_MT_TOUCH_MINOR, s.minor),
+                    ]);
+                }
+                s.forwarded = send;
+            }
+
+            if s.id < 0 {
+                if self.palm.log && s.start_us > 0 {
+                    eprintln!(
+                        "remvnc: touch slot {i}: {:?}, peak major {} minor {} pressure {}, tool {}, {} ms",
+                        s.owner,
+                        s.peak[0],
+                        s.peak[1],
+                        s.peak[2],
+                        s.tool,
+                        now_us.saturating_sub(s.start_us) / 1000
+                    );
+                }
+                *s = Slot { id: -1, ..Default::default() };
             }
         }
         // Legacy single-touch state, which touchpad drivers rely on.
-        let active: Vec<&Slot> = self.slots.iter().filter(|s| s.id >= 0 && !s.held).collect();
+        let active: Vec<&Slot> = self.slots.iter().filter(|s| s.forwarded).collect();
         let count = active.len();
         if let Some(first) = active.first() {
             ev.push(abs(ABS_X, first.pos[0]));
