@@ -3,8 +3,8 @@
 
 use crate::input::{PenMode, TouchMode};
 
-const DIR: &str = "/home/root/.config/remvnc";
-const PATH: &str = "/home/root/.config/remvnc/state";
+const DIR: &str = "/home/root/.config/remdesktop";
+const PATH: &str = "/home/root/.config/remdesktop/state";
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct State {
@@ -41,7 +41,7 @@ impl State {
         };
         let text = format!("view={}\npen={pen}\ntouch={touch}\n", self.view);
         if let Err(e) = std::fs::create_dir_all(DIR).and_then(|_| std::fs::write(PATH, text)) {
-            log!("remvnc: saving {PATH}: {e}");
+            log!("remdesktop: saving {PATH}: {e}");
         }
     }
 }

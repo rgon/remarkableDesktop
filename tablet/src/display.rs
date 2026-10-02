@@ -3,7 +3,7 @@
 //! get a full-quality refresh, which clears the fast mode's ghosting.
 
 use crate::epd::{Epd, ImageInfo, Mode};
-use remvnc_proto::gray4;
+use remdesktop_proto::gray4;
 use std::time::{Duration, Instant};
 
 /// Refresh modes and timing for streamed content.

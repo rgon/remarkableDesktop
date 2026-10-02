@@ -1,5 +1,5 @@
-//! Wire format between `remvnc run` on the tablet (its stdout, over SSH) and
-//! `remvnc-host`. Each message is `tag: u8, len: u32 LE, payload`.
+//! Wire format between `remdesktop run` on the tablet (its stdout, over SSH) and
+//! `remdesktop-host`. Each message is `tag: u8, len: u32 LE, payload`.
 //!
 //! The tablet declares virtual input devices, then streams evdev event
 //! batches for them; the host recreates the devices with uinput and replays
@@ -411,7 +411,7 @@ mod tests {
             Msg::Hello { version: VERSION, width: 1872, height: 1404, rotation: 90, view: "2".into() },
             Msg::Device(Device {
                 id: 1,
-                name: "remvnc pen".into(),
+                name: "remdesktop pen".into(),
                 props: 0,
                 keys: vec![0x140, 0x14a],
                 abs: vec![Abs { code: 0, min: 0, max: 20967, resolution: 100 }],

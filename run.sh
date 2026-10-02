@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# remvnc launcher.
+# remdesktop launcher.
 #
 #   ./run.sh [client opts]       build, deploy, start the tablet side, run the client
 #   ./run.sh tablet [opts]       one-shot: build, deploy and start the tablet side,
@@ -13,20 +13,20 @@
 #   --fast-mode M  --settle-mode M  --settle-ms N
 # Client options: --stats  --no-display  --list-screens (the client passes tablet
 #   options on when it starts the tablet side).
-# Environment: RM=root@10.11.99.1  REMOTE=/home/root/remvnc
+# Environment: RM=root@10.11.99.1  REMOTE=/home/root/remdesktop
 set -euo pipefail
 cd "$(dirname "$0")"
 
 RM=${RM:-root@10.11.99.1}
-REMOTE=${REMOTE:-/home/root/remvnc}
+REMOTE=${REMOTE:-/home/root/remdesktop}
 TARGET=armv7-unknown-linux-gnueabihf
-BIN=target/$TARGET/release/remvnc
-CLIENT=target/release/remvnc-host
+BIN=target/$TARGET/release/remdesktop
+CLIENT=target/release/remdesktop-host
 SSH=(ssh -o ConnectTimeout=5 -o ServerAliveInterval=1 -o ServerAliveCountMax=3 -o BatchMode=yes "$RM")
 
 build() {
-    cargo zigbuild -q -p remvnc-tablet --release --target "$TARGET.2.31"
-    cargo build -q -p remvnc-host --release
+    cargo zigbuild -q -p remdesktop-tablet --release --target "$TARGET.2.31"
+    cargo build -q -p remdesktop-host --release
 }
 
 wait_ssh() {
@@ -39,18 +39,18 @@ wait_ssh() {
 }
 
 running() {
-    "${SSH[@]}" systemctl is-active --quiet remvnc 2>/dev/null
+    "${SSH[@]}" systemctl is-active --quiet remdesktop 2>/dev/null
 }
 
 # Stopping takes our USB HID function out, which re-enumerates USB and drops
 # this SSH session, so stop from a detached unit and wait for it.
 stop_tablet() {
     running || return 0
-    "${SSH[@]}" systemd-run --quiet --collect --unit=remvnc-stop "$REMOTE" stop 2>/dev/null || true
+    "${SSH[@]}" systemd-run --quiet --collect --unit=remdesktop-stop "$REMOTE" stop 2>/dev/null || true
     for _ in $(seq 30); do
         sleep 1
         # Reconnect each time: the stop drops USB (and SSH) a few seconds in.
-        if "${SSH[@]}" "! systemctl is-active --quiet remvnc && ! ls /sys/kernel/config/usb_gadget/g_ether/configs/c.1 | grep -q ffs" 2>/dev/null; then
+        if "${SSH[@]}" "! systemctl is-active --quiet remdesktop && ! ls /sys/kernel/config/usb_gadget/g_ether/configs/c.1 | grep -q ffs" 2>/dev/null; then
             # Stopped and USB restored; let the host re-enumerate.
             sleep 2
             wait_ssh
@@ -70,12 +70,12 @@ deploy() {
     there=$("${SSH[@]}" "md5sum $REMOTE 2>/dev/null || true" | cut -d' ' -f1)
     [ "$here" = "$there" ] && return 0
     if running; then
-        echo "remvnc: new build, restarting the tablet side"
+        echo "remdesktop: new build, restarting the tablet side"
         stop_tablet
     fi
     scp -q -O "$BIN" "$RM:$REMOTE.new"
     "${SSH[@]}" "mv $REMOTE.new $REMOTE"
-    echo "remvnc: deployed $(du -h "$BIN" | cut -f1)"
+    echo "remdesktop: deployed $(du -h "$BIN" | cut -f1)"
 }
 
 client() {
@@ -99,11 +99,11 @@ case $cmd in
     stop)
         wait_ssh
         stop_tablet
-        echo "remvnc: stopped"
+        echo "remdesktop: stopped"
         ;;
     status)
         wait_ssh
-        if running; then echo "remvnc: running"; else echo "remvnc: not running"; fi
+        if running; then echo "remdesktop: running"; else echo "remdesktop: not running"; fi
         ;;
     -h | --help | help)
         sed -n '2,19p' "$0"

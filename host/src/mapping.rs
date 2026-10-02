@@ -5,7 +5,7 @@
 //! device's full range into that monitor's share of the bounding box.
 
 use crate::outputs::Output;
-use remvnc_proto::{Device, Event};
+use remdesktop_proto::{Device, Event};
 
 const EV_ABS: u16 = 3;
 const ABS_X: u16 = 0x00;
@@ -122,7 +122,7 @@ impl Mapper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remvnc_proto::Abs;
+    use remdesktop_proto::Abs;
 
     #[test]
     fn squeezes_into_right_monitor() {
@@ -132,7 +132,7 @@ mod tests {
         ];
         let dev = Device {
             id: 1,
-            name: "remvnc pen".into(),
+            name: "remdesktop pen".into(),
             props: 0,
             keys: vec![],
             abs: vec![Abs { code: ABS_X, min: 0, max: 100, resolution: 0 }, Abs { code: ABS_Y, min: 0, max: 100, resolution: 0 }],

@@ -32,14 +32,14 @@ use session::{Session, quitting};
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:
-  remvnc start [options]   Start the instance (detached): takes over the panel,
-                           adds the USB HID function, waits for remvnc-host.
-  remvnc stop              End it (hold X or press power on the tablet also works).
-  remvnc session           Print \"port token\" for remvnc-host, if running.
-  remvnc daemon [options]  Run the instance in the foreground.
-  remvnc probe             Draw test patterns for a few seconds.
-  remvnc restore           Kill stray instances and restart xochitl.
-  remvnc hid-restore       Remove our USB HID function from the gadget.
+  remdesktop start [options]   Start the instance (detached): takes over the panel,
+                           adds the USB HID function, waits for remdesktop-host.
+  remdesktop stop              End it (hold X or press power on the tablet also works).
+  remdesktop session           Print \"port token\" for remdesktop-host, if running.
+  remdesktop daemon [options]  Run the instance in the foreground.
+  remdesktop probe             Draw test patterns for a few seconds.
+  remdesktop restore           Kill stray instances and restart xochitl.
+  remdesktop hid-restore       Remove our USB HID function from the gadget.
 options: [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
          [--palm-major N] [--pen-grace-ms N] [--log-touch] [--no-usb]
          [--fast-mode M] [--settle-mode M] [--settle-ms N]
@@ -70,7 +70,7 @@ fn main() {
         _ => Err(USAGE.into()),
     };
     if let Err(e) = result {
-        log!("remvnc: {e}");
+        log!("remdesktop: {e}");
         std::process::exit(1);
     }
 }
@@ -127,7 +127,7 @@ fn wait(epd: &Epd, ms: u64) -> bool {
 }
 
 
-const UNIT: &str = "remvnc";
+const UNIT: &str = "remdesktop";
 
 fn unit_active() -> bool {
     std::process::Command::new("systemctl").args(["is-active", "--quiet", UNIT]).status().is_ok_and(|s| s.success())
@@ -185,7 +185,7 @@ fn probe() -> Result<(), String> {
             .draw(&mut Scaled { target: &mut canvas, factor: 3 });
         let t = Instant::now();
         canvas.flush(mode);
-        log!("remvnc: swap {mode:?} returned in {:?}", t.elapsed());
+        log!("remdesktop: swap {mode:?} returned in {:?}", t.elapsed());
         ok = wait(&epd, 1200);
     }
     drop(canvas);

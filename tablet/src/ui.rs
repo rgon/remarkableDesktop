@@ -125,7 +125,7 @@ impl<'a> Ui<'a> {
                 Slot { rect: Rectangle::new(Point::new(x, MARGIN), Size::new(BUTTON, BUTTON)), label: String::new(), drawn: None, enabled: true }
             })
             .collect();
-        let status = [concat!("remvnc v", env!("CARGO_PKG_VERSION")).to_string(), String::new(), String::new()];
+        let status = [concat!("remdesktop v", env!("CARGO_PKG_VERSION")).to_string(), String::new(), String::new()];
         Self { canvas, rotation, size, buttons, status }
     }
 

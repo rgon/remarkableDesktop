@@ -106,7 +106,7 @@ impl Capture {
             Some(l) => match crate::displayconfig::keep_layout(&conn, l, std::time::Duration::from_secs(5)) {
                 Ok(name) => Some(name),
                 Err(e) => {
-                    eprintln!("remvnc-host: could not keep the monitor layout: {e}");
+                    eprintln!("remdesktop-host: could not keep the monitor layout: {e}");
                     None
                 }
             },

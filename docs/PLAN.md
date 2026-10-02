@@ -12,7 +12,7 @@
 
 ## Done in v0.6: the tablet as a USB HID device
 Implemented as planned below: the FunctionFS gadget, a tablet-owned instance
-(`remvnc start`, `stop`, `session`) with host reconnects, an info box,
+(`remdesktop start`, `stop`, `session`) with host reconnects, an info box,
 greyed-out host-only options, and a SIDE button. Verified on Linux (GNOME):
 `hid-multitouch` creates Stylus, Touchscreen and Touchpad inputs. Windows and
 macOS are untested.
@@ -20,7 +20,7 @@ macOS are untested.
 ## Design notes (kept for reference)
 **Goal:** input works on any computer with no host software. The tablet itself
 is a USB tablet (pen digitizer, touch, mouse), next to the existing USB
-network, which stays up. `remvnc-host` becomes optional, for screen streaming
+network, which stays up. `remdesktop-host` becomes optional, for screen streaming
 and GNOME monitor mapping.
 
 ### What the tablet has (checked 2026-10-02, OS 3.28, kernel 5.4.70)
@@ -37,7 +37,7 @@ and GNOME monitor mapping.
 
 ### Approach
 1. **Gadget (tablet, `hid.rs`):**
-   1. Create `functions/ffs.remvnc` and mount it at `/dev/ffs-remvnc`.
+   1. Create `functions/ffs.remdesktop` and mount it at `/dev/ffs-remdesktop`.
    2. Write the descriptors (one HID interface, interrupt IN at 1 ms) and the
       strings to `ep0`.
    3. Link the function into both `c.1` and `c.2`, then rebind the UDC.
@@ -57,9 +57,9 @@ and GNOME monitor mapping.
    unlinks our function, rebinds the UDC, unmounts and removes the function,
    which brings back exactly what `usb-ether-once` built.
 4. **Tablet-owned session:**
-   - `remvnc start` runs the instance detached, as a systemd unit, so the USB
+   - `remdesktop start` runs the instance detached, as a systemd unit, so the USB
      re-enumeration and SSH sessions coming and going don't kill it.
-   - `remvnc attach` is a small process started over SSH by `remvnc-host`. It
+   - `remdesktop attach` is a small process started over SSH by `remdesktop-host`. It
      hands the host link (direct TCP socket or SSH stdio) to the running
      instance.
    - Input goes over USB HID when USB is enumerated; otherwise over the host
@@ -67,7 +67,7 @@ and GNOME monitor mapping.
 5. **On-screen info box:** "USB: connected / not connected" and
    "Host: connected (streaming) / not running". Options that need the host
    (screen views, display streaming) are greyed out and inert without it.
-6. **Host:** `remvnc-host` starts the instance if needed, waits for USB to
+6. **Host:** `remdesktop-host` starts the instance if needed, waits for USB to
    re-enumerate, then attaches. It keeps mapping devices through GNOME
    settings, now by the HID device's vendor:product.
 

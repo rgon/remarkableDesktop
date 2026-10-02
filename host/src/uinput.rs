@@ -1,6 +1,6 @@
 //! Virtual input devices through /dev/uinput (x86_64 and other 64-bit hosts).
 
-use remvnc_proto::{Device, Event};
+use remdesktop_proto::{Device, Event};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
@@ -60,7 +60,7 @@ fn ioctl<T>(file: &File, req: libc::c_ulong, arg: T) -> io::Result<()> {
 impl VirtualDevice {
     pub fn create(d: &Device) -> io::Result<Self> {
         let file = OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open("/dev/uinput").map_err(|e| {
-            io::Error::new(e.kind(), format!("/dev/uinput: {e} (see host/99-remvnc-uinput.rules)"))
+            io::Error::new(e.kind(), format!("/dev/uinput: {e} (see host/99-remdesktop-uinput.rules)"))
         })?;
         ioctl(&file, UI_SET_EVBIT, EV_SYN as libc::c_int)?;
         if !d.keys.is_empty() {

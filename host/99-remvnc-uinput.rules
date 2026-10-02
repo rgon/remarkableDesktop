@@ -1,3 +1,0 @@
-# Lets members of the "input" group create virtual devices for remvnc-host.
-# sudo cp host/99-remvnc-uinput.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger /dev/uinput
-KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

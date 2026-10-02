@@ -2,7 +2,7 @@
 //! recreates: coordinates rotated to how the tablet is held, touches that
 //! start on our own UI held back, and optional touchpad emulation.
 
-use remvnc_proto::{Abs, Device, Event};
+use remdesktop_proto::{Abs, Device, Event};
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
@@ -80,7 +80,7 @@ pub fn read_events(file: &mut File) -> io::Result<Vec<RawEvent>> {
 }
 
 /// Makes the device timestamp events with CLOCK_MONOTONIC, so latency can
-/// be measured against `remvnc_proto::monotonic_us`.
+/// be measured against `remdesktop_proto::monotonic_us`.
 pub fn use_monotonic_clock(file: &File) -> io::Result<()> {
     let clock: libc::c_int = libc::CLOCK_MONOTONIC;
     // EVIOCSCLOCKID
@@ -279,14 +279,14 @@ impl Pen {
         match self.mode {
             PenMode::Tablet => Device {
                 id: PEN_ID,
-                name: "remvnc pen".into(),
+                name: "remdesktop pen".into(),
                 props: 1 << INPUT_PROP_POINTER,
                 keys: vec![BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_TOUCH, BTN_STYLUS, BTN_STYLUS2],
                 abs: self.abs.clone(),
             },
             PenMode::Mouse => Device {
                 id: PEN_ID,
-                name: "remvnc pen (mouse)".into(),
+                name: "remdesktop pen (mouse)".into(),
                 props: 0,
                 keys: vec![BTN_LEFT, BTN_RIGHT],
                 abs: self.abs.iter().filter(|a| a.code == ABS_X || a.code == ABS_Y).cloned().collect(),
@@ -457,7 +457,7 @@ impl Touch {
         for code in [ABS_MT_PRESSURE, ABS_MT_TOUCH_MAJOR, ABS_MT_TOUCH_MINOR] {
             let i = abs_info(file, code)?;
             if palm.log {
-                log!("remvnc: touch axis {code:#x}: {i:?}");
+                log!("remdesktop: touch axis {code:#x}: {i:?}");
             }
             abs.push(Abs { code, min: i.min, max: i.max, resolution: 0 });
         }
@@ -474,7 +474,7 @@ impl Touch {
             }
             TouchMode::Touchscreen => 1 << INPUT_PROP_DIRECT,
         };
-        Device { id: TOUCH_ID, name: "remvnc touch".into(), props, keys, abs: self.abs.clone() }
+        Device { id: TOUCH_ID, name: "remdesktop touch".into(), props, keys, abs: self.abs.clone() }
     }
 
     /// The UI element held by a contact that started on it and is still on it.
@@ -642,7 +642,7 @@ impl Touch {
             if s.id < 0 {
                 if self.palm.log && s.start_us > 0 {
                     log!(
-                        "remvnc: touch slot {i}: {:?}, peak major {} minor {} pressure {}, tool {}, {} ms",
+                        "remdesktop: touch slot {i}: {:?}, peak major {} minor {} pressure {}, tool {}, {} ms",
                         s.owner,
                         s.peak[0],
                         s.peak[1],

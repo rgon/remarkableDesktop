@@ -3,7 +3,7 @@
 //! so no queue (and no latency) builds up on the slow e-ink side.
 
 use crate::capture::{Capture, Source};
-use remvnc_proto::{Msg, gray4};
+use remdesktop_proto::{Msg, gray4};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ impl DisplayStats {
             self.latencies_ms.sort_by(|a, b| a.total_cmp(b));
             let pct = |p: f64| self.latencies_ms[((n - 1) as f64 * p) as usize];
             eprintln!(
-                "remvnc-host: display {:.1}/s, {:.0} KB/update ({:.0} kpx), capture→ack p50 {:.1} p99 {:.1} max {:.1} ms",
+                "remdesktop-host: display {:.1}/s, {:.0} KB/update ({:.0} kpx), capture→ack p50 {:.1} p99 {:.1} max {:.1} ms",
                 n as f64 / since.elapsed().as_secs_f64(),
                 self.bytes as f64 / n as f64 / 1024.0,
                 self.pixels as f64 / n as f64 / 1000.0,
@@ -150,7 +150,7 @@ impl Streamer {
                                 current = Some((generation, c));
                             }
                             Err(e) => {
-                                eprintln!("remvnc-host: capture {src:?}: {e}");
+                                eprintln!("remdesktop-host: capture {src:?}: {e}");
                                 std::thread::sleep(Duration::from_secs(1));
                                 continue;
                             }
@@ -174,7 +174,7 @@ impl Streamer {
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        eprintln!("remvnc-host: capture ended: {e}");
+                        eprintln!("remdesktop-host: capture ended: {e}");
                         current = None;
                         std::thread::sleep(Duration::from_secs(1));
                     }

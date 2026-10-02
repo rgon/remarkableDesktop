@@ -1,5 +1,5 @@
 //! The tablet-side instance. It owns the panel, the inputs and the USB HID
-//! function, and keeps running while `remvnc-host` connects, drops (USB
+//! function, and keeps running while `remdesktop-host` connects, drops (USB
 //! re-enumeration) and reconnects.
 //!
 //! Input goes out as USB HID reports whenever the computer has enumerated
@@ -14,7 +14,7 @@ use crate::input::{self, PalmConfig, Pen, PenMode, Touch, TouchMode};
 use crate::link::{Incoming, Link, Server};
 use crate::session::{Session, quitting};
 use crate::ui::{self, Button, Ui};
-use remvnc_proto::{Event, Msg};
+use remdesktop_proto::{Event, Msg};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -55,11 +55,11 @@ fn pen_label(m: PenMode) -> &'static str {
 fn realtime_priority() {
     let param = libc::sched_param { sched_priority: 20 };
     if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) } != 0 {
-        log!("remvnc: SCHED_FIFO: {}", std::io::Error::last_os_error());
+        log!("remdesktop: SCHED_FIFO: {}", std::io::Error::last_os_error());
     }
 }
 
-/// A connected `remvnc-host`.
+/// A connected `remdesktop-host`.
 struct Host {
     link: Link,
     incoming: Receiver<Incoming>,
@@ -169,7 +169,7 @@ pub fn run(args: Args) -> Result<(), String> {
                     Some(g)
                 }
                 Err(e) => {
-                    log!("remvnc: usb hid unavailable: {e}");
+                    log!("remdesktop: usb hid unavailable: {e}");
                     hid::restore();
                     None
                 }
@@ -218,7 +218,7 @@ pub fn run(args: Args) -> Result<(), String> {
             frames.extend(pen.feed(&events).into_iter().map(|(t, e)| (input::PEN_ID, t, e)));
         }
         if let Some(touch) = touch.as_mut() {
-            let now = remvnc_proto::monotonic_us();
+            let now = remdesktop_proto::monotonic_us();
             if let Some(lift) = touch.set_pen(pen.as_ref().is_some_and(|p| p.in_range), now) {
                 frames.push((input::TOUCH_ID, now, lift));
             }
@@ -271,7 +271,7 @@ pub fn run(args: Args) -> Result<(), String> {
         if let Some(f) = files[2].as_mut() {
             let power = input::read_events(f).unwrap_or_default();
             if power.iter().any(|e| e.kind == input::EV_KEY && e.code == input::KEY_POWER && e.value == 1) {
-                log!("remvnc: power button pressed");
+                log!("remdesktop: power button pressed");
                 done = true;
             }
         }
@@ -287,7 +287,7 @@ pub fn run(args: Args) -> Result<(), String> {
                         let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true, heard: Instant::now(), remote: None };
                         h.send(&Msg::Addresses { addrs: addresses.clone() });
                         h.send(&Msg::Hello {
-                            version: remvnc_proto::VERSION,
+                            version: remdesktop_proto::VERSION,
                             width: ui.size[0] as u16,
                             height: ui.size[1] as u16,
                             rotation,
@@ -296,7 +296,7 @@ pub fn run(args: Args) -> Result<(), String> {
                         sent_status = None; // sent with the next wake-up
                         host = Some(h);
                     }
-                    Err(e) => log!("remvnc: host reader: {e}"),
+                    Err(e) => log!("remdesktop: host reader: {e}"),
                 }
             }
         }
@@ -307,9 +307,9 @@ pub fn run(args: Args) -> Result<(), String> {
             h.heard = Instant::now();
             while let Ok(item) = h.incoming.try_recv() {
                 match item {
-                    Incoming::Msg(Msg::Ping { host_us }) => h.send(&Msg::Pong { host_us, tablet_us: remvnc_proto::monotonic_us() }),
+                    Incoming::Msg(Msg::Ping { host_us }) => h.send(&Msg::Pong { host_us, tablet_us: remdesktop_proto::monotonic_us() }),
                     Incoming::Msg(Msg::Screens { names }) if !names.is_empty() => {
-                        log!("remvnc: host views: {}", names.join(", "));
+                        log!("remdesktop: host views: {}", names.join(", "));
                         h.views = names;
                         // The host resumes the view named in our Hello.
                         h.target = h.views.iter().position(|v| *v == state.view).unwrap_or(0) as u8;
@@ -337,7 +337,7 @@ pub fn run(args: Args) -> Result<(), String> {
                                 }
                                 display.show(&epd, r);
                             }
-                            Err(e) => log!("remvnc: {e}"),
+                            Err(e) => log!("remdesktop: {e}"),
                         }
                     }
                     Incoming::Closed => host_gone = true,
@@ -350,7 +350,7 @@ pub fn run(args: Args) -> Result<(), String> {
             // Silence means the link is dead (e.g. USB unplugged): TCP alone
             // would not notice for minutes.
             if h.heard.elapsed() > Duration::from_millis(1500) {
-                log!("remvnc: host silent for {:?}", h.heard.elapsed());
+                log!("remdesktop: host silent for {:?}", h.heard.elapsed());
                 h.link.close();
                 host_gone = true;
             }
@@ -366,7 +366,7 @@ pub fn run(args: Args) -> Result<(), String> {
             }
         }
         if host_gone {
-            log!("remvnc: host went away");
+            log!("remdesktop: host went away");
             host = None;
             ui.set_enabled(Button::Net, false);
             mappings = [Mapping::default(); 2];
@@ -404,10 +404,10 @@ pub fn run(args: Args) -> Result<(), String> {
                     ui.set_progress(b, steps.min(ui::HOLD_STEPS));
                     if elapsed >= b.hold() {
                         hold = Some((b, since, true));
-                        let now = remvnc_proto::monotonic_us();
+                        let now = remdesktop_proto::monotonic_us();
                         match b {
                             Button::Close => {
-                                log!("remvnc: close button held");
+                                log!("remdesktop: close button held");
                                 done = true;
                             }
                             Button::Mode => {
@@ -426,7 +426,7 @@ pub fn run(args: Args) -> Result<(), String> {
                                         }
                                         h.send(&Msg::Device(t.device()));
                                     }
-                                    log!("remvnc: touch is now {next:?}");
+                                    log!("remdesktop: touch is now {next:?}");
                                     ui.set_label(b, mode_label(next));
                                     state.touch = Some(next);
                                     state.save();
@@ -448,7 +448,7 @@ pub fn run(args: Args) -> Result<(), String> {
                                         }
                                         h.send(&Msg::Device(p.device()));
                                     }
-                                    log!("remvnc: pen is now {next:?}");
+                                    log!("remdesktop: pen is now {next:?}");
                                     ui.set_label(b, pen_label(next));
                                     state.pen = Some(next);
                                     state.save();
@@ -457,7 +457,7 @@ pub fn run(args: Args) -> Result<(), String> {
                             Button::Side => {}
                             Button::Net => {
                                 if let Some(h) = host.as_mut().filter(|h| h.remote.is_some()) {
-                                    log!("remvnc: going remote via {}", h.remote.as_deref().unwrap_or(""));
+                                    log!("remdesktop: going remote via {}", h.remote.as_deref().unwrap_or(""));
                                     h.send(&Msg::GoRemote);
                                 }
                             }
@@ -488,7 +488,7 @@ pub fn run(args: Args) -> Result<(), String> {
                     hold = Some((b, Instant::now(), true));
                     ui.set_progress(b, ui::HOLD_STEPS);
                     if let Some(p) = pen.as_ref() {
-                        let now = remvnc_proto::monotonic_us();
+                        let now = remdesktop_proto::monotonic_us();
                         let mouse = p.mode() == PenMode::Mouse;
                         for mut events in p.side_click() {
                             if let (true, Some(g), Some(r)) = (hid_up, gadget.as_ref(), ranges.as_ref()) {
@@ -515,7 +515,7 @@ pub fn run(args: Args) -> Result<(), String> {
     }
 
     // Release anything held, tell the host, take our USB function out.
-    log!("remvnc: shutting down");
+    log!("remdesktop: shutting down");
     if let (Some(g), true) = (gadget.as_ref(), hid_was_up) {
         for r in encoder.release_all(touch.as_ref().is_some_and(|t| t.mode() == TouchMode::Touchpad), pen.as_ref().is_some_and(|p| p.mode() == PenMode::Mouse)) {
             g.send(&r);
@@ -527,12 +527,12 @@ pub fn run(args: Args) -> Result<(), String> {
     }
     drop(server);
     if gadget.is_some() {
-        log!("remvnc: removing the usb hid function");
+        log!("remdesktop: removing the usb hid function");
         drop(gadget);
         hid::restore();
     }
     drop(ui);
-    log!("remvnc: restoring the screen");
+    log!("remdesktop: restoring the screen");
     let _ = std::io::stderr().flush();
     session.end(&epd)
 }

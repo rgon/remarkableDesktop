@@ -1,10 +1,10 @@
-# libinput quirks for remvnc's virtual pen.
+# libinput quirks for remdesktop's virtual pen.
 # libinput averages the last 4 tablet samples unless told otherwise; the
 # tablet already reports clean coordinates, so skip that lag.
-# Install: sudo install -Dm644 host/remvnc.quirks /etc/libinput/local-overrides.quirks
+# Install: sudo install -Dm644 host/remdesktop.quirks /etc/libinput/local-overrides.quirks
 # (merge by hand if that file exists), then log out and back in.
-[remvnc pen]
-MatchName=remvnc pen
+[remdesktop pen]
+MatchName=remdesktop pen
 MatchVendor=0x1D50
 MatchProduct=0x6201
 MatchUdevType=tablet

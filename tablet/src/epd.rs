@@ -110,7 +110,7 @@ unsafe fn forward_ctor(
         // From the executable, RTLD_NEXT lands on libQt6Gui's definition.
         let sym = unsafe { libc::dlvsym(libc::RTLD_NEXT, name.as_ptr(), c"Qt_6".as_ptr()) };
         if sym.is_null() {
-            log!("remvnc: cannot resolve {name:?}");
+            log!("remdesktop: cannot resolve {name:?}");
             std::process::abort();
         }
         sym as usize
@@ -192,7 +192,7 @@ impl Epd {
         };
         // Qt keeps references to argc/argv and the object for the process lifetime.
         let argc: &'static mut c_int = Box::leak(Box::new(1));
-        let argv: &'static mut [*mut c_char; 2] = Box::leak(Box::new([c"remvnc".as_ptr() as *mut c_char, std::ptr::null_mut()]));
+        let argv: &'static mut [*mut c_char; 2] = Box::leak(Box::new([c"remdesktop".as_ptr() as *mut c_char, std::ptr::null_mut()]));
         let app: &'static mut [u64; 32] = Box::leak(Box::new([0; 32]));
         unsafe { app_ctor(app.as_mut_ptr().cast(), argc, argv.as_mut_ptr(), QT_VERSION) };
 

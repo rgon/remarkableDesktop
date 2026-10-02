@@ -1,4 +1,4 @@
-//! `remvnc-host`: runs `remvnc run` on the tablet over SSH and replays its
+//! `remdesktop-host`: runs `remdesktop run` on the tablet over SSH and replays its
 //! pen and touch input through local uinput devices.
 
 mod capture;
@@ -11,7 +11,7 @@ mod stream;
 mod uinput;
 
 use mapping::Mapper;
-use remvnc_proto::{Device, Msg};
+use remdesktop_proto::{Device, Msg};
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -19,8 +19,8 @@ use std::process::{Command, ExitCode, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const USAGE: &str = "usage: remvnc-host [--ssh root@10.11.99.1] [--remote /home/root/remvnc]
-                   [--deploy <local remvnc binary>] [--stats] [--no-usb] [--list-screens]
+const USAGE: &str = "usage: remdesktop-host [--ssh root@10.11.99.1] [--remote /home/root/remdesktop]
+                   [--deploy <local remdesktop binary>] [--stats] [--no-usb] [--list-screens]
                    [--no-display]
                    [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
                    [--palm-major N] [--pen-grace-ms N] [--log-touch]
@@ -37,7 +37,7 @@ struct Args {
 }
 
 fn parse() -> Result<Args, String> {
-    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remvnc".into(), deploy: None, stats: false, display: true, run_args: vec![] };
+    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remdesktop".into(), deploy: None, stats: false, display: true, run_args: vec![] };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value\n{USAGE}"));
@@ -48,7 +48,7 @@ fn parse() -> Result<Args, String> {
             "--stats" => a.stats = true,
             "--no-display" => a.display = false,
             "--capture-test" => {
-                // remvnc-host --capture-test virtual|<connector> <out.pgm>
+                // remdesktop-host --capture-test virtual|<connector> <out.pgm>
                 let src = value()?;
                 let path = it.next().ok_or("--capture-test needs an output path")?;
                 let source = if src == "virtual" { capture::Source::Virtual } else { capture::Source::Monitor(src) };
@@ -89,7 +89,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("remvnc-host: {e}");
+            eprintln!("remdesktop-host: {e}");
             ExitCode::FAILURE
         }
     }
@@ -137,7 +137,7 @@ fn find_session(args: &Args, wait: Duration) -> Result<(SocketAddr, [u8; 16]), S
                 }
                 return Ok((SocketAddr::new(ip, port), t));
             }
-            Err(e) if e.contains("not running") => return Err("remvnc is not running on the tablet".into()),
+            Err(e) if e.contains("not running") => return Err("remdesktop is not running on the tablet".into()),
             Err(e) => last = e,
         }
         if std::time::Instant::now() > deadline {
@@ -233,7 +233,7 @@ fn remap_hid(w: &Writer, screens: &[outputs::Output], target: &Target, gs: &mut 
 
 fn remap(devices: &mut HashMap<u8, Virtual>, screens: &[outputs::Output], target: &Target, gs: &mut gsettings::Outputs) {
     let name = target.output.as_ref().map_or("all screens".to_string(), |o| format!("{} ({}x{})", o.name, o.w, o.h));
-    eprintln!("remvnc-host: input now maps to {name}");
+    eprintln!("remdesktop-host: input now maps to {name}");
     let edids = displayconfig::edids().unwrap_or_default();
     let edid = target.output.as_ref().and_then(|o| edids.get(&o.name));
     for (id, v) in devices.iter_mut() {
@@ -256,7 +256,7 @@ fn run() -> Result<(), String> {
         ssh(&args.ssh, &format!("mv {tmp} {}", args.remote))?;
     }
     let start = std::iter::once(format!("{} start", args.remote)).chain(args.run_args.iter().cloned()).collect::<Vec<_>>().join(" ");
-    eprintln!("remvnc-host: tablet: {}", ssh(&args.ssh, &start)?.trim());
+    eprintln!("remdesktop-host: tablet: {}", ssh(&args.ssh, &start)?.trim());
 
     // Settings changes are undone when this drops, across reconnects.
     let mut gs = gsettings::Outputs::default();
@@ -271,25 +271,25 @@ fn run() -> Result<(), String> {
         let tcp = match connect(addr, &token) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("remvnc-host: connect {addr}: {e}; retrying");
+                eprintln!("remdesktop-host: connect {addr}: {e}; retrying");
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
-        eprintln!("remvnc-host: connected to {addr}");
+        eprintln!("remdesktop-host: connected to {addr}");
         match session(tcp, addr.port(), &args, &mut gs) {
             Ok(End::Bye) => return Ok(()),
             Ok(End::GoRemote(ip)) => {
-                eprintln!("remvnc-host: going remote via {ip}");
+                eprintln!("remdesktop-host: going remote via {ip}");
                 remote = Some((SocketAddr::new(ip, addr.port()), token));
             }
             // USB re-enumeration or a network blip: the instance keeps
             // running, so find it again (directly if we went remote).
             Err(e) => {
-                eprintln!("remvnc-host: {e}; reconnecting");
+                eprintln!("remdesktop-host: {e}; reconnecting");
                 if let Some((r, _)) = remote {
                     if !wait_reachable(r, Duration::from_secs(30)) {
-                        eprintln!("remvnc-host: {r} unreachable; trying over USB");
+                        eprintln!("remdesktop-host: {r} unreachable; trying over USB");
                         remote = None;
                     }
                 }
@@ -341,8 +341,8 @@ fn spawn_prober(
                 .find(|&ip| reachable(SocketAddr::new(ip, port)));
             if last.as_ref() != Some(&(ok, candidates.clone())) {
                 match ok {
-                    Some(ip) => eprintln!("remvnc-host: tablet reachable without USB at {ip}"),
-                    None if !candidates.is_empty() => eprintln!("remvnc-host: tablet not reachable at {}", candidates.join(", ")),
+                    Some(ip) => eprintln!("remdesktop-host: tablet reachable without USB at {ip}"),
+                    None if !candidates.is_empty() => eprintln!("remdesktop-host: tablet not reachable at {}", candidates.join(", ")),
                     None => {}
                 }
                 *verified.lock().unwrap() = ok;
@@ -375,7 +375,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
     let pinger = {
         let w = writer.clone();
         std::thread::spawn(move || {
-            while send(&w, &Msg::Ping { host_us: remvnc_proto::monotonic_us() }).is_ok() {
+            while send(&w, &Msg::Ping { host_us: remdesktop_proto::monotonic_us() }).is_ok() {
                 std::thread::sleep(Duration::from_millis(100));
             }
         })
@@ -412,19 +412,19 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
         };
         match msg {
             Ok(Some(Msg::Hello { version, width, height, rotation, view })) => {
-                if version != remvnc_proto::VERSION {
-                    eprintln!("remvnc-host: tablet speaks protocol {version}, we speak {}", remvnc_proto::VERSION);
+                if version != remdesktop_proto::VERSION {
+                    eprintln!("remdesktop-host: tablet speaks protocol {version}, we speak {}", remdesktop_proto::VERSION);
                     break Ok(End::Bye);
                 }
-                eprintln!("remvnc-host: tablet ready, {width}x{height} rotated {rotation}°");
+                eprintln!("remdesktop-host: tablet ready, {width}x{height} rotated {rotation}°");
                 logical = (width as u32, height as u32);
                 monitors = outputs::list().unwrap_or_else(|e| {
-                    eprintln!("remvnc-host: no monitor list ({e}); input spans all screens");
+                    eprintln!("remdesktop-host: no monitor list ({e}); input spans all screens");
                     vec![]
                 });
                 screens = monitors.clone();
                 for (i, s) in monitors.iter().enumerate() {
-                    eprintln!("remvnc-host: screen {}: {} {}x{} at {},{}", i + 1, s.name, s.w, s.h, s.x, s.y);
+                    eprintln!("remdesktop-host: screen {}: {} {}x{} at {},{}", i + 1, s.name, s.w, s.h, s.x, s.y);
                 }
                 let labels = view_labels(args.display, monitors.len());
                 // Resume the view the tablet had selected (e.g. after USB was replugged).
@@ -441,14 +441,14 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
                     streamer = Some(s);
                 }
                 if initial != 0 {
-                    eprintln!("remvnc-host: resuming view {view}");
+                    eprintln!("remdesktop-host: resuming view {view}");
                     queued.push_back(Msg::Target { index: initial });
                 }
             }
             Ok(Some(Msg::Status { usb_hid, pen_mouse, touchpad })) => {
                 let st = TabletStatus { usb_hid, pen_mouse, touchpad };
                 if st.usb_hid != status.usb_hid {
-                    eprintln!("remvnc-host: input arrives over {}", if usb_hid { "USB HID" } else { "this connection (uinput)" });
+                    eprintln!("remdesktop-host: input arrives over {}", if usb_hid { "USB HID" } else { "this connection (uinput)" });
                 }
                 status = st;
                 if usb_hid {
@@ -463,11 +463,11 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
                 devices.remove(&d.id);
                 match uinput::VirtualDevice::create(&d) {
                     Ok(dev) => {
-                        eprintln!("remvnc-host: created \"{}\"", d.name);
+                        eprintln!("remdesktop-host: created \"{}\"", d.name);
                         devices.insert(d.id, Virtual { decl: d, dev, mapper: Mapper::default() });
                         remap(&mut devices, &screens, &target, gs);
                     }
-                    Err(e) => eprintln!("remvnc-host: creating \"{}\": {e}", d.name),
+                    Err(e) => eprintln!("remdesktop-host: creating \"{}\": {e}", d.name),
                 }
             }
             Ok(Some(Msg::Frame { device: _, time_us, events })) if events.is_empty() => {
@@ -479,7 +479,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
                 if let Some(v) = devices.get_mut(&device) {
                     v.mapper.apply(&mut events);
                     if let Err(e) = v.dev.emit(&events) {
-                        eprintln!("remvnc-host: write to device {device}: {e}");
+                        eprintln!("remdesktop-host: write to device {device}: {e}");
                     }
                 }
                 stats.frame(device, time_us);
@@ -517,7 +517,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
                 *offset.lock().unwrap() = stats.clock_offset();
             }
             Ok(Some(Msg::Bye)) => {
-                eprintln!("remvnc-host: tablet closed the session");
+                eprintln!("remdesktop-host: tablet closed the session");
                 break Ok(End::Bye);
             }
             Ok(Some(Msg::Addresses { addrs })) => *tablet_addrs.lock().unwrap() = addrs,

@@ -569,32 +569,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "remvnc-host"
+name = "remdesktop-host"
 version = "0.8.0"
 dependencies = [
  "libc",
  "lz4_flex",
- "remvnc-proto",
+ "remdesktop-proto",
  "wayland-client",
  "wayland-protocols",
  "zbus",
 ]
 
 [[package]]
-name = "remvnc-proto"
+name = "remdesktop-proto"
 version = "0.8.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
-name = "remvnc-tablet"
+name = "remdesktop-tablet"
 version = "0.8.0"
 dependencies = [
  "embedded-graphics",
  "libc",
  "lz4_flex",
- "remvnc-proto",
+ "remdesktop-proto",
 ]
 
 [[package]]

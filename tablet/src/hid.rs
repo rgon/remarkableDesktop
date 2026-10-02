@@ -12,12 +12,12 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 const GADGET: &str = "/sys/kernel/config/usb_gadget/g_ether";
-const INSTANCE: &str = "remvnc";
-const MOUNT: &str = "/dev/ffs-remvnc";
+const INSTANCE: &str = "remdesktop";
+const MOUNT: &str = "/dev/ffs-remdesktop";
 const CONFIGS: [&str; 2] = ["c.1", "c.2"];
 /// Present while our function is in the gadget: tells the guardian to
 /// restore the gadget if we die.
-pub const MARKER: &str = "/run/remvnc/gadget";
+pub const MARKER: &str = "/run/remdesktop/gadget";
 
 fn function_dir() -> String {
     format!("{GADGET}/functions/ffs.{INSTANCE}")
@@ -75,7 +75,7 @@ fn descriptors(report_len: usize) -> Vec<u8> {
 }
 
 fn strings() -> Vec<u8> {
-    let name = b"remvnc tablet\0";
+    let name = b"remdesktop tablet\0";
     let mut out = vec![];
     let len = 4 * 4 + 2 + name.len();
     for v in [STRINGS_MAGIC, len as u32, 1, 1] {
@@ -117,7 +117,7 @@ impl Gadget {
         fs::create_dir_all(MOUNT)?;
         let mounted = fs::read_to_string("/proc/mounts")?.lines().any(|l| l.split_whitespace().nth(1) == Some(MOUNT));
         if !mounted {
-            let (src, dst, fstype) = (c"remvnc", c"/dev/ffs-remvnc", c"functionfs");
+            let (src, dst, fstype) = (c"remdesktop", c"/dev/ffs-remdesktop", c"functionfs");
             if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), fstype.as_ptr(), 0, std::ptr::null()) } != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -126,7 +126,7 @@ impl Gadget {
         ep0.write_all(&descriptors(report.len()))?;
         ep0.write_all(&strings())?;
 
-        fs::create_dir_all("/run/remvnc")?;
+        fs::create_dir_all("/run/remdesktop")?;
         fs::write(MARKER, b"")?;
         for c in CONFIGS {
             let link = format!("{GADGET}/configs/{c}/ffs.{INSTANCE}");
@@ -162,7 +162,7 @@ impl Gadget {
         match ep1.as_mut().map(|f| f.write(report)) {
             Some(Ok(_)) => true,
             Some(Err(e)) => {
-                log!("remvnc: hid report: {e}");
+                log!("remdesktop: hid report: {e}");
                 *ep1 = None;
                 false
             }
@@ -186,7 +186,7 @@ fn serve_ep0(mut ep0: File, report: &'static [u8], state: Arc<AtomicU8>, ep1: Ar
         let n = match ep0.read(&mut buf) {
             Ok(n) => n,
             Err(e) => {
-                log!("remvnc: ep0: {e}");
+                log!("remdesktop: ep0: {e}");
                 return;
             }
         };
@@ -195,7 +195,7 @@ fn serve_ep0(mut ep0: File, report: &'static [u8], state: Arc<AtomicU8>, ep1: Ar
                 EV_ENABLE => {
                     *ep1.lock().unwrap() = OpenOptions::new().write(true).open(format!("{MOUNT}/ep1")).ok();
                     state.store(Link::Up as u8, Ordering::Relaxed);
-                    log!("remvnc: usb host configured the hid function");
+                    log!("remdesktop: usb host configured the hid function");
                 }
                 EV_DISABLE | EV_UNBIND => {
                     *ep1.lock().unwrap() = None;
@@ -242,7 +242,7 @@ fn setup(ep0: &mut File, req: &[u8], report: &[u8]) {
         }
         _ => {
             // Stall: transfer in the wrong direction.
-            log!("remvnc: hid: unsupported request {kind:#04x}/{request:#04x} value {value:#06x}");
+            log!("remdesktop: hid: unsupported request {kind:#04x}/{request:#04x} value {value:#06x}");
             if kind & 0x80 != 0 {
                 let _ = ep0.read(&mut [0u8; 0]);
             } else {
@@ -261,7 +261,7 @@ pub const MOUSE_REPORT: &[u8] = &[
     0xc0, 0xc0,
 ];
 
-/// `remvnc hid-test`: enumerate as a HID mouse and draw circles for a while.
+/// `remdesktop hid-test`: enumerate as a HID mouse and draw circles for a while.
 /// Run detached with `restore_script` after it: USB re-enumerates.
 pub fn test(seconds: u64) -> Result<(), String> {
     let g = Gadget::add(MOUSE_REPORT).map_err(|e| format!("gadget: {e}"))?;
@@ -269,7 +269,7 @@ pub fn test(seconds: u64) -> Result<(), String> {
     while g.link() != Link::Up && start.elapsed().as_secs() < 15 {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    log!("remvnc: hid link {:?} after {:?}", g.link(), start.elapsed());
+    log!("remdesktop: hid link {:?} after {:?}", g.link(), start.elapsed());
     let begin = std::time::Instant::now();
     let mut sent = 0u32;
     while begin.elapsed().as_secs() < seconds {
@@ -280,7 +280,7 @@ pub fn test(seconds: u64) -> Result<(), String> {
         }
         std::thread::sleep(std::time::Duration::from_millis(8));
     }
-    log!("remvnc: sent {sent} mouse reports");
+    log!("remdesktop: sent {sent} mouse reports");
     restore();
     Ok(())
 }

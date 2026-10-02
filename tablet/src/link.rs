@@ -1,4 +1,4 @@
-//! Connection to `remvnc-host`. The instance listens on a TCP port with
+//! Connection to `remdesktop-host`. The instance listens on a TCP port with
 //! Nagle off (dropbear's SSH channel adds ~40 ms stalls) and writes the port
 //! and a one-time token to a root-only file. The host reads that file over
 //! SSH, which is what authenticates it, then connects and sends the token.
@@ -6,7 +6,7 @@
 
 use crate::display::{Decoder, Rect};
 use crate::epd::ImageInfo;
-use remvnc_proto::Msg;
+use remdesktop_proto::Msg;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -15,8 +15,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// Where `remvnc session` (run by the host over SSH) finds "port token".
-pub const SESSION_FILE: &str = "/run/remvnc/session";
+/// Where `remdesktop session` (run by the host over SSH) finds "port token".
+pub const SESSION_FILE: &str = "/run/remdesktop/session";
 
 pub struct Server {
     listener: TcpListener,
@@ -37,7 +37,7 @@ impl Server {
     pub fn publish(&self) -> io::Result<()> {
         let port = self.listener.local_addr()?.port();
         let hex: String = self.token.iter().map(|b| format!("{b:02x}")).collect();
-        std::fs::create_dir_all("/run/remvnc")?;
+        std::fs::create_dir_all("/run/remdesktop")?;
         std::fs::write(SESSION_FILE, format!("{port} {hex}\n"))?;
         std::fs::set_permissions(SESSION_FILE, std::fs::Permissions::from_mode(0o600))
     }
@@ -62,14 +62,14 @@ impl Server {
         };
         match check() {
             Ok(true) => {
-                log!("remvnc: host connected from {peer}");
+                log!("remdesktop: host connected from {peer}");
                 let out = tcp.try_clone().ok()?;
                 Some(Link { out: BufWriter::new(Box::new(out)), tcp, peer: peer.ip() })
             }
             // Hosts test reachability by connecting and hanging up: not worth a log line.
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => None,
             _ => {
-                log!("remvnc: rejected connection from {peer}");
+                log!("remdesktop: rejected connection from {peer}");
                 None
             }
         }

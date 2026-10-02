@@ -1,6 +1,6 @@
 //! Input rate and end-to-end latency (tablet kernel event → uinput write).
 
-use remvnc_proto::monotonic_us;
+use remdesktop_proto::monotonic_us;
 use std::collections::HashMap;
 
 /// Clock offset samples are kept from the lowest-RTT pongs in this window.
@@ -100,7 +100,7 @@ impl Stats {
             let worst = self.probes.iter().map(|p| p.0).max().unwrap_or(0);
             line += &format!("rtt min {:.1} max {:.1} ms", rtt as f64 / 1000.0, worst as f64 / 1000.0);
         }
-        eprintln!("remvnc-host: {line}");
+        eprintln!("remdesktop-host: {line}");
         self.since = now;
     }
 }
@@ -128,11 +128,11 @@ impl HidProbe {
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("remvnc-host: hid latency probe: {path}: {e}");
+                eprintln!("remdesktop-host: hid latency probe: {path}: {e}");
                 return None;
             }
         };
-        eprintln!("remvnc-host: measuring USB HID pen latency on {path}");
+        eprintln!("remdesktop-host: measuring USB HID pen latency on {path}");
         let clock: libc::c_int = libc::CLOCK_MONOTONIC;
         unsafe { libc::ioctl(file.as_raw_fd(), 0x4004_45a0, &clock) }; // EVIOCSCLOCKID
         let (tx, rx) = std::sync::mpsc::channel::<u64>();
@@ -162,7 +162,7 @@ impl HidProbe {
                     if !(-5_000..200_000).contains(&l) {
                         // Out of step (a report or marker went missing): resync.
                         if resyncs < 3 {
-                            eprintln!("remvnc-host: hid probe resync: {:.1} ms apart", l as f64 / 1000.0);
+                            eprintln!("remdesktop-host: hid probe resync: {:.1} ms apart", l as f64 / 1000.0);
                         }
                         resyncs += 1;
                         markers.clear();
@@ -174,14 +174,14 @@ impl HidProbe {
                     arrivals.pop_front();
                 }
                 if since.elapsed() >= std::time::Duration::from_secs(2) && lat.is_empty() {
-                    eprintln!("remvnc-host: hid probe: {seen_m} markers, {seen_a} reports, {resyncs} resyncs, offset known: {}", offset.lock().unwrap().is_some());
+                    eprintln!("remdesktop-host: hid probe: {seen_m} markers, {seen_a} reports, {resyncs} resyncs, offset known: {}", offset.lock().unwrap().is_some());
                     since = std::time::Instant::now();
                 }
                 if since.elapsed() >= std::time::Duration::from_secs(2) && !lat.is_empty() {
                     lat.sort_by(|a, b| a.total_cmp(b));
                     let p = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
                     eprintln!(
-                        "remvnc-host: pen over USB HID {:.0}/s lat p50 {:.1} p99 {:.1} max {:.1} ms",
+                        "remdesktop-host: pen over USB HID {:.0}/s lat p50 {:.1} p99 {:.1} max {:.1} ms",
                         lat.len() as f64 / since.elapsed().as_secs_f64(),
                         p(0.5),
                         p(0.99),

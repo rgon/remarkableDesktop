@@ -1,5 +1,5 @@
 # reMarkable 2: 32-bit ARM, glibc 2.39. Build with:
-#   cargo zigbuild -p remvnc-tablet --release --target armv7-unknown-linux-gnueabihf.2.31
+#   cargo zigbuild -p remdesktop-tablet --release --target armv7-unknown-linux-gnueabihf.2.31
 [target.armv7-unknown-linux-gnueabihf]
 # Export our QImage constructor so it interposes the one libqsgepaper.so binds to.
 rustflags = ["-C", "link-arg=-Wl,--export-dynamic"]

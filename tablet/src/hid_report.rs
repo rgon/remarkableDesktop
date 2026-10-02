@@ -5,7 +5,7 @@
 //! Every device has its own report ID, so switching pen or touch modes just
 //! changes which report we send; the host never re-enumerates.
 
-use remvnc_proto::{Device, Event};
+use remdesktop_proto::{Device, Event};
 
 pub const PEN: u8 = 1;
 pub const TOUCHSCREEN: u8 = 2;
@@ -346,7 +346,7 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remvnc_proto::Abs;
+    use remdesktop_proto::Abs;
 
     fn dev(codes: &[(u16, i32)]) -> Device {
         Device {

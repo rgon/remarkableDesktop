@@ -6,7 +6,7 @@
 //!    marker and resumes + restarts xochitl so it repaints.
 //! 3. Everything dies: nobody pets xochitl's systemd watchdog (60 s), so
 //!    systemd restarts it.
-//! 4. Manual: `remvnc restore`.
+//! 4. Manual: `remdesktop restore`.
 
 use std::ffi::CString;
 use std::fs;
@@ -97,11 +97,11 @@ pub struct Guardian {
 }
 
 fn marker_path(parent: i32) -> String {
-    format!("/run/remvnc/restored-{parent}")
+    format!("/run/remdesktop/restored-{parent}")
 }
 
 impl Guardian {
-    /// Starts `remvnc guardian` as a transient systemd unit, so it outlives
+    /// Starts `remdesktop guardian` as a transient systemd unit, so it outlives
     /// the SSH session and logs to the journal. Falls back to a detached
     /// child. Call before loading Qt.
     pub fn spawn(xochitl: i32, deadline_secs: u64) -> io::Result<Self> {
@@ -109,7 +109,7 @@ impl Guardian {
         let exe = std::env::current_exe()?;
         let args = ["guardian".to_string(), xochitl.to_string(), deadline_secs.to_string(), me.to_string()];
         let _ = fs::remove_file(marker_path(me as i32));
-        let unit = format!("--unit=remvnc-guardian-{me}");
+        let unit = format!("--unit=remdesktop-guardian-{me}");
         let systemd = Command::new("systemd-run")
             .args(["--quiet", "--collect", &unit])
             .arg(&exe)
@@ -117,7 +117,7 @@ impl Guardian {
             .stdout(Stdio::null())
             .status();
         if !matches!(systemd, Ok(s) if s.success()) {
-            log!("remvnc: systemd-run unavailable, guardian runs as a child");
+            log!("remdesktop: systemd-run unavailable, guardian runs as a child");
             unsafe {
                 Command::new(&exe)
                     .args(&args)
@@ -136,7 +136,7 @@ impl Guardian {
 
     /// Tells the guardian the screen is restored: it only needs to resume xochitl.
     pub fn restored(&mut self) {
-        let _ = fs::create_dir_all("/run/remvnc");
+        let _ = fs::create_dir_all("/run/remdesktop");
         let _ = fs::write(&self.marker, b"");
     }
 }
@@ -145,7 +145,7 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// `remvnc guardian <xochitl pid> <deadline secs, 0 = none> <parent pid>`.
+/// `remdesktop guardian <xochitl pid> <deadline secs, 0 = none> <parent pid>`.
 /// Pets xochitl's watchdog while the parent lives; once the parent is gone
 /// (and its e-ink engine with it), resumes xochitl, restarting it unless the
 /// parent restored the screen.
@@ -163,7 +163,7 @@ pub fn run_guardian(xochitl: i32, deadline_secs: u64, parent: i32) {
             last_pet = Some(Instant::now());
         }
         if deadline_secs > 0 && start.elapsed() > Duration::from_secs(deadline_secs) {
-            log!("remvnc guardian: deadline reached, killing {parent}");
+            log!("remdesktop guardian: deadline reached, killing {parent}");
             let _ = signal(parent, libc::SIGKILL);
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -171,23 +171,23 @@ pub fn run_guardian(xochitl: i32, deadline_secs: u64, parent: i32) {
     // Our USB HID function was still in the gadget: put USB back first.
     if fs::exists(crate::hid::MARKER).unwrap_or(false) {
         crate::hid::restore();
-        log!("remvnc guardian: removed the usb hid function");
+        log!("remdesktop guardian: removed the usb hid function");
     }
     let marker = marker_path(parent);
     let restored = fs::remove_file(&marker).is_ok();
     let _ = signal(xochitl, libc::SIGCONT);
     if restored {
-        log!("remvnc guardian: screen restored, resumed xochitl");
+        log!("remdesktop guardian: screen restored, resumed xochitl");
     } else {
         restart_xochitl();
-        log!("remvnc guardian: no restored screen, restarted xochitl");
+        log!("remdesktop guardian: no restored screen, restarted xochitl");
     }
 }
 
-/// `remvnc restore`: kill stray instances, resume and restart xochitl.
+/// `remdesktop restore`: kill stray instances, resume and restart xochitl.
 pub fn manual_restore() {
     let me = std::process::id() as i32;
-    for pid in pids_named("remvnc").into_iter().filter(|&p| p != me) {
+    for pid in pids_named("remdesktop").into_iter().filter(|&p| p != me) {
         let _ = signal(pid, libc::SIGKILL);
     }
     if let Some(pid) = xochitl_pid() {
