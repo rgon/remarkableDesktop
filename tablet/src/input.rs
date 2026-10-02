@@ -195,6 +195,8 @@ pub struct Pen {
     pending: Vec<Event>,
     /// Pen or eraser within hover range.
     pub in_range: bool,
+    /// Last position sent, for clicks at the pen's location.
+    last: [i32; 2],
 }
 
 impl Pen {
@@ -221,7 +223,7 @@ impl Pen {
             let m = i.max.max(-i.min);
             abs.push(Abs { code, min: -m, max: m, resolution: 0 });
         }
-        Ok(Self { mode, rubber: false, pressed: None, map, pos, abs, pending: vec![], in_range: false })
+        Ok(Self { mode, rubber: false, pressed: None, map, pos, abs, pending: vec![], in_range: false, last: [0; 2] })
     }
 
     pub fn mode(&self) -> PenMode {
@@ -242,6 +244,35 @@ impl Pen {
         self.mode = mode;
         self.pending.clear();
         release
+    }
+
+    /// A side-button click (right click in mouse mode) at the pen's current
+    /// or last position: press and release frames. Out of range, the pen
+    /// briefly enters hover there so the click has a location.
+    pub fn side_click(&self) -> [Vec<Event>; 2] {
+        let at = [Event { kind: EV_ABS, code: ABS_X, value: self.last[0] }, Event { kind: EV_ABS, code: ABS_Y, value: self.last[1] }];
+        let key = |code, value| Event { kind: EV_KEY, code, value };
+        match self.mode {
+            PenMode::Mouse => {
+                let mut down = at.to_vec();
+                down.push(key(BTN_RIGHT, 1));
+                [down, vec![key(BTN_RIGHT, 0)]]
+            }
+            PenMode::Tablet => {
+                let enter = !self.in_range;
+                let mut down = vec![];
+                if enter {
+                    down.push(key(BTN_TOOL_PEN, 1));
+                }
+                down.extend(at);
+                down.push(key(BTN_STYLUS, 1));
+                let mut up = vec![key(BTN_STYLUS, 0)];
+                if enter {
+                    up.push(key(BTN_TOOL_PEN, 0));
+                }
+                [down, up]
+            }
+        }
     }
 
     pub fn device(&self) -> Device {
@@ -302,7 +333,9 @@ impl Pen {
                 (EV_ABS, ABS_X | ABS_Y) => {
                     let raw = (e.code - ABS_X) as usize;
                     let (out, flipped) = self.map.to[raw];
-                    pending.push(Event { kind: EV_ABS, code: [ABS_X, ABS_Y][out], value: apply(e.value, self.pos[raw], flipped) });
+                    let value = apply(e.value, self.pos[raw], flipped);
+                    self.last[out] = value;
+                    pending.push(Event { kind: EV_ABS, code: [ABS_X, ABS_Y][out], value });
                 }
                 (EV_ABS, ABS_TILT_X | ABS_TILT_Y) => {
                     let raw = (e.code - ABS_TILT_X) as usize;
@@ -484,7 +517,7 @@ impl Touch {
         }
         if in_range && !was {
             let mut lifted = false;
-            for s in self.slots.iter_mut().filter(|s| s.id >= 0 && matches!(s.owner, Owner::Host | Owner::Ui(_))) {
+            for s in self.slots.iter_mut().filter(|s| s.id >= 0 && s.owner == Owner::Host) {
                 s.owner = Owner::PenNear;
                 s.dirty = true;
                 lifted = true;
@@ -566,12 +599,14 @@ impl Touch {
             if s.began {
                 s.began = false;
                 s.peak = [0; 3];
-                s.owner = if pen_blocks {
-                    Owner::PenNear
-                } else if let Some(p) = palm {
+                // Our buttons work even while the pen hovers (e.g. the side
+                // button); palms never press them.
+                s.owner = if let Some(p) = palm {
                     p
                 } else if let Some(b) = on_ui(s.pos) {
                     Owner::Ui(b)
+                } else if pen_blocks {
+                    Owner::PenNear
                 } else {
                     Owner::Host
                 };

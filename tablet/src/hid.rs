@@ -15,6 +15,9 @@ const GADGET: &str = "/sys/kernel/config/usb_gadget/g_ether";
 const INSTANCE: &str = "remvnc";
 const MOUNT: &str = "/dev/ffs-remvnc";
 const CONFIGS: [&str; 2] = ["c.1", "c.2"];
+/// Present while our function is in the gadget: tells the guardian to
+/// restore the gadget if we die.
+pub const MARKER: &str = "/run/remvnc/gadget";
 
 fn function_dir() -> String {
     format!("{GADGET}/functions/ffs.{INSTANCE}")
@@ -28,7 +31,7 @@ pub fn restore_script() -> String {
          echo '' > {GADGET}/UDC 2>/dev/null; \
          rm -f {GADGET}/configs/c.1/ffs.{INSTANCE} {GADGET}/configs/c.2/ffs.{INSTANCE}; \
          echo $U > {GADGET}/UDC; \
-         umount {MOUNT} 2>/dev/null; rmdir {MOUNT} 2>/dev/null; rmdir {fd} 2>/dev/null; true",
+         umount {MOUNT} 2>/dev/null; rmdir {MOUNT} 2>/dev/null; rmdir {fd} 2>/dev/null; rm -f {MARKER}; true",
         fd = function_dir()
     )
 }
@@ -123,6 +126,8 @@ impl Gadget {
         ep0.write_all(&descriptors(report.len()))?;
         ep0.write_all(&strings())?;
 
+        fs::create_dir_all("/run/remvnc")?;
+        fs::write(MARKER, b"")?;
         for c in CONFIGS {
             let link = format!("{GADGET}/configs/{c}/ffs.{INSTANCE}");
             if fs::symlink_metadata(&link).is_err() {
@@ -217,7 +222,17 @@ fn setup(ep0: &mut File, req: &[u8], report: &[u8]) {
         // GET_DESCRIPTOR to the interface: report or HID descriptor.
         (0x81, 0x06) if value >> 8 == 0x22 => reply(ep0, report),
         (0x81, 0x06) if value >> 8 == 0x21 => reply(ep0, &hid_descriptor(report.len())),
-        (0xa1, 0x01) => reply(ep0, &vec![0u8; length]), // GET_REPORT
+        // GET_REPORT: feature reports carry real values (contact maximum).
+        (0xa1, 0x01) => match crate::hid_report::feature(value as u8).filter(|_| value >> 8 == 3) {
+            Some(f) => reply(ep0, &f),
+            None => {
+                let mut zero = vec![0u8; length];
+                if let Some(b) = zero.first_mut() {
+                    *b = value as u8;
+                }
+                reply(ep0, &zero)
+            }
+        },
         (0xa1, 0x02) => reply(ep0, &[0]),               // GET_IDLE
         (0xa1, 0x03) => reply(ep0, &[1]),               // GET_PROTOCOL: report
         // SET_IDLE, SET_PROTOCOL, SET_REPORT: read (any data) to acknowledge.

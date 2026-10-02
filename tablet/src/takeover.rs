@@ -168,6 +168,11 @@ pub fn run_guardian(xochitl: i32, deadline_secs: u64, parent: i32) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // Our USB HID function was still in the gadget: put USB back first.
+    if fs::exists(crate::hid::MARKER).unwrap_or(false) {
+        crate::hid::restore();
+        log!("remvnc guardian: removed the usb hid function");
+    }
     let marker = marker_path(parent);
     let restored = fs::remove_file(&marker).is_ok();
     let _ = signal(xochitl, libc::SIGCONT);

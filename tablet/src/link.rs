@@ -1,57 +1,95 @@
-//! Session transport. Starts on SSH stdio (authenticated, encrypted) and,
-//! unless disabled, moves to a direct TCP socket with Nagle off: dropbear
-//! leaves Nagle on for non-PTY sessions, which adds ~40 ms stalls.
-//!
-//! The direct socket listens only on the address the SSH client reached,
-//! accepts only the SSH client's IP, and requires a one-time token sent over
-//! SSH. Input events then travel unencrypted on that link.
+//! Connection to `remvnc-host`. The instance listens on a TCP port with
+//! Nagle off (dropbear's SSH channel adds ~40 ms stalls) and writes the port
+//! and a one-time token to a root-only file. The host reads that file over
+//! SSH, which is what authenticates it, then connects and sends the token.
+//! Traffic on the socket itself is unencrypted.
 
 use crate::display::{Decoder, Rect};
 use crate::epd::ImageInfo;
 use remvnc_proto::Msg;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
-use std::net::{IpAddr, TcpListener, TcpStream};
-use std::os::fd::FromRawFd;
+use std::net::{TcpListener, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+/// Where `remvnc session` (run by the host over SSH) finds "port token".
+pub const SESSION_FILE: &str = "/run/remvnc/session";
+
+pub struct Server {
+    listener: TcpListener,
+    token: [u8; 16],
+}
+
+impl Server {
+    pub fn listen() -> io::Result<Server> {
+        let listener = TcpListener::bind(("0.0.0.0", 0))?;
+        listener.set_nonblocking(true)?;
+        let mut token = [0u8; 16];
+        File::open("/dev/urandom")?.read_exact(&mut token)?;
+        Ok(Server { listener, token })
+    }
+
+    /// Publishes port and token for the host. Done once the USB setup has
+    /// settled, so the host doesn't connect just before re-enumeration.
+    pub fn publish(&self) -> io::Result<()> {
+        let port = self.listener.local_addr()?.port();
+        let hex: String = self.token.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::create_dir_all("/run/remvnc")?;
+        std::fs::write(SESSION_FILE, format!("{port} {hex}\n"))?;
+        std::fs::set_permissions(SESSION_FILE, std::fs::Permissions::from_mode(0o600))
+    }
+
+    pub fn fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+
+    /// A newly connected host that presented the token, if any.
+    pub fn accept(&self) -> Option<Link> {
+        let (tcp, peer) = self.listener.accept().ok()?;
+        let check = || -> io::Result<bool> {
+            tcp.set_nonblocking(false)?;
+            tcp.set_read_timeout(Some(Duration::from_secs(2)))?;
+            let mut got = [0u8; 16];
+            (&tcp).read_exact(&mut got)?;
+            tcp.set_read_timeout(None)?;
+            tcp.set_nodelay(true)?;
+            Ok(got == self.token)
+        };
+        match check() {
+            Ok(true) => {
+                log!("remvnc: host connected from {peer}");
+                let out = tcp.try_clone().ok()?;
+                Some(Link { out: BufWriter::new(Box::new(out)), tcp })
+            }
+            _ => {
+                log!("remvnc: rejected connection from {peer}");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(SESSION_FILE);
+    }
+}
 
 pub struct Link {
     pub out: BufWriter<Box<dyn Write>>,
-    tcp: Option<TcpStream>,
+    tcp: TcpStream,
 }
 
 impl Link {
-    pub fn open(ssh_only: bool) -> Link {
-        if !ssh_only {
-            match direct() {
-                Ok(tcp) => {
-                    let out = tcp.try_clone().expect("clone tcp socket");
-                    return Link { out: BufWriter::new(Box::new(out)), tcp: Some(tcp) };
-                }
-                Err(e) => log!("remvnc: direct link unavailable ({e}), using ssh"),
-            }
-        }
-        Link { out: BufWriter::new(Box::new(io::stdout())), tcp: None }
-    }
-
-    pub fn is_direct(&self) -> bool {
-        self.tcp.is_some()
-    }
-
     /// Moves receiving off the (real-time) input thread. Screen updates are
     /// decoded straight into the framebuffer on the reader thread; everything
     /// arrives on the returned channel, and the returned fd becomes readable
     /// whenever something is waiting.
     pub fn spawn_reader(&mut self, fb: ImageInfo) -> io::Result<(mpsc::Receiver<Incoming>, File)> {
-        let source: Box<dyn Read + Send> = match &self.tcp {
-            Some(t) => {
-                // Shared with the writer half: both block from now on.
-                t.set_nonblocking(false)?;
-                Box::new(t.try_clone()?)
-            }
-            None => Box::new(io::stdin()),
-        };
+        let source = self.tcp.try_clone()?;
         let (mut wake_tx, wake_rx) = pipe()?;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -78,6 +116,11 @@ impl Link {
         });
         Ok((rx, wake_rx))
     }
+
+    /// Ends the connection (the reader thread then reports `Closed`).
+    pub fn close(&self) {
+        let _ = self.tcp.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 /// What the reader thread hands to the input thread.
@@ -94,50 +137,4 @@ fn pipe() -> io::Result<(File, File)> {
         return Err(io::Error::last_os_error());
     }
     unsafe { Ok((File::from_raw_fd(fds[1]), File::from_raw_fd(fds[0]))) }
-}
-
-fn unmap(ip: &str) -> Result<IpAddr, String> {
-    ip.trim_start_matches("::ffff:").parse().map_err(|e| format!("bad address {ip}: {e}"))
-}
-
-fn direct() -> Result<TcpStream, String> {
-    let conn = std::env::var("SSH_CONNECTION").map_err(|_| "not started over ssh")?;
-    let f: Vec<&str> = conn.split_whitespace().collect();
-    let [client, _, server, _] = f[..] else { return Err(format!("odd SSH_CONNECTION {conn:?}")) };
-    let (client, server) = (unmap(client)?, unmap(server)?);
-
-    let listener = TcpListener::bind((server, 0)).map_err(|e| format!("bind {server}: {e}"))?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let mut token = [0u8; 16];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut token)).map_err(|e| e.to_string())?;
-
-    let mut stdout = io::stdout().lock();
-    Msg::Direct { addr: server.to_string(), port, token }
-        .write_to(&mut stdout)
-        .and_then(|_| stdout.flush())
-        .map_err(|e| format!("announce: {e}"))?;
-
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        match listener.accept() {
-            Ok((tcp, peer)) if peer.ip().to_canonical() == client => {
-                tcp.set_nonblocking(false).map_err(|e| e.to_string())?;
-                tcp.set_read_timeout(Some(Duration::from_secs(2))).map_err(|e| e.to_string())?;
-                let mut got = [0u8; 16];
-                if (&tcp).read_exact(&mut got).is_err() || got != token {
-                    log!("remvnc: rejected direct connection from {peer}: bad token");
-                    continue;
-                }
-                tcp.set_nodelay(true).map_err(|e| e.to_string())?;
-                tcp.set_read_timeout(None).map_err(|e| e.to_string())?;
-                tcp.set_nonblocking(true).map_err(|e| e.to_string())?;
-                return Ok(tcp);
-            }
-            Ok((_, peer)) => log!("remvnc: rejected direct connection from {peer}"),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => return Err(e.to_string()),
-        }
-    }
-    Err("host did not connect".into())
 }

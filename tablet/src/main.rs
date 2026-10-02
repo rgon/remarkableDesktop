@@ -7,10 +7,12 @@ macro_rules! log {
     }};
 }
 
+mod daemon;
 mod display;
 mod epd;
 mod gfx;
 mod hid;
+mod hid_report;
 mod input;
 mod link;
 mod session;
@@ -24,23 +26,23 @@ use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::text::Text;
 use epd::{Epd, Mode};
 use gfx::{Canvas, Scaled};
-use input::{PalmConfig, Pen, PenMode, Touch, TouchMode};
-use ui::Button;
-use remvnc_proto::Msg;
+use input::{PalmConfig, PenMode, TouchMode};
 use session::{Session, quitting};
-use std::io::Write;
-use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:
-  remvnc run [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
-             [--palm-major N] [--pen-grace-ms N] [--log-touch] [--ssh-only]
-             [--fast-mode M] [--settle-mode M] [--settle-ms N]
-             (modes: pen, mono, animation, ui, content)
-      Forward pen/touch to remvnc-host (on stdout, or a direct socket it
-      is told about) until the X is held.
-  remvnc probe     Draw test patterns for a few seconds.
-  remvnc restore   Kill stray instances and restart xochitl.";
+  remvnc start [options]   Start the instance (detached): takes over the panel,
+                           adds the USB HID function, waits for remvnc-host.
+  remvnc stop              End it (hold X or press power on the tablet also works).
+  remvnc session           Print \"port token\" for remvnc-host, if running.
+  remvnc daemon [options]  Run the instance in the foreground.
+  remvnc probe             Draw test patterns for a few seconds.
+  remvnc restore           Kill stray instances and restart xochitl.
+  remvnc hid-restore       Remove our USB HID function from the gadget.
+options: [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
+         [--palm-major N] [--pen-grace-ms N] [--log-touch] [--no-usb]
+         [--fast-mode M] [--settle-mode M] [--settle-ms N]
+         (modes: pen, mono, animation, ui, content)";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -60,7 +62,10 @@ fn main() {
             hid::restore();
             Ok(())
         }
-        Some("run") => parse_run(&args[2..]).and_then(run),
+        Some("daemon") => parse_run(&args[2..]).and_then(daemon::run),
+        Some("start") => parse_run(&args[2..]).and_then(|_| start(&args[2..])),
+        Some("stop") => stop(),
+        Some("session") => session_info(),
         _ => Err(USAGE.into()),
     };
     if let Err(e) = result {
@@ -69,17 +74,8 @@ fn main() {
     }
 }
 
-struct RunArgs {
-    refresh: display::Refresh,
-    rotation: u16,
-    touch: TouchMode,
-    pen: PenMode,
-    palm: PalmConfig,
-    ssh_only: bool,
-}
-
-fn parse_run(args: &[String]) -> Result<RunArgs, String> {
-    let (mut rotation, mut touch, mut palm, mut ssh_only) = (90, TouchMode::Touchpad, PalmConfig::default(), false);
+fn parse_run(args: &[String]) -> Result<daemon::Args, String> {
+    let (mut rotation, mut touch, mut palm, mut usb) = (90, TouchMode::Touchpad, PalmConfig::default(), true);
     let mut pen = PenMode::Tablet;
     let mut refresh = display::Refresh::default();
     let mut it = args.iter();
@@ -111,11 +107,11 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "--palm-major" => palm.max_major = value()?.parse().map_err(|_| "--palm-major: a number")?,
             "--pen-grace-ms" => palm.pen_grace_us = value()?.parse::<u64>().map_err(|_| "--pen-grace-ms: a number")? * 1000,
             "--log-touch" => palm.log = true,
-            "--ssh-only" => ssh_only = true,
+            "--no-usb" => usb = false,
             _ => return Err(format!("unknown argument {a}\n{USAGE}")),
         }
     }
-    Ok(RunArgs { refresh, rotation, touch, pen, palm, ssh_only })
+    Ok(daemon::Args { refresh, rotation, touch, pen, palm, usb })
 }
 
 /// Pumps Qt events for `ms`; false if we were asked to quit.
@@ -129,239 +125,46 @@ fn wait(epd: &Epd, ms: u64) -> bool {
 }
 
 
-/// Runs the calling thread under SCHED_FIFO so input forwarding is not
-/// delayed behind the engine's threads (which keep their normal policy).
-fn realtime_priority() {
-    let param = libc::sched_param { sched_priority: 20 };
-    if unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) } != 0 {
-        log!("remvnc: SCHED_FIFO: {}", std::io::Error::last_os_error());
-    }
+const UNIT: &str = "remvnc";
+
+fn unit_active() -> bool {
+    std::process::Command::new("systemctl").args(["is-active", "--quiet", UNIT]).status().is_ok_and(|s| s.success())
 }
 
-/// Idle wake-up interval. The engine hands refresh work through Qt's event
-/// loop, so it is serviced on every wake-up (and right after each refresh);
-/// servicing it less often delays and bunches up screen updates.
-const IDLE_WAKE: Duration = Duration::from_millis(100);
-
-fn mode_label(m: TouchMode) -> &'static str {
-    match m {
-        TouchMode::Touchpad => "PAD",
-        TouchMode::Touchscreen => "TOUCH",
+/// Starts the instance as a transient systemd unit, so it outlives the SSH
+/// session that started it (USB re-enumeration drops that session).
+fn start(options: &[String]) -> Result<(), String> {
+    if unit_active() {
+        println!("running");
+        return Ok(());
     }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let status = std::process::Command::new("systemd-run")
+        .args(["--quiet", "--collect", &format!("--unit={UNIT}")])
+        .arg(exe)
+        .arg("daemon")
+        .args(options)
+        .status()
+        .map_err(|e| format!("systemd-run: {e}"))?;
+    if !status.success() {
+        return Err("systemd-run failed".into());
+    }
+    println!("started");
+    Ok(())
 }
 
-fn pen_label(m: PenMode) -> &'static str {
-    match m {
-        PenMode::Tablet => "PEN",
-        PenMode::Mouse => "MOUSE",
-    }
+fn stop() -> Result<(), String> {
+    let _ = std::process::Command::new("systemctl").args(["stop", UNIT]).status();
+    Ok(())
 }
 
-fn run(args: RunArgs) -> Result<(), String> {
-    let RunArgs { refresh, rotation, touch: touch_mode, pen: pen_mode, palm, ssh_only } = args;
-    // Before pausing xochitl: the host must answer within a few seconds.
-    let mut link = link::Link::open(ssh_only);
-    let (session, epd) = Session::begin(0)?;
-    let inputs = &session.inputs;
-    let mut pen = inputs.pen.as_ref().map(|g| Pen::new(&g.file, rotation, pen_mode)).transpose().map_err(|e| format!("pen: {e}"))?;
-    let mut touch = inputs
-        .touch
-        .as_ref()
-        .map(|g| Touch::new(&g.file, rotation, touch_mode, palm))
-        .transpose()
-        .map_err(|e| format!("touch: {e}"))?;
-
-    let mut ui = ui::Ui::new(&epd, rotation);
-    let mut target: u8 = 0;
-    // View labels from the host; the screen button cycles through them.
-    let mut views: Vec<String> = vec!["ALL".into()];
-    let mut display = display::Display::new(refresh);
-    ui.set_label(Button::Screen, &views[0]);
-    ui.set_label(Button::Mode, mode_label(touch_mode));
-    ui.set_label(Button::Pen, pen_label(pen_mode));
-    ui.draw_home();
-    realtime_priority();
-
-    let out = &mut link.out;
-    let mut hello = vec![Msg::Hello { version: remvnc_proto::VERSION, width: ui.size[0] as u16, height: ui.size[1] as u16, rotation }];
-    hello.extend(pen.iter().map(|p| Msg::Device(p.device())));
-    hello.extend(touch.iter().map(|t| Msg::Device(t.device())));
-    let mut alive = hello.iter().try_for_each(|m| m.write_to(out)).and_then(|_| out.flush()).is_ok();
-
-    let grabbed = [inputs.pen.as_ref(), inputs.touch.as_ref(), inputs.power.as_ref()];
-    let (incoming, mut wake) = link.spawn_reader(epd.fb).map_err(|e| format!("reader: {e}"))?;
-    let mut fds: Vec<i32> = grabbed.iter().map(|g| g.map_or(-1, |g| g.file.as_raw_fd())).collect();
-    fds.push(wake.as_raw_fd());
-    // With a direct link, ssh's stdin still tells us when the host is gone.
-    fds.push(if link.is_direct() { 0 } else { -1 });
-    let mut files = grabbed.map(|g| g.and_then(|g| g.file.try_clone().ok()));
-    // (button, since, already fired): a hold fires once, then needs a release.
-    let mut hold: Option<(Button, Instant, bool)> = None;
-    let mut done = false;
-
-    while alive && !done && !quitting() {
-        let mut pfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
-        let mut timeout = if hold.is_some() { 30 } else { IDLE_WAKE.as_millis() as i32 };
-        if let Some(t) = display.next_tick_ms() {
-            timeout = timeout.min(t);
-        }
-        unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, timeout) };
-
-        // Pen first: its hover state gates touches in the same wake-up.
-        let mut frames = vec![];
-        if let (Some(pen), Some(f)) = (pen.as_mut(), files[0].as_mut()) {
-            let events = input::read_events(f).unwrap_or_default();
-            frames.extend(pen.feed(&events).into_iter().map(|(t, e)| (input::PEN_ID, t, e)));
-        }
-        if let Some(touch) = touch.as_mut() {
-            let now = remvnc_proto::monotonic_us();
-            if let Some(lift) = touch.set_pen(pen.as_ref().is_some_and(|p| p.in_range), now) {
-                frames.push((input::TOUCH_ID, now, lift));
-            }
-            if let Some(f) = files[1].as_mut() {
-                let events = input::read_events(f).unwrap_or_default();
-                let fs = touch.feed(&events, ui.size, |p| ui.button_at(p).map(|b| b as u8));
-                frames.extend(fs.into_iter().map(|(t, e)| (input::TOUCH_ID, t, e)));
-            }
-        }
-        let out = &mut link.out;
-        for (device, time_us, events) in frames {
-            alive &= Msg::Frame { device, time_us, events }.write_to(out).is_ok();
-        }
-
-        if let Some(f) = files[2].as_mut() {
-            let power = input::read_events(f).unwrap_or_default();
-            if power.iter().any(|e| e.kind == input::EV_KEY && e.code == input::KEY_POWER && e.value == 1) {
-                log!("remvnc: power button pressed");
-                done = true;
-            }
-        }
-        if pfds[4].revents != 0 {
-            // ssh closed under a direct link.
-            let mut b = [0u8; 64];
-            if unsafe { libc::read(0, b.as_mut_ptr().cast(), b.len()) } <= 0 {
-                log!("remvnc: ssh session ended");
-                break;
-            }
-        }
-        if pfds[3].revents != 0 {
-            let mut drain = [0u8; 64];
-            let _ = std::io::Read::read(&mut wake, &mut drain);
-            let mut closed = false;
-            while let Ok(item) = incoming.try_recv() {
-                match item {
-                    link::Incoming::Msg(Msg::Ping { host_us }) => {
-                        let pong = Msg::Pong { host_us, tablet_us: remvnc_proto::monotonic_us() };
-                        alive &= pong.write_to(&mut link.out).is_ok();
-                    }
-                    link::Incoming::Msg(Msg::Screens { names }) if !names.is_empty() => {
-                        log!("remvnc: host views: {}", names.join(", "));
-                        views = names;
-                        target = 0;
-                        ui.set_label(Button::Screen, &views[0]);
-                    }
-                    link::Incoming::Msg(_) => {}
-                    link::Incoming::Decoded { id, rect } => {
-                        // Ack first: the host prepares the next update while we refresh.
-                        alive &= Msg::Ack { id }.write_to(&mut link.out).and_then(|_| link.out.flush()).is_ok();
-                        match rect {
-                            Ok(r) => {
-                                if r.intersects(ui.bar_phys()) {
-                                    ui.redraw_buttons();
-                                }
-                                display.show(&epd, r);
-                            }
-                            Err(e) => log!("remvnc: {e}"),
-                        }
-                    }
-                    link::Incoming::Closed => closed = true,
-                }
-            }
-            if closed {
-                log!("remvnc: host went away");
-                break;
-            }
-        }
-        alive &= link.out.flush().is_ok();
-
-        let held = touch.as_ref().and_then(|t| t.holding()).map(|b| Button::ALL[b as usize]);
-        match (held, hold) {
-            (Some(b), Some((h, since, fired))) if b == h => {
-                if !fired {
-                    let elapsed = since.elapsed();
-                    let steps = (elapsed.as_millis() * ui::HOLD_STEPS as u128 / b.hold().as_millis()) as u32;
-                    ui.set_progress(b, steps.min(ui::HOLD_STEPS));
-                    if elapsed >= b.hold() {
-                        hold = Some((b, since, true));
-                        match b {
-                            Button::Close => {
-                                log!("remvnc: close button held");
-                                done = true;
-                            }
-                            Button::Mode => {
-                                if let Some(t) = touch.as_mut() {
-                                    let next = match t.mode() {
-                                        TouchMode::Touchpad => TouchMode::Touchscreen,
-                                        TouchMode::Touchscreen => TouchMode::Touchpad,
-                                    };
-                                    let now = remvnc_proto::monotonic_us();
-                                    if let Some(lift) = t.set_mode(next, now) {
-                                        alive &= Msg::Frame { device: input::TOUCH_ID, time_us: now, events: lift }.write_to(&mut link.out).is_ok();
-                                    }
-                                    alive &= Msg::Device(t.device()).write_to(&mut link.out).is_ok();
-                                    log!("remvnc: touch is now {next:?}");
-                                    ui.set_label(b, mode_label(next));
-                                }
-                            }
-                            Button::Pen => {
-                                if let Some(p) = pen.as_mut() {
-                                    let next = match p.mode() {
-                                        PenMode::Tablet => PenMode::Mouse,
-                                        PenMode::Mouse => PenMode::Tablet,
-                                    };
-                                    let now = remvnc_proto::monotonic_us();
-                                    if let Some(release) = p.set_mode(next) {
-                                        alive &= Msg::Frame { device: input::PEN_ID, time_us: now, events: release }.write_to(&mut link.out).is_ok();
-                                    }
-                                    alive &= Msg::Device(p.device()).write_to(&mut link.out).is_ok();
-                                    log!("remvnc: pen is now {next:?}");
-                                    ui.set_label(b, pen_label(next));
-                                }
-                            }
-                            Button::Screen => {
-                                if views.len() > 1 {
-                                    target = (target + 1) % views.len() as u8;
-                                    alive &= Msg::Target { index: target }.write_to(&mut link.out).is_ok();
-                                    ui.set_label(b, &views[target as usize]);
-                                }
-                            }
-                        }
-                        alive &= link.out.flush().is_ok();
-                    }
-                }
-            }
-            (Some(b), _) => {
-                if let Some((h, _, _)) = hold {
-                    ui.set_progress(h, 0);
-                }
-                hold = Some((b, Instant::now(), false));
-            }
-            (None, Some((h, _, _))) => {
-                hold = None;
-                ui.set_progress(h, 0);
-            }
-            (None, None) => {}
-        }
-        display.tick(&epd);
-        epd.process_events(0);
+fn session_info() -> Result<(), String> {
+    if !unit_active() {
+        return Err("not running".into());
     }
-    if !alive {
-        log!("remvnc: lost the host connection");
-    }
-    let _ = Msg::Bye.write_to(&mut link.out).and_then(|_| link.out.flush());
-    drop(link);
-    drop(ui);
-    session.end(&epd)
+    let s = std::fs::read_to_string(link::SESSION_FILE).map_err(|_| "starting".to_string())?;
+    print!("{s}");
+    Ok(())
 }
 
 fn probe() -> Result<(), String> {

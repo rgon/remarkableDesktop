@@ -62,21 +62,28 @@ pub const HOLD_STEPS: u32 = 12;
 /// The hold-to-activate buttons, left to right along the top edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
+    /// Clicks the pen's side button where the pen is (or last was). Acts
+    /// on touch, no hold.
+    Side = 0,
     /// Cycles which monitor absolute input maps to.
-    Screen = 0,
+    Screen = 1,
     /// Switches the pen between drawing tablet and absolute mouse.
-    Pen = 1,
+    Pen = 2,
     /// Switches touch between touchpad and touchscreen.
-    Mode = 2,
-    Close = 3,
+    Mode = 3,
+    Close = 4,
 }
 
 impl Button {
-    pub const ALL: [Button; 4] = [Button::Screen, Button::Pen, Button::Mode, Button::Close];
+    pub const ALL: [Button; 5] = [Button::Side, Button::Screen, Button::Pen, Button::Mode, Button::Close];
 
-    /// How long the button must be held.
+    /// How long the button must be held (zero: acts on touch).
     pub fn hold(self) -> std::time::Duration {
-        std::time::Duration::from_millis(if self == Button::Close { 1500 } else { 700 })
+        std::time::Duration::from_millis(match self {
+            Button::Side => 0,
+            Button::Close => 1500,
+            _ => 700,
+        })
     }
 }
 
@@ -85,13 +92,21 @@ struct Slot {
     /// Text shown inside; the close button draws an X instead.
     label: String,
     drawn: Option<u32>,
+    /// Disabled buttons are drawn grey and ignore holds.
+    enabled: bool,
 }
+
+/// Lines of the info box in the bottom-left corner.
+const STATUS_LINES: usize = 3;
+const STATUS_W: u32 = 520;
+const STATUS_LINE_H: i32 = 44;
 
 pub struct Ui<'a> {
     canvas: Canvas<'a>,
     rotation: u16,
     pub size: [i32; 2],
     buttons: Vec<Slot>,
+    status: [String; STATUS_LINES],
 }
 
 impl<'a> Ui<'a> {
@@ -104,10 +119,11 @@ impl<'a> Ui<'a> {
             .map(|&b| {
                 let from_right = (Button::ALL.len() - 1 - b as usize) as i32;
                 let x = size[0] - MARGIN - BUTTON as i32 - from_right * (BUTTON as i32 + GAP);
-                Slot { rect: Rectangle::new(Point::new(x, MARGIN), Size::new(BUTTON, BUTTON)), label: String::new(), drawn: None }
+                Slot { rect: Rectangle::new(Point::new(x, MARGIN), Size::new(BUTTON, BUTTON)), label: String::new(), drawn: None, enabled: true }
             })
             .collect();
-        Self { canvas, rotation, size, buttons }
+        let status = [concat!("remvnc v", env!("CARGO_PKG_VERSION")).to_string(), String::new(), String::new()];
+        Self { canvas, rotation, size, buttons, status }
     }
 
     fn target(&mut self) -> Rotated<'_, Canvas<'a>> {
@@ -116,6 +132,76 @@ impl<'a> Ui<'a> {
 
     /// The panel (portrait) area covered by the buttons, so updates under it
     /// know to redraw them.
+    fn status_rect(&self) -> Rectangle {
+        let h = STATUS_LINE_H * STATUS_LINES as i32 + 16;
+        Rectangle::new(Point::new(MARGIN, self.size[1] - MARGIN - h), Size::new(STATUS_W, h as u32))
+    }
+
+    fn rect_phys(&mut self, r: Rectangle) -> crate::display::Rect {
+        let br = r.top_left + Point::new(r.size.width as i32 - 1, r.size.height as i32 - 1);
+        let t = self.target();
+        let (a, b) = (t.phys(r.top_left), t.phys(br));
+        let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+        crate::display::Rect { x, y, w: (a.x - b.x).abs() + 1, h: (a.y - b.y).abs() + 1 }
+    }
+
+    /// Panel areas our UI draws over streamed content: buttons, info box.
+    pub fn overlays_phys(&mut self) -> [crate::display::Rect; 2] {
+        let s = self.status_rect();
+        [self.bar_phys(), self.rect_phys(s)]
+    }
+
+    /// Redraws buttons and the info box (after screen content covered them).
+    pub fn redraw_overlays(&mut self) {
+        for b in Button::ALL {
+            let steps = self.buttons[b as usize].drawn.unwrap_or(0);
+            self.draw_button(b, steps);
+        }
+        self.draw_status();
+        self.canvas.flush(Mode::Ui);
+    }
+
+    /// Sets the info box's status lines (below the version), redrawing if changed.
+    pub fn set_status(&mut self, usb: &str, host: &str) {
+        if self.status[1] == usb && self.status[2] == host {
+            return;
+        }
+        self.status[1] = usb.into();
+        self.status[2] = host.into();
+        self.draw_status();
+        self.canvas.flush(Mode::Ui);
+    }
+
+    fn draw_status(&mut self) {
+        let r = self.status_rect();
+        let lines = self.status.clone();
+        let mut t = self.target();
+        let frame = PrimitiveStyleBuilder::new().fill_color(Gray8::WHITE).stroke_color(Gray8::new(0x80)).stroke_width(3).build();
+        let _ = r.into_styled(frame).draw(&mut t);
+        let style = MonoTextStyle::new(&FONT_10X20, Gray8::BLACK);
+        for (i, line) in lines.iter().enumerate() {
+            let y = r.top_left.y + 8 + STATUS_LINE_H * i as i32 + 30;
+            let _ = Text::new(line, Point::new((r.top_left.x + 16) / 2, y / 2), style).draw(&mut Scaled { target: &mut t, factor: 2 });
+        }
+    }
+
+    pub fn enabled(&self, b: Button) -> bool {
+        self.buttons[b as usize].enabled
+    }
+
+    /// Greys a button out (or back in) and redraws it.
+    pub fn set_enabled(&mut self, b: Button, enabled: bool) {
+        if self.buttons[b as usize].enabled == enabled {
+            return;
+        }
+        self.buttons[b as usize].enabled = enabled;
+        let drawn = self.buttons[b as usize].drawn.is_some();
+        self.draw_button(b, 0);
+        if drawn {
+            self.canvas.flush(Mode::Ui);
+        }
+    }
+
     pub fn bar_phys(&mut self) -> crate::display::Rect {
         let first = self.buttons[0].rect.top_left;
         let last = self.buttons[self.buttons.len() - 1].rect.top_left + Point::new(BUTTON as i32 - 1, BUTTON as i32 - 1);
@@ -125,14 +211,6 @@ impl<'a> Ui<'a> {
         crate::display::Rect { x, y, w: (a.x - b.x).abs() + 1, h: (a.y - b.y).abs() + 1 }
     }
 
-    /// Draws all buttons again (after screen content overwrote them).
-    pub fn redraw_buttons(&mut self) {
-        for b in Button::ALL {
-            let steps = self.buttons[b as usize].drawn.unwrap_or(0);
-            self.draw_button(b, steps);
-        }
-        self.canvas.flush(Mode::Ui);
-    }
 
     /// The button under a logical pixel position (with a little slack).
     pub fn button_at(&self, p: [i32; 2]) -> Option<Button> {
@@ -153,13 +231,12 @@ impl<'a> Ui<'a> {
             .draw(&mut Scaled { target: &mut t, factor: 6 });
         let _ = Text::with_alignment("hold a button to use it", Point::new(w / 8, h / 8 + 40), big, Alignment::Center)
             .draw(&mut Scaled { target: &mut t, factor: 4 });
-        let version = concat!("remvnc v", env!("CARGO_PKG_VERSION"));
-        let _ = Text::new(version, Point::new(MARGIN / 2, (h - MARGIN) / 2), big).draw(&mut Scaled { target: &mut t, factor: 2 });
         drop(t);
         for b in Button::ALL {
             self.buttons[b as usize].drawn = None;
             self.draw_button(b, 0);
         }
+        self.draw_status();
         self.canvas.flush(Mode::Content);
     }
 
@@ -191,11 +268,14 @@ impl<'a> Ui<'a> {
     fn draw_button(&mut self, b: Button, steps: u32) {
         let slot = &mut self.buttons[b as usize];
         slot.drawn = Some(steps);
-        let (r, label) = (slot.rect, slot.label.clone());
-        let frame = PrimitiveStyleBuilder::new().fill_color(Gray8::WHITE).stroke_color(Gray8::BLACK).stroke_width(5).build();
+        let (r, label, enabled) = (slot.rect, slot.label.clone(), slot.enabled);
+        // Disabled: light grey outline and text, never filled.
+        let line = if enabled { Gray8::BLACK } else { Gray8::new(0xb0) };
+        let frame = PrimitiveStyleBuilder::new().fill_color(Gray8::WHITE).stroke_color(line).stroke_width(5).build();
+        let steps = if enabled { steps } else { 0 };
         let fill_h = BUTTON * steps.min(HOLD_STEPS) / HOLD_STEPS;
         // White ink over the fill once the button is mostly covered.
-        let ink = if steps * 2 > HOLD_STEPS { Gray8::WHITE } else { Gray8::BLACK };
+        let ink = if steps * 2 > HOLD_STEPS { Gray8::WHITE } else { line };
         let mut t = self.target();
         let _ = r.into_styled(frame).draw(&mut t);
         if fill_h > 0 {
