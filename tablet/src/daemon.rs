@@ -140,6 +140,8 @@ pub fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("touch: {e}"))?;
 
     let mut ui = Ui::new(&epd, rotation);
+    ui.set_label(Button::Undo, "UNDO");
+    ui.set_label(Button::Redo, "REDO");
     ui.set_label(Button::Side, "SIDE");
     ui.set_label(Button::Net, "NET");
     ui.set_enabled(Button::Net, false);
@@ -232,7 +234,12 @@ pub fn run(args: Args) -> Result<(), String> {
         // Route input: USB HID if the computer enumerated it, else the host.
         if let Some(h) = host.as_mut() {
             if !hid_up && !h.declared {
-                let decls: Vec<Msg> = pen.iter().map(|p| Msg::Device(p.device())).chain(touch.iter().map(|t| Msg::Device(t.device()))).collect();
+                let decls: Vec<Msg> = pen
+                    .iter()
+                    .map(|p| Msg::Device(p.device()))
+                    .chain(touch.iter().map(|t| Msg::Device(t.device())))
+                    .chain([Msg::Device(input::keys_device())])
+                    .collect();
                 decls.iter().for_each(|m| h.send(m));
                 h.declared = true;
             }
@@ -370,7 +377,9 @@ pub fn run(args: Args) -> Result<(), String> {
             host = None;
             ui.set_enabled(Button::Net, false);
             mappings = [Mapping::default(); 2];
-            ui.set_label(Button::Side, "SIDE");
+            ui.set_label(Button::Undo, "UNDO");
+    ui.set_label(Button::Redo, "REDO");
+    ui.set_label(Button::Side, "SIDE");
     ui.set_label(Button::Net, "NET");
     ui.set_enabled(Button::Net, false);
     ui.set_label(Button::Screen, "VIEW");
@@ -454,7 +463,7 @@ pub fn run(args: Args) -> Result<(), String> {
                                     state.save();
                                 }
                             }
-                            Button::Side => {}
+                            Button::Side | Button::Undo | Button::Redo => {}
                             Button::Net => {
                                 if let Some(h) = host.as_mut().filter(|h| h.remote.is_some()) {
                                     log!("remdesktop: going remote via {}", h.remote.as_deref().unwrap_or(""));
@@ -483,6 +492,25 @@ pub fn run(args: Args) -> Result<(), String> {
                     ui.set_progress(h, 0);
                 }
                 hold = Some((b, Instant::now(), false));
+                if matches!(b, Button::Undo | Button::Redo) {
+                    // Acts on touch: a Ctrl+Z / Ctrl+Y key press.
+                    hold = Some((b, Instant::now(), true));
+                    ui.set_progress(b, ui::HOLD_STEPS);
+                    let (key, usage) = match b {
+                        Button::Undo => (input::KEY_Z, hid_report::USAGE_Z),
+                        _ => (input::KEY_Y, hid_report::USAGE_Y),
+                    };
+                    if let (true, Some(g)) = (hid_up, gadget.as_ref()) {
+                        g.send(&hid_report::keyboard(hid_report::MOD_LEFT_CTRL, Some(usage)));
+                        g.send(&hid_report::keyboard(0, None));
+                    } else if let Some(h) = host.as_mut() {
+                        let now = remdesktop_proto::monotonic_us();
+                        for events in input::ctrl_chord(key) {
+                            h.send(&Msg::Frame { device: input::KEYS_ID, time_us: now, events });
+                        }
+                        h.flush();
+                    }
+                }
                 if b == Button::Side {
                     // Acts on touch: click the pen's side button where it is.
                     hold = Some((b, Instant::now(), true));

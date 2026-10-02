@@ -62,28 +62,33 @@ pub const HOLD_STEPS: u32 = 12;
 /// The hold-to-activate buttons, left to right along the top edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
+    /// Ctrl+Z. Acts on touch, no hold.
+    Undo = 0,
+    /// Ctrl+Y. Acts on touch, no hold.
+    Redo = 1,
     /// Clicks the pen's side button where the pen is (or last was). Acts
     /// on touch, no hold.
-    Side = 0,
+    Side = 2,
     /// Moves the host connection off USB (to Wi-Fi), once the host has
     /// verified it can reach us there; then USB can be unplugged.
-    Net = 1,
+    Net = 3,
     /// Cycles which monitor absolute input maps to.
-    Screen = 2,
+    Screen = 4,
     /// Switches the pen between drawing tablet and absolute mouse.
-    Pen = 3,
+    Pen = 5,
     /// Switches touch between touchpad and touchscreen.
-    Mode = 4,
-    Close = 5,
+    Mode = 6,
+    Close = 7,
 }
 
 impl Button {
-    pub const ALL: [Button; 6] = [Button::Side, Button::Net, Button::Screen, Button::Pen, Button::Mode, Button::Close];
+    pub const ALL: [Button; 8] =
+        [Button::Undo, Button::Redo, Button::Side, Button::Net, Button::Screen, Button::Pen, Button::Mode, Button::Close];
 
     /// How long the button must be held (zero: acts on touch).
     pub fn hold(self) -> std::time::Duration {
         std::time::Duration::from_millis(match self {
-            Button::Side => 0,
+            Button::Undo | Button::Redo | Button::Side => 0,
             Button::Close => 1500,
             _ => 700,
         })

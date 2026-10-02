@@ -48,6 +48,23 @@ const PANEL_MM: [f32; 2] = [157.8, 210.4];
 
 pub const PEN_ID: u8 = 1;
 pub const TOUCH_ID: u8 = 2;
+pub const KEYS_ID: u8 = 3;
+
+/// Linux key codes for the shortcut buttons.
+pub const KEY_LEFTCTRL: u16 = 29;
+pub const KEY_Z: u16 = 44;
+pub const KEY_Y: u16 = 21;
+
+/// A keyboard with just the keys our buttons press, for the uinput path.
+pub fn keys_device() -> Device {
+    Device { id: KEYS_ID, name: "remdesktop keys".into(), props: 0, keys: vec![KEY_LEFTCTRL, KEY_Z, KEY_Y], abs: vec![] }
+}
+
+/// Ctrl+`key` as press and release frames.
+pub fn ctrl_chord(key: u16) -> [Vec<Event>; 2] {
+    let k = |code, value| Event { kind: EV_KEY, code, value };
+    [vec![k(KEY_LEFTCTRL, 1), k(key, 1)], vec![k(key, 0), k(KEY_LEFTCTRL, 0)]]
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RawEvent {

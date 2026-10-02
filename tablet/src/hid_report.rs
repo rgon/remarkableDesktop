@@ -13,6 +13,7 @@ pub const TOUCHPAD: u8 = 3;
 const TOUCHSCREEN_MAX: u8 = 4;
 pub const MOUSE: u8 = 5;
 const TOUCHPAD_FEATURES: u8 = 6;
+pub const KEYBOARD: u8 = 7;
 
 /// Contacts per touch report.
 pub const FINGERS: usize = 5;
@@ -203,7 +204,24 @@ pub fn descriptor(r: &Ranges) -> Vec<u8> {
         d.usage(usage).logical(a.min, a.max).size(16, 1).input(VAR);
     }
     d.end().end();
+
+    // Keyboard (for the undo/redo buttons): modifiers, reserved, 6 keys.
+    d.page(0x01).usage(0x06).collection(APPLICATION).id(KEYBOARD);
+    d.page(0x07).uitem(0x18, 0xe0).uitem(0x28, 0xe7).logical(0, 1).size(1, 8).input(VAR);
+    d.size(8, 1).input(CONST);
+    d.page(0x07).uitem(0x18, 0).uitem(0x28, 0xff).logical(0, 255).size(8, 6).input(0x00); // array
+    d.end();
     d.0
+}
+
+/// HID keyboard usages for the keys our buttons send.
+pub const USAGE_Z: u8 = 0x1d;
+pub const USAGE_Y: u8 = 0x1c;
+pub const MOD_LEFT_CTRL: u8 = 0x01;
+
+/// A keyboard report: modifier bits and up to one key pressed.
+pub fn keyboard(mods: u8, key: Option<u8>) -> Vec<u8> {
+    vec![KEYBOARD, mods, 0, key.unwrap_or(0), 0, 0, 0, 0, 0]
 }
 
 /// Feature reports the host may ask for with GET_REPORT.
@@ -364,7 +382,9 @@ mod tests {
         let touch = dev(&[(ABS_MT_POSITION_X, 1403), (ABS_MT_POSITION_Y, 1871)]);
         let r = Ranges::new(&pen, &touch);
         let d = descriptor(&r);
-        assert!(d.len() < 2048 && d.ends_with(&[0xc0, 0xc0]), "descriptor is {} bytes", d.len());
+        assert!(d.len() < 2048 && d.ends_with(&[0xc0]), "descriptor is {} bytes", d.len());
+        // id + modifiers + reserved + 6 keys
+        assert_eq!(keyboard(MOD_LEFT_CTRL, Some(USAGE_Z)), vec![KEYBOARD, 1, 0, USAGE_Z, 0, 0, 0, 0, 0]);
         let mut e = Encoder::default();
         // id + flags + x, y, pressure + 2 tilts
         assert_eq!(e.pen(&[Event { kind: EV_ABS, code: ABS_X, value: 5 }], false).len(), 1 + 1 + 6 + 4);
