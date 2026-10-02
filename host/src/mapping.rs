@@ -44,6 +44,17 @@ pub fn letterbox(logical: (u32, u32), target: &Output) -> [f64; 4] {
     [(1.0 - cw) / 2.0, (1.0 + cw) / 2.0, (1.0 - ch) / 2.0, (1.0 + ch) / 2.0]
 }
 
+/// The target's share of the desktop bounding box, (x0, x1, y0, y1) as
+/// fractions: where an absolute pointer spanning the desktop must land.
+pub fn desktop_span(outputs: &[Output], target: Option<&Output>) -> [f64; 4] {
+    let Some(t) = target.filter(|_| !outputs.is_empty()) else { return FULL };
+    let x0 = outputs.iter().map(|o| o.x).min().unwrap();
+    let y0 = outputs.iter().map(|o| o.y).min().unwrap();
+    let bw = (outputs.iter().map(|o| o.x + o.w).max().unwrap() - x0) as f64;
+    let bh = (outputs.iter().map(|o| o.y + o.h).max().unwrap() - y0) as f64;
+    [(t.x - x0) as f64 / bw, (t.x + t.w - x0) as f64 / bw, (t.y - y0) as f64 / bh, (t.y + t.h - y0) as f64 / bh]
+}
+
 /// The whole tablet shows the target.
 pub const FULL: [f64; 4] = [0.0, 1.0, 0.0, 1.0];
 

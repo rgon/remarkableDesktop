@@ -39,6 +39,11 @@ impl Stats {
         }
     }
 
+    /// Tablet clock − host clock, once known.
+    pub fn clock_offset(&self) -> Option<i64> {
+        self.offset().map(|o| o.1)
+    }
+
     fn offset(&self) -> Option<(u64, i64)> {
         self.probes.iter().min_by_key(|p| p.0).copied()
     }
@@ -97,5 +102,80 @@ impl Stats {
         }
         eprintln!("remvnc-host: {line}");
         self.since = now;
+    }
+}
+
+/// Measures pen latency over USB HID: tablet kernel event → this machine's
+/// kernel event on the tablet's HID stylus device. The tablet sends one
+/// marker (its event timestamp) per HID report it delivered; markers and
+/// arrivals are paired in order.
+pub struct HidProbe {
+    tx: std::sync::mpsc::Sender<u64>,
+}
+
+/// Tablet clock − host clock, from the lowest-RTT ping, shared with the probe.
+pub type Offset = std::sync::Arc<std::sync::Mutex<Option<i64>>>;
+
+impl HidProbe {
+    pub fn start(offset: Offset) -> Option<HidProbe> {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let dev = std::fs::read_dir("/sys/class/input").ok()?.flatten().find(|e| {
+            e.file_name().to_string_lossy().starts_with("event")
+                && std::fs::read_to_string(e.path().join("device/name")).is_ok_and(|n| n.trim() == "reMarkable 2 Stylus")
+        })?;
+        let mut file = std::fs::File::open(format!("/dev/input/{}", dev.file_name().to_string_lossy())).ok()?;
+        let clock: libc::c_int = libc::CLOCK_MONOTONIC;
+        unsafe { libc::ioctl(file.as_raw_fd(), 0x4004_45a0, &clock) }; // EVIOCSCLOCKID
+        let (tx, rx) = std::sync::mpsc::channel::<u64>();
+        std::thread::spawn(move || {
+            let mut markers = std::collections::VecDeque::new();
+            let mut arrivals = std::collections::VecDeque::new();
+            let mut lat: Vec<f64> = vec![];
+            let mut since = std::time::Instant::now();
+            let mut buf = [0u8; 24 * 64];
+            while let Ok(n) = file.read(&mut buf) {
+                for ev in buf[..n].chunks_exact(24) {
+                    let (kind, code) = (u16::from_ne_bytes([ev[16], ev[17]]), u16::from_ne_bytes([ev[18], ev[19]]));
+                    if kind == 0 && code == 0 {
+                        let sec = i64::from_ne_bytes(ev[0..8].try_into().unwrap());
+                        let usec = i64::from_ne_bytes(ev[8..16].try_into().unwrap());
+                        arrivals.push_back((sec * 1_000_000 + usec) as u64);
+                    }
+                }
+                markers.extend(rx.try_iter());
+                let Some(off) = *offset.lock().unwrap() else { continue };
+                while let (Some(&m), Some(&a)) = (markers.front(), arrivals.front()) {
+                    let l = a as i64 - (m as i64 - off);
+                    if !(-5_000..200_000).contains(&l) {
+                        // Out of step (a report or marker went missing): resync.
+                        markers.clear();
+                        arrivals.clear();
+                        break;
+                    }
+                    lat.push(l as f64 / 1000.0);
+                    markers.pop_front();
+                    arrivals.pop_front();
+                }
+                if since.elapsed() >= std::time::Duration::from_secs(2) && !lat.is_empty() {
+                    lat.sort_by(|a, b| a.total_cmp(b));
+                    let p = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
+                    eprintln!(
+                        "remvnc-host: pen over USB HID {:.0}/s lat p50 {:.1} p99 {:.1} max {:.1} ms",
+                        lat.len() as f64 / since.elapsed().as_secs_f64(),
+                        p(0.5),
+                        p(0.99),
+                        p(1.0)
+                    );
+                    lat.clear();
+                    since = std::time::Instant::now();
+                }
+            }
+        });
+        Some(HidProbe { tx })
+    }
+
+    pub fn marker(&self, tablet_us: u64) {
+        let _ = self.tx.send(tablet_us);
     }
 }
