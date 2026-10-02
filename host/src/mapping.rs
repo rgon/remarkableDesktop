@@ -79,6 +79,23 @@ impl Mapper {
         }
     }
 
+    /// For devices the compositor already maps onto the target monitor:
+    /// only stretch the part of the tablet that shows it (`shown`) to the
+    /// device's full range, so letterboxed areas don't distort the aspect.
+    pub fn letterboxed(device: &Device, shown: [f64; 4]) -> Self {
+        if shown == FULL {
+            return Self::default();
+        }
+        let range = |code| device.abs.iter().find(|a| a.code == code).map(|a| (a.min, a.max)).unwrap_or((0, 1));
+        let ((xmin, xmax), (ymin, ymax)) = (range(ABS_X), range(ABS_Y));
+        Self {
+            axes: Some([
+                Axis { min: xmin, max: xmax, shown: (shown[0], shown[1]), from: 0.0, to: 1.0 },
+                Axis { min: ymin, max: ymax, shown: (shown[2], shown[3]), from: 0.0, to: 1.0 },
+            ]),
+        }
+    }
+
     pub fn apply(&self, events: &mut [Event]) {
         let Some(axes) = &self.axes else { return };
         for e in events.iter_mut().filter(|e| e.kind == EV_ABS) {

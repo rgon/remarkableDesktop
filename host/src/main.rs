@@ -3,6 +3,7 @@
 
 mod capture;
 mod displayconfig;
+mod gsettings;
 mod mapping;
 mod outputs;
 mod stats;
@@ -131,11 +132,33 @@ struct Virtual {
     mapper: Mapper,
 }
 
-fn remap(devices: &mut HashMap<u8, Virtual>, screens: &[outputs::Output], target: &Target) {
+/// uinput ids, as set in uinput.rs.
+const VENDOR: u16 = 0x1d50;
+
+/// How GNOME should map a device itself, if it can: drawing tablets and
+/// touchscreens have per-device monitor settings; absolute pointers
+/// (pen in mouse mode) span the desktop, touchpads are relative.
+fn compositor_kind(d: &Device) -> Option<gsettings::Kind> {
+    const INPUT_PROP_DIRECT: u32 = 1;
+    if d.keys.contains(&0x140) {
+        Some(gsettings::Kind::Tablet) // BTN_TOOL_PEN
+    } else if d.props & (1 << INPUT_PROP_DIRECT) != 0 {
+        Some(gsettings::Kind::Touchscreen)
+    } else {
+        None
+    }
+}
+
+fn remap(devices: &mut HashMap<u8, Virtual>, screens: &[outputs::Output], target: &Target, gs: &mut gsettings::Outputs) {
     let name = target.output.as_ref().map_or("all screens".to_string(), |o| format!("{} ({}x{})", o.name, o.w, o.h));
     eprintln!("remvnc-host: input now maps to {name}");
-    for v in devices.values_mut() {
-        v.mapper = Mapper::new(&v.decl, screens, target.output.as_ref(), target.shown);
+    let edids = displayconfig::edids().unwrap_or_default();
+    let edid = target.output.as_ref().and_then(|o| edids.get(&o.name));
+    for (id, v) in devices.iter_mut() {
+        v.mapper = match compositor_kind(&v.decl) {
+            Some(kind) if gs.map(kind, VENDOR, 0x6200 + *id as u16, edid) => Mapper::letterboxed(&v.decl, target.shown),
+            _ => Mapper::new(&v.decl, screens, target.output.as_ref(), target.shown),
+        };
     }
 }
 
@@ -199,13 +222,14 @@ fn run() -> Result<(), String> {
     let mut target = Target { output: None, shown: mapping::FULL };
     let mut logical = (0u32, 0u32);
     let mut streamer: Option<stream::Streamer> = None;
+    let mut gs = gsettings::Outputs::default();
     let result = loop {
         // Pongs arrive every 100 ms, so this runs often enough.
         if let Some(Some(name)) = streamer.as_ref().and_then(|s| s.take_started()) {
             // A virtual monitor appeared: point input at it.
             screens = outputs::list().unwrap_or_default();
             target = Target { output: screens.iter().find(|o| o.name == name).cloned(), shown: mapping::FULL };
-            remap(&mut devices, &screens, &target);
+            remap(&mut devices, &screens, &target, &mut gs);
         }
         let msg = match pending.take() {
             Some(m) => Ok(Some(m)),
@@ -232,7 +256,7 @@ fn run() -> Result<(), String> {
                 if args.display {
                     let w = writer.clone();
                     let s = stream::Streamer::start(logical, rotation, args.stats, Box::new(move |m| send(&w, m)));
-                    s.set_source(Some(capture::Source::Virtual));
+                    s.set_source(Some(capture::Source::Virtual), mapping::FULL);
                     streamer = Some(s);
                 }
             }
@@ -242,8 +266,8 @@ fn run() -> Result<(), String> {
                 match uinput::VirtualDevice::create(&d) {
                     Ok(dev) => {
                         eprintln!("remvnc-host: created \"{}\"", d.name);
-                        let mapper = Mapper::new(&d, &screens, target.output.as_ref(), target.shown);
-                        devices.insert(d.id, Virtual { decl: d, dev, mapper });
+                        devices.insert(d.id, Virtual { decl: d, dev, mapper: Mapper::default() });
+                        remap(&mut devices, &screens, &target, &mut gs);
                     }
                     Err(e) => break Err(format!("creating \"{}\": {e}", d.name)),
                 }
@@ -261,8 +285,8 @@ fn run() -> Result<(), String> {
                 let monitor = monitors.get((index as usize).wrapping_sub(1)).cloned();
                 match (&streamer, &monitor) {
                     // The virtual monitor's mapping is set once it exists (below).
-                    (Some(s), None) => s.set_source(Some(capture::Source::Virtual)),
-                    (Some(s), Some(m)) => s.set_source(Some(capture::Source::Monitor(m.name.clone()))),
+                    (Some(s), None) => s.set_source(Some(capture::Source::Virtual), mapping::FULL),
+                    (Some(s), Some(m)) => s.set_source(Some(capture::Source::Monitor(m.name.clone())), mapping::letterbox(logical, m)),
                     (None, _) => {}
                 }
                 if streamer.is_none() || monitor.is_some() {
@@ -270,12 +294,11 @@ fn run() -> Result<(), String> {
                     if let Ok(s) = outputs::list() {
                         screens = s;
                     }
-                    let shown = match (&streamer, &monitor) {
-                        (Some(_), Some(m)) => mapping::letterbox(logical, m),
-                        _ => mapping::FULL,
-                    };
+                    // Keep the monitor's aspect: the tablet area matches the
+                    // (letterboxed) picture of it, shown or not.
+                    let shown = monitor.as_ref().map_or(mapping::FULL, |m| mapping::letterbox(logical, m));
                     target = Target { output: monitor, shown };
-                    remap(&mut devices, &screens, &target);
+                    remap(&mut devices, &screens, &target, &mut gs);
                 }
             }
             Ok(Some(Msg::Ack { id })) => {
@@ -295,6 +318,7 @@ fn run() -> Result<(), String> {
     };
     drop(streamer);
     drop(devices);
+    drop(gs);
     // Ending ssh ends the session on the tablet; the pinger then fails and exits.
     let _ = child.kill();
     let _ = child.wait();

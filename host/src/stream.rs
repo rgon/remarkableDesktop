@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 struct Shared {
     /// What to capture; `generation` bumps on every change.
     source: Option<Source>,
+    /// Where the picture sits on the tablet (fractions of the logical
+    /// screen); the rest is letterbox, painted white.
+    shown: [f64; 4],
     generation: u64,
     /// Newest frame as gray levels, the generation it belongs to, and when
     /// it was read from the capture pipeline.
@@ -85,6 +88,38 @@ fn changed(a: &[u8], b: &[u8], w: usize, h: usize) -> Option<(usize, usize, usiz
     Some((x0, y0, x1.max(x0 + 2).min(w) - x0, y1 + 1 - y0))
 }
 
+/// Paints the letterbox bars white (GStreamer pads with black). Only rows
+/// and columns that are entirely black and within the expected bar size
+/// (plus rounding slack) are touched, so dark content is left alone.
+fn whiten_bars(frame: &mut [u8], logical: (u32, u32), rotation: u16, shown: [f64; 4]) {
+    let (lw, lh) = (logical.0 as f64, logical.1 as f64);
+    // Bar thickness in logical pixels: (left/right, top/bottom).
+    let bars = (((shown[0] * lw).round() as usize + 2), ((shown[2] * lh).round() as usize + 2));
+    if bars == (2, 2) {
+        return;
+    }
+    // In the panel's portrait layout a 90°/270° rotation swaps the axes.
+    let (pw, ph) = if rotation % 180 == 90 { (logical.1 as usize, logical.0 as usize) } else { (logical.0 as usize, logical.1 as usize) };
+    let (bar_x, bar_y) = if rotation % 180 == 90 { (bars.1, bars.0) } else { bars };
+    if frame.len() != pw * ph {
+        return;
+    }
+    let row_black = |f: &[u8], y: usize| f[y * pw..][..pw].iter().all(|&v| v == 0);
+    let col_black = |f: &[u8], x: usize| (0..ph).all(|y| f[y * pw + x] == 0);
+    for y in (0..bar_y.min(ph)).take_while(|&y| row_black(frame, y)).collect::<Vec<_>>() {
+        frame[y * pw..][..pw].fill(255);
+    }
+    for y in (ph.saturating_sub(bar_y)..ph).rev().take_while(|&y| row_black(frame, y)).collect::<Vec<_>>() {
+        frame[y * pw..][..pw].fill(255);
+    }
+    for x in (0..bar_x.min(pw)).take_while(|&x| col_black(frame, x)).collect::<Vec<_>>() {
+        (0..ph).for_each(|y| frame[y * pw + x] = 255);
+    }
+    for x in (pw.saturating_sub(bar_x)..pw).rev().take_while(|&x| col_black(frame, x)).collect::<Vec<_>>() {
+        (0..ph).for_each(|y| frame[y * pw + x] = 255);
+    }
+}
+
 impl Streamer {
     /// `logical` is the tablet's screen as the user sees it; frames are
     /// produced in panel portrait for `rotation`.
@@ -98,12 +133,12 @@ impl Streamer {
             let mut current: Option<(u64, Capture)> = None;
             let mut raw = vec![];
             loop {
-                let (wanted, generation) = {
+                let (wanted, generation, shown) = {
                     let s = lock.lock().unwrap();
                     if s.stop {
                         return;
                     }
-                    (s.source.clone(), s.generation)
+                    (s.source.clone(), s.generation, s.shown)
                 };
                 if current.as_ref().map(|c| c.0) != Some(generation) {
                     current = None; // stops the old stream (and removes a virtual monitor)
@@ -130,6 +165,7 @@ impl Streamer {
                 match cap.next_frame(&mut raw, Duration::from_millis(100)) {
                     Ok(true) => {
                         let at = Instant::now();
+                        whiten_bars(&mut raw, logical, rotation, shown);
                         let levels: Vec<u8> = raw.iter().map(|&v| gray4::level(v)).collect();
                         let mut s = lock.lock().unwrap();
                         s.frame = Some((generation, levels, at));
@@ -195,11 +231,13 @@ impl Streamer {
         Streamer { shared, threads: vec![capture, sender] }
     }
 
-    /// Switches what is captured (None pauses capture).
-    pub fn set_source(&self, source: Option<Source>) {
+    /// Switches what is captured (None pauses capture); `shown` is where the
+    /// picture lands on the tablet (see `mapping::letterbox`).
+    pub fn set_source(&self, source: Option<Source>, shown: [f64; 4]) {
         let (lock, cv) = &*self.shared;
         let mut s = lock.lock().unwrap();
         s.source = source;
+        s.shown = shown;
         s.generation += 1;
         s.acked = true;
         cv.notify_all();
@@ -241,6 +279,18 @@ impl Drop for Streamer {
 #[cfg(test)]
 mod tests {
     use super::changed;
+
+    #[test]
+    fn whitens_only_black_bars() {
+        // 4x6 portrait panel, logical 6x4 rotated 90°, picture letterboxed
+        // left/right in logical = top/bottom rows in portrait.
+        let mut f = vec![0u8; 4 * 6];
+        f[2 * 4..4 * 4].fill(100); // content rows 2..4
+        super::whiten_bars(&mut f, (6, 4), 90, [0.25, 0.75, 0.0, 1.0]);
+        assert!(f[..2 * 4].iter().all(|&v| v == 255));
+        assert!(f[4 * 4..].iter().all(|&v| v == 255));
+        assert!(f[2 * 4..4 * 4].iter().all(|&v| v == 100));
+    }
 
     #[test]
     fn bounding_box_of_changes() {

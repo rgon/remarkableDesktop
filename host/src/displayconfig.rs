@@ -89,3 +89,11 @@ pub fn keep_layout(conn: &Connection, layout: &Layout, wait: Duration) -> Result
         .map_err(|e| format!("ApplyMonitorsConfig: {e}"))?;
     Ok(new)
 }
+
+/// EDID identity of each connector: (vendor, product, serial), the format
+/// GNOME's per-device `output` settings use.
+pub fn edids() -> Result<HashMap<String, (String, String, String)>, String> {
+    let conn = Connection::session().map_err(|e| format!("session bus: {e}"))?;
+    let (_, monitors, _, _) = state(&conn).map_err(|e| format!("GetCurrentState: {e}"))?;
+    Ok(monitors.into_iter().map(|(spec, _, _)| (spec.0, (spec.1, spec.2, spec.3))).collect())
+}
