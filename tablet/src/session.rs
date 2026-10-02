@@ -1,0 +1,99 @@
+//! Taking the panel and inputs from xochitl, and handing them back.
+
+use crate::epd::{Epd, Mode};
+use crate::takeover::{self, Grabbed, Guardian};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+pub static QUIT: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_: libc::c_int) {
+    QUIT.store(true, Ordering::Relaxed);
+}
+
+pub fn quitting() -> bool {
+    QUIT.load(Ordering::Relaxed)
+}
+
+pub struct Inputs {
+    pub pen: Option<Grabbed>,
+    pub touch: Option<Grabbed>,
+    pub power: Option<Grabbed>,
+}
+
+pub struct Session {
+    guardian: Guardian,
+    pub inputs: Inputs,
+    /// xochitl's last frame, when it could be located unambiguously.
+    saved: Option<Vec<u8>>,
+    started: Instant,
+}
+
+impl Session {
+    /// Grabs inputs, pauses xochitl and starts the e-ink engine.
+    /// `deadline_secs` (0 = none) bounds how long xochitl may stay paused.
+    pub fn begin(deadline_secs: u64) -> Result<(Session, Epd), String> {
+        let xochitl = takeover::xochitl_pid().ok_or("xochitl is not running")?;
+        unsafe {
+            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                libc::signal(sig, on_signal as *const () as libc::sighandler_t);
+            }
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
+        // Before Qt starts any threads.
+        let guardian = Guardian::spawn(xochitl, deadline_secs).map_err(|e| format!("guardian: {e}"))?;
+
+        let mut inputs = Inputs { pen: None, touch: None, power: None };
+        for i in 0..3 {
+            let path = format!("/dev/input/event{i}");
+            match Grabbed::open(&path) {
+                Ok(g) if g.name.contains("Wacom") => inputs.pen = Some(g),
+                Ok(g) if g.name.contains("pt_mt") => inputs.touch = Some(g),
+                Ok(g) if g.name.contains("powerkey") => inputs.power = Some(g),
+                Ok(g) => eprintln!("remvnc: ignoring {} ({})", g.path, g.name),
+                Err(e) => eprintln!("remvnc: grab {path}: {e}"),
+            }
+        }
+
+        takeover::signal(xochitl, libc::SIGSTOP).map_err(|e| format!("pause xochitl: {e}"))?;
+        let started = Instant::now();
+        takeover::private_tmp().map_err(|e| format!("private /tmp: {e}"))?;
+        let epd = Epd::open()?;
+
+        let (w, h) = (epd.width() as u32, epd.height() as u32);
+        let saved = match takeover::learn_layout(epd.fb.pixels as usize, w, h, 32)
+            .and_then(|layout| takeover::snapshot_images(xochitl, layout, w, h, 32, epd.fb.len()))
+        {
+            Ok(mut found) if found.len() == 1 => Some(found.remove(0).1),
+            Ok(found) => {
+                eprintln!("remvnc: {} candidate xochitl frames; will restart it on exit", found.len());
+                None
+            }
+            Err(e) => {
+                eprintln!("remvnc: snapshot: {e}; will restart xochitl on exit");
+                None
+            }
+        };
+        eprintln!("remvnc: paused xochitl ({xochitl}), engine up in {:?}, {} buffers", started.elapsed(), epd.candidates.len());
+        Ok((Session { guardian, inputs, saved, started }, epd))
+    }
+
+    /// Puts xochitl's frame back and exits; the guardian resumes xochitl
+    /// once this process (and its engine) is gone.
+    pub fn end(mut self, epd: &Epd) -> ! {
+        if let Some(buf) = &self.saved {
+            unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), epd.fb.pixels, buf.len()) };
+            epd.swap(0, 0, epd.width(), epd.height(), Mode::Content, 0);
+            let end = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < end {
+                epd.process_events(20);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            self.guardian.restored();
+        }
+        eprintln!("remvnc: xochitl was paused for {:?}", self.started.elapsed());
+        drop(self.inputs);
+        // The vendor engine has no clean shutdown; let process exit stop it.
+        std::process::exit(0);
+    }
+}

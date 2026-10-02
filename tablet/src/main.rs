@@ -1,199 +1,193 @@
 mod epd;
 mod gfx;
+mod input;
+mod session;
 mod takeover;
+mod ui;
 
 use embedded_graphics::mono_font::{MonoTextStyle, ascii::FONT_10X20};
 use embedded_graphics::pixelcolor::Gray8;
 use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle};
+use embedded_graphics::primitives::{PrimitiveStyleBuilder, Rectangle};
 use embedded_graphics::text::Text;
 use epd::{Epd, Mode};
 use gfx::{Canvas, Scaled};
-use std::io::Read;
+use input::{Pen, Touch, TouchMode};
+use remvnc_proto::Msg;
+use session::{Session, quitting};
+use std::io::{BufWriter, Write};
 use std::os::fd::AsRawFd;
-use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use takeover::{Grabbed, Guardian};
 
-static QUIT: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_signal(_: libc::c_int) {
-    QUIT.store(true, Ordering::Relaxed);
-}
+const USAGE: &str = "usage:
+  remvnc run [--rotate 0|90|180|270] [--touch touchpad|touchscreen]
+      Forward pen/touch to the host over stdout until the X is held.
+  remvnc probe     Draw test patterns for a few seconds.
+  remvnc restore   Kill stray instances and restart xochitl.";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
+    let result = match args.get(1).map(String::as_str) {
         Some("guardian") if args.len() == 5 => {
-            let n = |i: usize| args[i].parse().expect("guardian: bad argument");
+            let n = |i: usize| args[i].parse::<u64>().expect("guardian: bad argument");
             takeover::run_guardian(n(2) as i32, n(3), n(4) as i32);
+            Ok(())
         }
-        Some("restore") => takeover::manual_restore(),
-        Some("probe") => {
-            if let Err(e) = probe() {
-                eprintln!("remvnc: {e}");
-                std::process::exit(1);
-            }
+        Some("restore") => {
+            takeover::manual_restore();
+            Ok(())
         }
-        _ => eprintln!("usage: remvnc probe | restore"),
+        Some("probe") => probe(),
+        Some("run") => parse_run(&args[2..]).and_then(|(r, t)| run(r, t)),
+        _ => Err(USAGE.into()),
+    };
+    if let Err(e) = result {
+        eprintln!("remvnc: {e}");
+        std::process::exit(1);
     }
+}
+
+fn parse_run(args: &[String]) -> Result<(u16, TouchMode), String> {
+    let (mut rotation, mut touch) = (90, TouchMode::Touchpad);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().ok_or(format!("{a} needs a value"));
+        match a.as_str() {
+            "--rotate" => {
+                rotation = value()?.parse().ok().filter(|r| [0, 90, 180, 270].contains(r)).ok_or("--rotate: 0, 90, 180 or 270")?
+            }
+            "--touch" => {
+                touch = match value()?.as_str() {
+                    "touchpad" => TouchMode::Touchpad,
+                    "touchscreen" => TouchMode::Touchscreen,
+                    _ => return Err("--touch: touchpad or touchscreen".into()),
+                }
+            }
+            _ => return Err(format!("unknown argument {a}\n{USAGE}")),
+        }
+    }
+    Ok((rotation, touch))
 }
 
 /// Pumps Qt events for `ms`; false if we were asked to quit.
 fn wait(epd: &Epd, ms: u64) -> bool {
     let end = Instant::now() + Duration::from_millis(ms);
-    while Instant::now() < end {
-        if QUIT.load(Ordering::Relaxed) {
-            return false;
-        }
+    while Instant::now() < end && !quitting() {
         epd.process_events(20);
         std::thread::sleep(Duration::from_millis(10));
     }
-    !QUIT.load(Ordering::Relaxed)
+    !quitting()
 }
 
-fn watchdog_ts() -> String {
-    Command::new("systemctl")
-        .args(["show", "xochitl", "-p", "WatchdogTimestampMonotonic", "--value"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
-}
+const HOLD: Duration = Duration::from_millis(1500);
 
-fn write_pgm(path: &str, w: i32, h: i32, gray: &[u8]) {
-    let mut data = format!("P5\n{w} {h}\n255\n").into_bytes();
-    data.extend_from_slice(gray);
-    if let Err(e) = std::fs::write(path, data) {
-        eprintln!("remvnc: write {path}: {e}");
+fn run(rotation: u16, touch_mode: TouchMode) -> Result<(), String> {
+    let (session, epd) = Session::begin(0)?;
+    let inputs = &session.inputs;
+    let pen = inputs.pen.as_ref().map(|g| Pen::new(&g.file, rotation)).transpose().map_err(|e| format!("pen: {e}"))?;
+    let mut touch =
+        inputs.touch.as_ref().map(|g| Touch::new(&g.file, rotation, touch_mode)).transpose().map_err(|e| format!("touch: {e}"))?;
+
+    let mut ui = ui::Ui::new(&epd, rotation);
+    ui.draw_home();
+
+    let mut out = BufWriter::new(std::io::stdout().lock());
+    let mut hello = vec![Msg::Hello { version: remvnc_proto::VERSION, width: ui.size[0] as u16, height: ui.size[1] as u16, rotation }];
+    hello.extend(pen.iter().map(|p| Msg::Device(p.device())));
+    hello.extend(touch.iter().map(|t| Msg::Device(t.device())));
+    let mut alive = hello.iter().try_for_each(|m| m.write_to(&mut out)).and_then(|_| out.flush()).is_ok();
+
+    let grabbed = [inputs.pen.as_ref(), inputs.touch.as_ref(), inputs.power.as_ref()];
+    let fds = grabbed.map(|g| g.map_or(-1, |g| g.file.as_raw_fd()));
+    let mut files = grabbed.map(|g| g.and_then(|g| g.file.try_clone().ok()));
+    let mut pen_pending = vec![];
+    let mut hold_start: Option<Instant> = None;
+    let mut done = false;
+
+    while alive && !done && !quitting() {
+        let mut pfds: Vec<libc::pollfd> =
+            fds.iter().chain([&0]).map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
+        let timeout = if hold_start.is_some() { 30 } else { 250 };
+        unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, timeout) };
+        epd.process_events(0);
+
+        let mut frames = vec![];
+        if let (Some(pen), Some(f)) = (&pen, files[0].as_mut()) {
+            let mut fs = vec![];
+            pen.feed(&input::read_events(f).unwrap_or_default(), &mut pen_pending, &mut fs);
+            frames.extend(fs.into_iter().map(|e| (input::PEN_ID, e)));
+        }
+        if let (Some(touch), Some(f)) = (touch.as_mut(), files[1].as_mut()) {
+            let events = input::read_events(f).unwrap_or_default();
+            let fs = touch.feed(&events, ui.size, |p| ui.on_button(p));
+            frames.extend(fs.into_iter().map(|e| (input::TOUCH_ID, e)));
+        }
+        if let Some(f) = files[2].as_mut() {
+            let power = input::read_events(f).unwrap_or_default();
+            if power.iter().any(|e| e.kind == input::EV_KEY && e.code == input::KEY_POWER && e.value == 1) {
+                eprintln!("remvnc: power button pressed");
+                done = true;
+            }
+        }
+        if pfds[3].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            let mut buf = [0u8; 256];
+            if unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) } <= 0 {
+                eprintln!("remvnc: host went away");
+                break;
+            }
+        }
+
+        for (device, events) in frames {
+            alive &= Msg::Frame { device, events }.write_to(&mut out).is_ok();
+        }
+        alive &= out.flush().is_ok();
+
+        let holding = touch.as_ref().is_some_and(|t| t.holding());
+        match (holding, hold_start) {
+            (true, None) => hold_start = Some(Instant::now()),
+            (false, Some(_)) => {
+                hold_start = None;
+                ui.set_progress(0);
+            }
+            (true, Some(t)) => {
+                let steps = (t.elapsed().as_millis() * ui::HOLD_STEPS as u128 / HOLD.as_millis()) as u32;
+                ui.set_progress(steps.min(ui::HOLD_STEPS));
+                if t.elapsed() >= HOLD {
+                    eprintln!("remvnc: close button held");
+                    done = true;
+                }
+            }
+            (false, None) => {}
+        }
     }
+    if !alive {
+        eprintln!("remvnc: lost the host connection");
+    }
+    let _ = Msg::Bye.write_to(&mut out).and_then(|_| out.flush());
+    drop(out);
+    drop(ui);
+    session.end(&epd)
 }
 
 fn probe() -> Result<(), String> {
-    let xpid = takeover::xochitl_pid().ok_or("xochitl is not running")?;
-    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
-    }
-    let mut guardian = Guardian::spawn(xpid, 50).map_err(|e| format!("guardian: {e}"))?;
-    eprintln!("remvnc: xochitl pid {xpid}, guardian pid {}", guardian.id());
-
-    let mut inputs = vec![];
-    for i in 0..3 {
-        let path = format!("/dev/input/event{i}");
-        match Grabbed::open(&path) {
-            Ok(g) => {
-                eprintln!("remvnc: grabbed {} ({})", g.path, g.name);
-                inputs.push(g);
-            }
-            Err(e) => eprintln!("remvnc: grab {path}: {e}"),
-        }
-    }
-
-    let wd_before = watchdog_ts();
-    takeover::signal(xpid, libc::SIGSTOP).map_err(|e| format!("pause xochitl: {e}"))?;
-    let t0 = Instant::now();
-    takeover::private_tmp().map_err(|e| format!("private /tmp: {e}"))?;
-    let epd = Epd::open()?;
-    eprintln!("remvnc: engine up in {:?}", t0.elapsed());
-    for c in &epd.candidates {
-        eprintln!("remvnc: candidate {c:?}");
-    }
-    eprintln!("remvnc: drawing into {:?}", epd.fb);
-
-    let dir = "/home/root/remvnc-probe";
-    let _ = std::fs::create_dir_all(dir);
-    let (w, h) = (epd.width(), epd.height());
-    let ours = unsafe { std::slice::from_raw_parts(epd.fb.pixels, epd.fb.len()) };
-    write_pgm(&format!("{dir}/ours-initial.pgm"), w, h, &epd.fb.to_gray(ours));
-    // xochitl's own copy of the screen, found by its QImageData header.
-    let t = Instant::now();
-    let saved = takeover::learn_layout(epd.fb.pixels as usize, w as u32, h as u32, 32)
-        .and_then(|layout| takeover::snapshot_images(xpid, layout, w as u32, h as u32, 32, epd.fb.len()))
-        .unwrap_or_else(|e| {
-            eprintln!("remvnc: snapshot: {e}");
-            vec![]
-        });
-    for (i, (addr, buf)) in saved.iter().enumerate() {
-        eprintln!("remvnc: xochitl screen image {i} at {addr:#x}");
-        write_pgm(&format!("{dir}/xochitl-{i}.pgm"), w, h, &epd.fb.to_gray(buf));
-    }
-    eprintln!("remvnc: snapshot scan took {:?}", t.elapsed());
-
+    let (session, epd) = Session::begin(50)?;
+    let mut canvas = Canvas::new(&epd, vec![epd.fb]);
     let text = MonoTextStyle::new(&FONT_10X20, Gray8::BLACK);
     let panel = PrimitiveStyleBuilder::new().fill_color(Gray8::WHITE).stroke_color(Gray8::BLACK).stroke_width(6).build();
     let mut ok = true;
-    let mut canvas = Canvas::new(&epd, vec![epd.fb]);
-
     for (i, mode) in Mode::ALL.into_iter().enumerate() {
         if !ok {
             break;
         }
         let y = 360 + i as i32 * 200;
         let _ = Rectangle::new(Point::new(100, y), Size::new(1204, 160)).into_styled(panel).draw(&mut canvas);
-        let _ = Rectangle::new(Point::new(1000, y + 30), Size::new(250, 100))
-            .into_styled(PrimitiveStyle::with_fill(Gray8::new(0x80)))
-            .draw(&mut canvas);
-        let label = format!("{i} {mode:?}");
-        let _ = Text::new(&label, Point::new(15, y / 3 + 35), text).draw(&mut Scaled { target: &mut canvas, factor: 3 });
+        let _ = Text::new(&format!("{i} {mode:?}"), Point::new(15, y / 3 + 35), text)
+            .draw(&mut Scaled { target: &mut canvas, factor: 3 });
         let t = Instant::now();
         canvas.flush(mode);
         eprintln!("remvnc: swap {mode:?} returned in {:?}", t.elapsed());
         ok = wait(&epd, 1200);
     }
-
-    if ok {
-        let _ = Rectangle::new(Point::new(100, 1600), Size::new(1204, 160)).into_styled(panel).draw(&mut canvas);
-        let _ = Text::new("TOUCH + PEN NOW", Point::new(40, 1600 / 4 + 25), text).draw(&mut Scaled { target: &mut canvas, factor: 4 });
-        canvas.flush(Mode::Ui);
-        eprintln!("remvnc: touch the screen / use the pen for 8 s");
-        let end = Instant::now() + Duration::from_secs(8);
-        let mut counts = vec![0usize; inputs.len()];
-        while ok && Instant::now() < end {
-            let mut fds: Vec<libc::pollfd> =
-                inputs.iter().map(|g| libc::pollfd { fd: g.file.as_raw_fd(), events: libc::POLLIN, revents: 0 }).collect();
-            unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 100) };
-            for (i, g) in inputs.iter_mut().enumerate() {
-                let mut buf = [0u8; 16 * 64];
-                while let Ok(n) = g.file.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    for ev in buf[..n].chunks_exact(16) {
-                        let (ty, code) = (u16::from_le_bytes([ev[8], ev[9]]), u16::from_le_bytes([ev[10], ev[11]]));
-                        let value = i32::from_le_bytes([ev[12], ev[13], ev[14], ev[15]]);
-                        if counts[i] < 12 && ty != 0 {
-                            eprintln!("remvnc:   {} type {ty} code {code} value {value}", g.name);
-                        }
-                        counts[i] += 1;
-                    }
-                }
-            }
-            ok = !QUIT.load(Ordering::Relaxed);
-        }
-        for (g, c) in inputs.iter().zip(&counts) {
-            eprintln!("remvnc: {} -> {c} events", g.name);
-        }
-    }
-
-    let wd_after = watchdog_ts();
-    eprintln!("remvnc: xochitl watchdog timestamp {wd_before} -> {wd_after} ({})",
-        if wd_before != wd_after { "petting works" } else { "NOT updated" });
-
-    // Put xochitl's last frame back so its idea of the panel matches reality.
-    // Only restore when the match is unambiguous.
-    if let [(_, buf)] = &saved[..] {
-        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), epd.fb.pixels, buf.len()) };
-        epd.swap(0, 0, w, h, Mode::Content, 0);
-        epd.process_events(20);
-        std::thread::sleep(Duration::from_millis(1500));
-        epd.process_events(20);
-        guardian.restored();
-        eprintln!("remvnc: screen restored, xochitl resumes on exit");
-    } else {
-        eprintln!("remvnc: no snapshot; guardian will restart xochitl");
-    }
-    eprintln!("remvnc: paused xochitl for {:?}", t0.elapsed());
-    drop(inputs);
-    // Exit without unwinding Qt: the vendor engine has no clean shutdown path.
-    std::process::exit(0);
+    drop(canvas);
+    session.end(&epd)
 }

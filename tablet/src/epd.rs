@@ -81,25 +81,6 @@ impl ImageInfo {
         }
     }
 
-    /// Converts a buffer in this image's format to 8-bit gray, row by row.
-    pub fn to_gray(&self, src: &[u8]) -> Vec<u8> {
-        let (w, h, s) = (self.width as usize, self.height as usize, self.stride as usize);
-        let mut out = Vec::with_capacity(w * h);
-        for y in 0..h {
-            let row = &src[y * s..];
-            for x in 0..w {
-                out.push(match self.format {
-                    FORMAT_GRAYSCALE8 => row[x],
-                    FORMAT_RGB16 => {
-                        let p = u16::from_le_bytes([row[x * 2], row[x * 2 + 1]]);
-                        ((p >> 5 & 0x3f) << 2) as u8
-                    }
-                    _ => row[x * 4 + 1],
-                });
-            }
-        }
-        out
-    }
 }
 
 static CAPTURE: AtomicBool = AtomicBool::new(false);

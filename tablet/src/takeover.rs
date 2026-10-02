@@ -93,7 +93,7 @@ pub fn private_tmp() -> io::Result<()> {
 /// Handle to the guardian process. Dropping it without `restored()` makes the
 /// guardian restart xochitl.
 pub struct Guardian {
-    child: Child,
+    _child: Child,
     stdin: Option<ChildStdin>,
 }
 
@@ -112,7 +112,7 @@ impl Guardian {
                 .spawn()?
         };
         let stdin = child.stdin.take();
-        Ok(Self { child, stdin })
+        Ok(Self { _child: child, stdin })
     }
 
     /// Tells the guardian the screen is restored: it only needs to resume xochitl.
@@ -121,10 +121,6 @@ impl Guardian {
         if let Some(s) = self.stdin.as_mut() {
             let _ = s.write_all(b"restored\n");
         }
-    }
-
-    pub fn id(&self) -> u32 {
-        self.child.id()
     }
 }
 
