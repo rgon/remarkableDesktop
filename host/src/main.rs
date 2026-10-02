@@ -106,7 +106,8 @@ fn send(w: &Writer, msg: &Msg) -> std::io::Result<()> {
 /// Runs a command on the tablet; its stdout on success.
 fn ssh(target: &str, cmd: &str) -> Result<String, String> {
     let out = Command::new("ssh")
-        .args(["-T", "-o", "ConnectTimeout=3", "-o", "BatchMode=yes", target, cmd])
+        // Keepalives: a call caught by USB re-enumeration fails fast instead of hanging.
+        .args(["-T", "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-o", "BatchMode=yes", target, cmd])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("ssh: {e}"))?;
