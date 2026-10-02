@@ -1,6 +1,7 @@
 mod epd;
 mod gfx;
 mod input;
+mod link;
 mod session;
 mod takeover;
 mod ui;
@@ -13,16 +14,18 @@ use embedded_graphics::text::Text;
 use epd::{Epd, Mode};
 use gfx::{Canvas, Scaled};
 use input::{PalmConfig, Pen, Touch, TouchMode};
+use ui::Button;
 use remvnc_proto::Msg;
 use session::{Session, quitting};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 const USAGE: &str = "usage:
   remvnc run [--rotate 0|90|180|270] [--touch touchpad|touchscreen]
-             [--palm-major N] [--pen-grace-ms N] [--log-touch]
-      Forward pen/touch to the host over stdout until the X is held.
+             [--palm-major N] [--pen-grace-ms N] [--log-touch] [--ssh-only]
+      Forward pen/touch to remvnc-host (on stdout, or a direct socket it
+      is told about) until the X is held.
   remvnc probe     Draw test patterns for a few seconds.
   remvnc restore   Kill stray instances and restart xochitl.";
 
@@ -52,10 +55,11 @@ struct RunArgs {
     rotation: u16,
     touch: TouchMode,
     palm: PalmConfig,
+    ssh_only: bool,
 }
 
 fn parse_run(args: &[String]) -> Result<RunArgs, String> {
-    let (mut rotation, mut touch, mut palm) = (90, TouchMode::Touchpad, PalmConfig::default());
+    let (mut rotation, mut touch, mut palm, mut ssh_only) = (90, TouchMode::Touchpad, PalmConfig::default(), false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || it.next().ok_or(format!("{a} needs a value"));
@@ -73,10 +77,11 @@ fn parse_run(args: &[String]) -> Result<RunArgs, String> {
             "--palm-major" => palm.max_major = value()?.parse().map_err(|_| "--palm-major: a number")?,
             "--pen-grace-ms" => palm.pen_grace_us = value()?.parse::<u64>().map_err(|_| "--pen-grace-ms: a number")? * 1000,
             "--log-touch" => palm.log = true,
+            "--ssh-only" => ssh_only = true,
             _ => return Err(format!("unknown argument {a}\n{USAGE}")),
         }
     }
-    Ok(RunArgs { rotation, touch, palm })
+    Ok(RunArgs { rotation, touch, palm, ssh_only })
 }
 
 /// Pumps Qt events for `ms`; false if we were asked to quit.
@@ -89,7 +94,6 @@ fn wait(epd: &Epd, ms: u64) -> bool {
     !quitting()
 }
 
-const HOLD: Duration = Duration::from_millis(1500);
 
 /// Runs the calling thread under SCHED_FIFO so input forwarding is not
 /// delayed behind the engine's threads (which keep their normal policy).
@@ -103,8 +107,21 @@ fn realtime_priority() {
 /// Qt only needs servicing for the engine's own bookkeeping, not per event.
 const QT_EVERY: Duration = Duration::from_millis(100);
 
+fn mode_label(m: TouchMode) -> &'static str {
+    match m {
+        TouchMode::Touchpad => "PAD",
+        TouchMode::Touchscreen => "TOUCH",
+    }
+}
+
+fn screen_label(target: u8) -> String {
+    if target == 0 { "ALL".into() } else { target.to_string() }
+}
+
 fn run(args: RunArgs) -> Result<(), String> {
-    let RunArgs { rotation, touch: touch_mode, palm } = args;
+    let RunArgs { rotation, touch: touch_mode, palm, ssh_only } = args;
+    // Before pausing xochitl: the host must answer within a few seconds.
+    let mut link = link::Link::open(ssh_only);
     let (session, epd) = Session::begin(0)?;
     let inputs = &session.inputs;
     let mut pen = inputs.pen.as_ref().map(|g| Pen::new(&g.file, rotation)).transpose().map_err(|e| format!("pen: {e}"))?;
@@ -116,27 +133,33 @@ fn run(args: RunArgs) -> Result<(), String> {
         .map_err(|e| format!("touch: {e}"))?;
 
     let mut ui = ui::Ui::new(&epd, rotation);
+    let mut target: u8 = 0;
+    let mut screens: u8 = 0;
+    ui.set_label(Button::Screen, &screen_label(target));
+    ui.set_label(Button::Mode, mode_label(touch_mode));
     ui.draw_home();
     realtime_priority();
 
-    let mut out = BufWriter::new(std::io::stdout().lock());
+    let out = &mut link.out;
     let mut hello = vec![Msg::Hello { version: remvnc_proto::VERSION, width: ui.size[0] as u16, height: ui.size[1] as u16, rotation }];
     hello.extend(pen.iter().map(|p| Msg::Device(p.device())));
     hello.extend(touch.iter().map(|t| Msg::Device(t.device())));
-    let mut alive = hello.iter().try_for_each(|m| m.write_to(&mut out)).and_then(|_| out.flush()).is_ok();
+    let mut alive = hello.iter().try_for_each(|m| m.write_to(out)).and_then(|_| out.flush()).is_ok();
 
     let grabbed = [inputs.pen.as_ref(), inputs.touch.as_ref(), inputs.power.as_ref()];
-    let fds = grabbed.map(|g| g.map_or(-1, |g| g.file.as_raw_fd()));
+    let mut fds: Vec<i32> = grabbed.iter().map(|g| g.map_or(-1, |g| g.file.as_raw_fd())).collect();
+    fds.push(link.input_fd());
+    // With a direct link, ssh's stdin still tells us when the host is gone.
+    fds.push(if link.is_direct() { 0 } else { -1 });
     let mut files = grabbed.map(|g| g.and_then(|g| g.file.try_clone().ok()));
-    let mut from_host: Vec<u8> = vec![];
-    let mut hold_start: Option<Instant> = None;
+    // (button, since, already fired): a hold fires once, then needs a release.
+    let mut hold: Option<(Button, Instant, bool)> = None;
     let mut last_qt = Instant::now();
     let mut done = false;
 
     while alive && !done && !quitting() {
-        let mut pfds: Vec<libc::pollfd> =
-            fds.iter().chain([&0]).map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
-        let timeout = if hold_start.is_some() { 30 } else { QT_EVERY.as_millis() as i32 };
+        let mut pfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
+        let timeout = if hold.is_some() { 30 } else { QT_EVERY.as_millis() as i32 };
         unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, timeout) };
 
         // Pen first: its hover state gates touches in the same wake-up.
@@ -152,12 +175,13 @@ fn run(args: RunArgs) -> Result<(), String> {
             }
             if let Some(f) = files[1].as_mut() {
                 let events = input::read_events(f).unwrap_or_default();
-                let fs = touch.feed(&events, ui.size, |p| ui.on_button(p));
+                let fs = touch.feed(&events, ui.size, |p| ui.button_at(p).map(|b| b as u8));
                 frames.extend(fs.into_iter().map(|(t, e)| (input::TOUCH_ID, t, e)));
             }
         }
+        let out = &mut link.out;
         for (device, time_us, events) in frames {
-            alive &= Msg::Frame { device, time_us, events }.write_to(&mut out).is_ok();
+            alive &= Msg::Frame { device, time_us, events }.write_to(out).is_ok();
         }
 
         if let Some(f) = files[2].as_mut() {
@@ -167,40 +191,89 @@ fn run(args: RunArgs) -> Result<(), String> {
                 done = true;
             }
         }
-        if pfds[3].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            let mut buf = [0u8; 4096];
-            let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
-            if n <= 0 {
-                eprintln!("remvnc: host went away");
+        if pfds[4].revents != 0 {
+            // ssh closed under a direct link.
+            let mut b = [0u8; 64];
+            if unsafe { libc::read(0, b.as_mut_ptr().cast(), b.len()) } <= 0 {
+                eprintln!("remvnc: ssh session ended");
                 break;
             }
-            from_host.extend_from_slice(&buf[..n as usize]);
-            while let Ok(Some((msg, used))) = Msg::parse(&from_host) {
-                from_host.drain(..used);
-                if let Msg::Ping { host_us } = msg {
-                    let pong = Msg::Pong { host_us, tablet_us: remvnc_proto::monotonic_us() };
-                    alive &= pong.write_to(&mut out).is_ok();
+        }
+        if pfds[3].revents != 0 {
+            match link.receive() {
+                Ok(Some(msgs)) => {
+                    for m in msgs {
+                        match m {
+                            Msg::Ping { host_us } => {
+                                let pong = Msg::Pong { host_us, tablet_us: remvnc_proto::monotonic_us() };
+                                alive &= pong.write_to(&mut link.out).is_ok();
+                            }
+                            Msg::Screens { names } => {
+                                screens = names.len().min(9) as u8;
+                                eprintln!("remvnc: host screens: {}", names.join(", "));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    eprintln!("remvnc: host went away");
+                    break;
                 }
             }
         }
-        alive &= out.flush().is_ok();
+        alive &= link.out.flush().is_ok();
 
-        let holding = touch.as_ref().is_some_and(|t| t.holding());
-        match (holding, hold_start) {
-            (true, None) => hold_start = Some(Instant::now()),
-            (false, Some(_)) => {
-                hold_start = None;
-                ui.set_progress(0);
-            }
-            (true, Some(t)) => {
-                let steps = (t.elapsed().as_millis() * ui::HOLD_STEPS as u128 / HOLD.as_millis()) as u32;
-                ui.set_progress(steps.min(ui::HOLD_STEPS));
-                if t.elapsed() >= HOLD {
-                    eprintln!("remvnc: close button held");
-                    done = true;
+        let held = touch.as_ref().and_then(|t| t.holding()).map(|b| Button::ALL[b as usize]);
+        match (held, hold) {
+            (Some(b), Some((h, since, fired))) if b == h => {
+                if !fired {
+                    let elapsed = since.elapsed();
+                    let steps = (elapsed.as_millis() * ui::HOLD_STEPS as u128 / b.hold().as_millis()) as u32;
+                    ui.set_progress(b, steps.min(ui::HOLD_STEPS));
+                    if elapsed >= b.hold() {
+                        hold = Some((b, since, true));
+                        match b {
+                            Button::Close => {
+                                eprintln!("remvnc: close button held");
+                                done = true;
+                            }
+                            Button::Mode => {
+                                if let Some(t) = touch.as_mut() {
+                                    let next = match t.mode() {
+                                        TouchMode::Touchpad => TouchMode::Touchscreen,
+                                        TouchMode::Touchscreen => TouchMode::Touchpad,
+                                    };
+                                    let now = remvnc_proto::monotonic_us();
+                                    if let Some(lift) = t.set_mode(next, now) {
+                                        alive &= Msg::Frame { device: input::TOUCH_ID, time_us: now, events: lift }.write_to(&mut link.out).is_ok();
+                                    }
+                                    alive &= Msg::Device(t.device()).write_to(&mut link.out).is_ok();
+                                    eprintln!("remvnc: touch is now {next:?}");
+                                    ui.set_label(b, mode_label(next));
+                                }
+                            }
+                            Button::Screen => {
+                                target = (target + 1) % (screens + 1);
+                                alive &= Msg::Target { index: target }.write_to(&mut link.out).is_ok();
+                                ui.set_label(b, &screen_label(target));
+                            }
+                        }
+                        alive &= link.out.flush().is_ok();
+                    }
                 }
             }
-            (false, None) => {}
+            (Some(b), _) => {
+                if let Some((h, _, _)) = hold {
+                    ui.set_progress(h, 0);
+                }
+                hold = Some((b, Instant::now(), false));
+            }
+            (None, Some((h, _, _))) => {
+                hold = None;
+                ui.set_progress(h, 0);
+            }
+            (None, None) => {}
         }
         if last_qt.elapsed() >= QT_EVERY {
             epd.process_events(0);
@@ -210,8 +283,8 @@ fn run(args: RunArgs) -> Result<(), String> {
     if !alive {
         eprintln!("remvnc: lost the host connection");
     }
-    let _ = Msg::Bye.write_to(&mut out).and_then(|_| out.flush());
-    drop(out);
+    let _ = Msg::Bye.write_to(&mut link.out).and_then(|_| link.out.flush());
+    drop(link);
     drop(ui);
     session.end(&epd)
 }

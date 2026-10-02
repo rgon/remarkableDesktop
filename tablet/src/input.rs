@@ -290,14 +290,16 @@ const SLOTS: usize = 16;
 enum Owner {
     #[default]
     Host,
-    /// Our own UI (the close button).
-    Ui,
+    /// Our own UI: the button with this index.
+    Ui(u8),
     /// Landed while the pen was near: a resting hand.
     PenNear,
     /// The touch controller flagged it as a palm.
     Palm,
     /// Contact area too large for a fingertip.
     Large,
+    /// Was down when the touch mode switched; ignored until lifted.
+    Switched,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -377,9 +379,30 @@ impl Touch {
         Device { id: TOUCH_ID, name: "remvnc touch".into(), props, keys, abs: self.abs.clone() }
     }
 
-    /// True while a contact that started on our UI is down and still on it.
-    pub fn holding(&self) -> bool {
-        self.slots.iter().any(|s| s.owner == Owner::Ui && s.inside && s.id >= 0)
+    /// The UI element held by a contact that started on it and is still on it.
+    pub fn holding(&self) -> Option<u8> {
+        self.slots.iter().find_map(|s| match s.owner {
+            Owner::Ui(b) if s.inside && s.id >= 0 => Some(b),
+            _ => None,
+        })
+    }
+
+    pub fn mode(&self) -> TouchMode {
+        self.mode
+    }
+
+    /// Switches between touchpad and touchscreen. Contacts the host sees are
+    /// lifted first (returned as a frame for the old device); the caller then
+    /// re-declares `device()`.
+    pub fn set_mode(&mut self, mode: TouchMode, now_us: u64) -> Option<Vec<Event>> {
+        for s in self.slots.iter_mut().filter(|s| s.forwarded) {
+            s.owner = Owner::Switched;
+            s.dirty = true;
+        }
+        let lift = self.frame(now_us, &|_| None);
+        self.mode = mode;
+        self.last_count = 0;
+        lift
     }
 
     fn pen_blocks(&self, now_us: u64) -> bool {
@@ -396,22 +419,22 @@ impl Touch {
         }
         if in_range && !was {
             let mut lifted = false;
-            for s in self.slots.iter_mut().filter(|s| s.id >= 0 && matches!(s.owner, Owner::Host | Owner::Ui)) {
+            for s in self.slots.iter_mut().filter(|s| s.id >= 0 && matches!(s.owner, Owner::Host | Owner::Ui(_))) {
                 s.owner = Owner::PenNear;
                 s.dirty = true;
                 lifted = true;
             }
             if lifted {
-                return self.frame(now_us, &|_| false);
+                return self.frame(now_us, &|_| None);
             }
         }
         None
     }
 
-    /// Feeds raw events. `on_ui(pixel)` decides, in logical screen pixels of
-    /// a `size` screen, whether a contact belongs to our own UI. Returns
+    /// Feeds raw events. `on_ui(pixel)` names the UI element, if any, under a
+    /// position in logical screen pixels of a `size` screen. Returns
     /// forwarded frames with their kernel timestamps.
-    pub fn feed(&mut self, events: &[RawEvent], size: [i32; 2], on_ui: impl Fn([i32; 2]) -> bool) -> Vec<(u64, Vec<Event>)> {
+    pub fn feed(&mut self, events: &[RawEvent], size: [i32; 2], on_ui: impl Fn([i32; 2]) -> Option<u8>) -> Vec<(u64, Vec<Event>)> {
         let out = self.out;
         let on_ui = move |pos: [i32; 2]| on_ui([0, 1].map(|i| to_pixels(out[i], pos[i], size[i])));
         let mut frames = vec![];
@@ -463,7 +486,7 @@ impl Touch {
         }
     }
 
-    fn frame(&mut self, now_us: u64, on_ui: &impl Fn([i32; 2]) -> bool) -> Option<Vec<Event>> {
+    fn frame(&mut self, now_us: u64, on_ui: &impl Fn([i32; 2]) -> Option<u8>) -> Option<Vec<Event>> {
         let abs = |code, value| Event { kind: EV_ABS, code, value };
         let key = |code, down: bool| Event { kind: EV_KEY, code, value: down as i32 };
         let pen_blocks = self.pen_blocks(now_us);
@@ -482,12 +505,12 @@ impl Touch {
                     Owner::PenNear
                 } else if let Some(p) = palm {
                     p
-                } else if on_ui(s.pos) {
-                    Owner::Ui
+                } else if let Some(b) = on_ui(s.pos) {
+                    Owner::Ui(b)
                 } else {
                     Owner::Host
                 };
-            } else if s.id >= 0 && matches!(s.owner, Owner::Host | Owner::Ui) {
+            } else if s.id >= 0 && matches!(s.owner, Owner::Host | Owner::Ui(_)) {
                 // A fingertip that grew into a palm.
                 if let Some(p) = palm {
                     s.owner = p;
@@ -496,8 +519,8 @@ impl Touch {
             if s.id >= 0 {
                 s.peak = [s.peak[0].max(s.major), s.peak[1].max(s.minor), s.peak[2].max(s.pressure)];
             }
-            if s.owner == Owner::Ui {
-                s.inside = on_ui(s.pos);
+            if let Owner::Ui(b) = s.owner {
+                s.inside = on_ui(s.pos) == Some(b);
             }
 
             let send = s.owner == Owner::Host && s.id >= 0;
