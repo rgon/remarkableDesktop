@@ -67,11 +67,14 @@ logs to the journal.
   USB HID.
 
 ## Input
-- **Monitor targeting:** relies on the compositor mapping an unassigned
-  absolute device across the bounding box of all monitors (Mutter does). The
-  host then squeezes coordinates into the chosen monitor's share. A compositor
-  that maps devices differently would put input in the wrong place.
-- **Aspect ratio:** targeting a monitor stretches the tablet to fill it.
+- **Monitor targeting:** pen and touchscreen are mapped through GNOME's
+  per-device `output` settings (restored when `remvnc-host` exits normally).
+  The pen's MOUSE mode instead assumes the absolute pointer spans the bounding
+  box of all monitors, as Mutter does. Other compositors would need their own
+  mapping.
+- **Aspect ratio:** kept. The tablet area matches the letterboxed picture of
+  the target monitor. In the ALL view, the touchscreen goes wherever GNOME
+  puts it.
 - **Touchpad mode:** relative, so monitor targeting doesn't apply to it.
 - **Pen cursor in some apps:** in PEN mode the app must draw the pen cursor
   (Wayland tablet protocol). Chromium and Electron don't, so no cursor shows.
