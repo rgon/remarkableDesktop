@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Abs {
@@ -59,6 +59,15 @@ pub enum Msg {
     Rect { id: u32, x: u16, y: u16, w: u16, h: u16, data: Vec<u8> },
     /// Tablet → host: `Rect` `id` is on its way to the panel; send the next.
     Ack { id: u32 },
+    /// Host → tablet: coordinate correction for a device's USB HID reports
+    /// (the host corrects uinput input itself). Fractions of the device
+    /// range ×65535: the part of the tablet `shown` (x0, x1, y0, y1) is
+    /// stretched onto `to`.
+    Mapping { device: u8, shown: [u16; 4], to: [u16; 4] },
+    /// Tablet → host: whether input goes out over USB HID (the host's
+    /// uinput devices then idle), and the current pen and touch modes, which
+    /// decide how the host maps the HID devices.
+    Status { usb_hid: bool, pen_mouse: bool, touchpad: bool },
     /// The tablet is exiting on purpose (X button held, power button).
     Bye,
 }
@@ -74,6 +83,8 @@ const SCREENS: u8 = 8;
 const TARGET: u8 = 9;
 const RECT: u8 = 10;
 const ACK: u8 = 11;
+const MAPPING: u8 = 12;
+const STATUS: u8 = 13;
 
 impl Msg {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
@@ -151,6 +162,17 @@ impl Msg {
                 p.extend_from_slice(&id.to_le_bytes());
                 ACK
             }
+            Msg::Mapping { device, shown, to } => {
+                p.push(*device);
+                for v in shown.iter().chain(to) {
+                    p.extend_from_slice(&v.to_le_bytes());
+                }
+                MAPPING
+            }
+            Msg::Status { usb_hid, pen_mouse, touchpad } => {
+                p.push(*usb_hid as u8 | (*pen_mouse as u8) << 1 | (*touchpad as u8) << 2);
+                STATUS
+            }
         };
         w.write_all(&[tag])?;
         w.write_all(&(p.len() as u32).to_le_bytes())?;
@@ -203,6 +225,18 @@ impl Msg {
                 Msg::Rect { id, x, y, w, h, data: c.take(len - c.at)?.to_vec() }
             }
             ACK => Msg::Ack { id: c.u32()? },
+            MAPPING => {
+                let device = c.u8()?;
+                let mut v = [0u16; 8];
+                for x in &mut v {
+                    *x = c.u16()?;
+                }
+                Msg::Mapping { device, shown: v[..4].try_into().unwrap(), to: v[4..].try_into().unwrap() }
+            }
+            STATUS => {
+                let f = c.u8()?;
+                Msg::Status { usb_hid: f & 1 != 0, pen_mouse: f & 2 != 0, touchpad: f & 4 != 0 }
+            }
             t => return Err(bad(&format!("unknown message tag {t}"))),
         };
         Ok(Some(msg))
@@ -353,6 +387,8 @@ mod tests {
             Msg::Target { index: 2 },
             Msg::Rect { id: 3, x: 8, y: 16, w: 3, h: 2, data: vec![1, 2, 3] },
             Msg::Ack { id: 3 },
+            Msg::Mapping { device: 1, shown: [0, 65535, 100, 65000], to: [1, 2, 3, 4] },
+            Msg::Status { usb_hid: true, pen_mouse: false, touchpad: true },
             Msg::Bye,
         ];
         let mut buf = Vec::new();
