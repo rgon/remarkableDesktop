@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Abs {
@@ -68,6 +68,14 @@ pub enum Msg {
     /// uinput devices then idle), and the current pen and touch modes, which
     /// decide how the host maps the HID devices.
     Status { usb_hid: bool, pen_mouse: bool, touchpad: bool },
+    /// Tablet → host: its addresses other than the USB link (e.g. Wi-Fi),
+    /// for the host to test whether it could reach the tablet without USB.
+    Addresses { addrs: Vec<String> },
+    /// Host → tablet: an address the host verified it can reach the tablet
+    /// on without USB ("" if none). Enables the tablet's go-remote button.
+    RemoteOk { addr: String },
+    /// Tablet → host: the user asked to go remote; reconnect over `RemoteOk`'s address.
+    GoRemote,
     /// The tablet is exiting on purpose (X button held, power button).
     Bye,
 }
@@ -85,6 +93,9 @@ const RECT: u8 = 10;
 const ACK: u8 = 11;
 const MAPPING: u8 = 12;
 const STATUS: u8 = 13;
+const ADDRESSES: u8 = 14;
+const REMOTE_OK: u8 = 15;
+const GO_REMOTE: u8 = 16;
 
 impl Msg {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
@@ -173,6 +184,18 @@ impl Msg {
                 p.push(*usb_hid as u8 | (*pen_mouse as u8) << 1 | (*touchpad as u8) << 2);
                 STATUS
             }
+            Msg::Addresses { addrs } => {
+                p.push(addrs.len() as u8);
+                for a in addrs {
+                    put_str(&mut p, a);
+                }
+                ADDRESSES
+            }
+            Msg::RemoteOk { addr } => {
+                put_str(&mut p, addr);
+                REMOTE_OK
+            }
+            Msg::GoRemote => GO_REMOTE,
         };
         w.write_all(&[tag])?;
         w.write_all(&(p.len() as u32).to_le_bytes())?;
@@ -237,6 +260,9 @@ impl Msg {
                 let f = c.u8()?;
                 Msg::Status { usb_hid: f & 1 != 0, pen_mouse: f & 2 != 0, touchpad: f & 4 != 0 }
             }
+            ADDRESSES => Msg::Addresses { addrs: (0..c.u8()?).map(|_| c.str()).collect::<io::Result<_>>()? },
+            REMOTE_OK => Msg::RemoteOk { addr: c.str()? },
+            GO_REMOTE => Msg::GoRemote,
             t => return Err(bad(&format!("unknown message tag {t}"))),
         };
         Ok(Some(msg))
@@ -389,6 +415,9 @@ mod tests {
             Msg::Ack { id: 3 },
             Msg::Mapping { device: 1, shown: [0, 65535, 100, 65000], to: [1, 2, 3, 4] },
             Msg::Status { usb_hid: true, pen_mouse: false, touchpad: true },
+            Msg::Addresses { addrs: vec!["192.168.1.5".into()] },
+            Msg::RemoteOk { addr: "192.168.1.5".into() },
+            Msg::GoRemote,
             Msg::Bye,
         ];
         let mut buf = Vec::new();
