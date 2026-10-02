@@ -1,6 +1,8 @@
 //! `remvnc-host`: runs `remvnc run` on the tablet over SSH and replays its
 //! pen and touch input through local uinput devices.
 
+mod capture;
+mod displayconfig;
 mod mapping;
 mod outputs;
 mod stats;
@@ -38,6 +40,27 @@ fn parse() -> Result<Args, String> {
             "--remote" => a.remote = value()?,
             "--deploy" => a.deploy = Some(value()?),
             "--stats" => a.stats = true,
+            "--capture-test" => {
+                // remvnc-host --capture-test virtual|<connector> <out.pgm>
+                let src = value()?;
+                let path = it.next().ok_or("--capture-test needs an output path")?;
+                let source = if src == "virtual" { capture::Source::Virtual } else { capture::Source::Monitor(src) };
+                let mut cap = capture::Capture::start(&source, (1872, 1404), 90)?;
+                let mut frame = vec![];
+                let t = std::time::Instant::now();
+                cap.next_frame(&mut frame).map_err(|e| format!("frame: {e}"))?;
+                let first = t.elapsed();
+                cap.next_frame(&mut frame).map_err(|e| format!("frame: {e}"))?;
+                println!("virtual monitor: {:?}", cap.virtual_name);
+                let mut pgm = format!("P5\n{} {}\n255\n", cap.width, cap.height).into_bytes();
+                pgm.extend_from_slice(&frame);
+                std::fs::write(&path, pgm).map_err(|e| e.to_string())?;
+                println!("{}x{} frame in {first:?}, second after {:?}; outputs now:", cap.width, cap.height, t.elapsed());
+                for o in outputs::list()? {
+                    println!("  {} {}x{} at {},{}", o.name, o.w, o.h, o.x, o.y);
+                }
+                std::process::exit(0);
+            }
             "--list-screens" => {
                 for (i, o) in outputs::list()?.iter().enumerate() {
                     println!("{}: {} {}x{} at {},{}", i + 1, o.name, o.w, o.h, o.x, o.y);
