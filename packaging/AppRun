@@ -1,0 +1,4 @@
+#!/bin/sh
+here=$(dirname "$(readlink -f "$0")")
+export LD_LIBRARY_PATH="$here/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$here/usr/bin/remdesktop-host" "$@"

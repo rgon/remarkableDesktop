@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=remdesktop
+Comment=Use a reMarkable tablet as a second display and pen input
+Exec=remdesktop-host
+Icon=remdesktop
+Terminal=true
+Categories=Utility;
