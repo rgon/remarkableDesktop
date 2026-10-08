@@ -15,7 +15,43 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Tablet binaries: glibc-linked against 2.31 with zig, like run.sh does.
+  build-tablet:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - arch: armv7
+            target: armv7-unknown-linux-gnueabihf
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        run: pip3 install cargo-zigbuild
+
+      - name: Build tablet binary
+        run: |
+          cargo zigbuild -p remdesktop-tablet --release --target ${{ matrix.target }}.2.31
+          cp target/${{ matrix.target }}/release/remdesktop remdesktop-${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: tablet-${{ matrix.arch }}
+          path: remdesktop-${{ matrix.arch }}
+          if-no-files-found: error
+
   build:
+    needs: [build-tablet]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -32,7 +68,16 @@ jobs:
       - name: Run tests
         run: cargo test --release -p remdesktop-proto -p remdesktop-host
 
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: tablet-*
+          path: tablet-bin
+          merge-multiple: true
+
       - name: Build AppImage
+        env:
+          TABLET_DIR: ${{ github.workspace }}/tablet-bin
+          REQUIRE_TABLET: "1"
         run: bash scripts/build-appimage.sh
 
       - name: Stage AppImage for the release job
