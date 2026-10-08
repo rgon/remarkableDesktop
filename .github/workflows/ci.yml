@@ -18,7 +18,7 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -66,7 +66,7 @@ jobs:
     if: needs.release-please.outputs.release_created
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Restore AppImage
         uses: actions/cache/restore@v4
@@ -110,7 +110,7 @@ jobs:
 
       # release-please bumps the Cargo.toml versions but never runs cargo, so
       # Cargo.lock is stale on the branch it just pushed.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         if: steps.release_pr.outputs.prs_created == 'true'
         with:
           ref: ${{ fromJSON(steps.release_pr.outputs.pr || '{}').headBranchName }}
