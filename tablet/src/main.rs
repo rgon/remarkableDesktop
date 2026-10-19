@@ -13,6 +13,7 @@ mod epd;
 mod gfx;
 mod hid;
 mod hid_report;
+mod ink;
 mod input;
 mod link;
 mod pen_gate;

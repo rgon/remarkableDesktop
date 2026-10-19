@@ -13,12 +13,12 @@ pub const EV_ABS: u16 = 3;
 pub const SYN_REPORT: u16 = 0;
 
 pub const KEY_POWER: u16 = 116;
-const BTN_LEFT: u16 = 0x110;
+pub const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_TOOL_PEN: u16 = 0x140;
-const BTN_TOOL_RUBBER: u16 = 0x141;
+pub const BTN_TOOL_RUBBER: u16 = 0x141;
 const BTN_TOOL_FINGER: u16 = 0x145;
-const BTN_TOUCH: u16 = 0x14a;
+pub const BTN_TOUCH: u16 = 0x14a;
 const BTN_STYLUS: u16 = 0x14b;
 const BTN_STYLUS2: u16 = 0x14c;
 const BTN_TOOL_DOUBLETAP: u16 = 0x14d;
@@ -26,8 +26,8 @@ const BTN_TOOL_TRIPLETAP: u16 = 0x14e;
 const BTN_TOOL_QUADTAP: u16 = 0x14f;
 const BTN_TOOL_QUINTTAP: u16 = 0x148;
 
-const ABS_X: u16 = 0x00;
-const ABS_Y: u16 = 0x01;
+pub const ABS_X: u16 = 0x00;
+pub const ABS_Y: u16 = 0x01;
 const ABS_PRESSURE: u16 = 0x18;
 const ABS_DISTANCE: u16 = 0x19;
 const ABS_TILT_X: u16 = 0x1a;
@@ -267,6 +267,11 @@ impl Pen {
 
     pub fn mode(&self) -> PenMode {
         self.mode
+    }
+
+    /// Value range `(min, max)` of the X and Y events `feed` produces.
+    pub fn pos_range(&self) -> [(i32, i32); 2] {
+        [0, 1].map(|i| (self.abs[i].min, self.abs[i].max))
     }
 
     /// Switches mode; returns a frame releasing anything held on the old

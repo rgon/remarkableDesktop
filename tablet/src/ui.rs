@@ -78,17 +78,34 @@ pub enum Button {
     Pen = 5,
     /// Switches touch between touchpad and touchscreen.
     Mode = 6,
-    Close = 7,
+    /// Cycles what the panel shows: the screen, nothing, or just its edges.
+    Display = 7,
+    /// Toggles the pen ink preview. Acts on touch, no hold.
+    Ink = 8,
+    /// Wipes the ink preview. Acts on touch, no hold.
+    Clear = 9,
+    Close = 10,
 }
 
 impl Button {
-    pub const ALL: [Button; 8] =
-        [Button::Undo, Button::Redo, Button::Side, Button::Net, Button::Screen, Button::Pen, Button::Mode, Button::Close];
+    pub const ALL: [Button; 11] = [
+        Button::Undo,
+        Button::Redo,
+        Button::Side,
+        Button::Net,
+        Button::Screen,
+        Button::Pen,
+        Button::Mode,
+        Button::Display,
+        Button::Ink,
+        Button::Clear,
+        Button::Close,
+    ];
 
     /// How long the button must be held (zero: acts on touch).
     pub fn hold(self) -> std::time::Duration {
         std::time::Duration::from_millis(match self {
-            Button::Undo | Button::Redo | Button::Side => 0,
+            Button::Undo | Button::Redo | Button::Side | Button::Ink | Button::Clear => 0,
             Button::Close => 1500,
             _ => 700,
         })
@@ -143,6 +160,17 @@ impl<'a> Ui<'a> {
     fn status_rect(&self) -> Rectangle {
         let h = STATUS_LINE_H * STATUS_LINES as i32 + 16;
         Rectangle::new(Point::new(MARGIN, self.size[1] - MARGIN - h), Size::new(STATUS_W, h as u32))
+    }
+
+    /// Panel (portrait) pixel of a logical pixel position.
+    pub fn to_panel(&self, p: [i32; 2]) -> [i32; 2] {
+        let [w, h] = if self.rotation % 180 == 90 { [self.size[1], self.size[0]] } else { self.size };
+        match self.rotation {
+            90 => [p[1], h - 1 - p[0]],
+            180 => [w - 1 - p[0], h - 1 - p[1]],
+            270 => [w - 1 - p[1], p[0]],
+            _ => p,
+        }
     }
 
     fn rect_phys(&mut self, r: Rectangle) -> crate::display::Rect {

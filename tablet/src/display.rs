@@ -94,6 +94,16 @@ impl Display {
         Self { refresh, unsettled: None, last_update: Instant::now(), frames: 0 }
     }
 
+    /// The mode for updates that must show up at once.
+    pub fn fast(&self) -> Mode {
+        self.refresh.fast
+    }
+
+    /// The mode that clears the fast mode's ghosting.
+    pub fn settle(&self) -> Mode {
+        self.refresh.settle
+    }
+
     /// Refreshes freshly written pixels in the fast mode.
     pub fn show(&mut self, epd: &Epd, r: Rect) {
         epd.swap(r.x, r.y, r.w, r.h, self.refresh.fast, 0);

@@ -8,13 +8,15 @@
 //! also what streams the screen, so its options are greyed out without it.
 
 use crate::display::{self, Display};
+use crate::epd::Epd;
 use crate::hid::{self, Gadget, Link as UsbLink};
 use crate::hid_report::{self, Encoder, Ranges};
+use crate::ink::Ink;
 use crate::input::{self, PalmConfig, Pen, PenMode, Touch, TouchMode};
 use crate::link::{Incoming, Link, Server};
 use crate::session::{Session, quitting};
 use crate::ui::{self, Button, Ui};
-use remdesktop_proto::{Event, Msg};
+use remdesktop_proto::{DisplayMode, Event, Msg};
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -40,6 +42,27 @@ fn mode_label(m: TouchMode) -> &'static str {
     match m {
         TouchMode::Touchpad => "PAD",
         TouchMode::Touchscreen => "TOUCH",
+    }
+}
+
+fn display_label(m: DisplayMode) -> &'static str {
+    match m {
+        DisplayMode::Normal => "NRM",
+        DisplayMode::None => "OFF",
+        DisplayMode::Edge => "EDGE",
+    }
+}
+
+fn ink_label(on: bool) -> &'static str {
+    if on { "INK*" } else { "INK" }
+}
+
+/// Wipes the ink preview off the panel, with the quality refresh that also
+/// clears the fast mode's ghosting.
+fn clear_ink(ink: &mut Ink, epd: &Epd, display: &Display) {
+    if let Some(r) = ink.restore(&epd.fb) {
+        epd.swap(r.x, r.y, r.w, r.h, display.settle(), 0);
+        epd.process_events(0);
     }
 }
 
@@ -151,6 +174,10 @@ pub fn run(args: Args) -> Result<(), String> {
     ui.set_label(Button::Screen, "VIEW");
     ui.set_label(Button::Mode, mode_label(touch_mode));
     ui.set_label(Button::Pen, pen_label(pen_mode));
+    ui.set_label(Button::Display, display_label(state.display));
+    ui.set_label(Button::Ink, ink_label(state.ink));
+    ui.set_label(Button::Clear, "CLR");
+    ui.set_enabled(Button::Clear, state.ink);
     ui.set_enabled(Button::Screen, false);
     ui.set_status("USB  starting", "HOST not connected");
     ui.draw_home();
@@ -193,6 +220,7 @@ pub fn run(args: Args) -> Result<(), String> {
     let pen_axes = ranges.as_ref().map(|r| r.pen);
     let mut mappings = [Mapping::default(); 2]; // pen, touch
     let mut display = Display::new(refresh);
+    let mut ink = Ink::new(state.ink);
     let mut host: Option<Host> = None;
     let mut hid_was_up = false;
     // Last status sent to the host (usb hid, pen mouse, touchpad).
@@ -226,6 +254,7 @@ pub fn run(args: Args) -> Result<(), String> {
             let events = input::read_events(f).unwrap_or_default();
             let mouse = pen.mode() == PenMode::Mouse;
             let size = ui.size;
+            let range = pen.pos_range();
             let zone = |pos: [i32; 2]| match pen_axes {
                 Some(a) => ui.pen_zone([0, 1].map(|i| {
                     ((pos[i] - a[i].min) as i64 * size[i] as i64 / (a[i].max - a[i].min).max(1) as i64) as i32
@@ -233,12 +262,25 @@ pub fn run(args: Args) -> Result<(), String> {
                 None => crate::pen_gate::Zone::Outside,
             };
             for (t, e) in pen.feed(&events) {
+                if let Some(p) = ink.feed(&e, mouse) {
+                    let at = [0, 1].map(|i| ((p[i] - range[i].0) as i64 * size[i] as i64 / (range[i].1 - range[i].0).max(1) as i64) as i32);
+                    if ui.pen_zone(at) == crate::pen_gate::Zone::Outside {
+                        ink.stroke(&epd.fb, ui.to_panel(at));
+                    } else {
+                        ink.lift();
+                    }
+                }
                 let g = gate.filter(e, mouse, &zone);
                 pen_pressing = g.pressing.filter(|&b| ui.enabled(b));
                 if let Some(e) = g.events {
                     frames.push((input::PEN_ID, t, e));
                 }
             }
+        }
+        // One refresh per wake-up, whatever number of pen frames arrived.
+        if let Some(r) = ink.take_pending() {
+            epd.swap(r.x, r.y, r.w, r.h, display.fast(), 0);
+            epd.process_events(0);
         }
         if let Some(touch) = touch.as_mut() {
             let now = remdesktop_proto::monotonic_us();
@@ -324,6 +366,7 @@ pub fn run(args: Args) -> Result<(), String> {
                             rotation,
                             view: state.view.clone(),
                         });
+                        h.send(&Msg::Display { mode: state.display });
                         sent_status = None; // sent with the next wake-up
                         host = Some(h);
                     }
@@ -371,11 +414,17 @@ pub fn run(args: Args) -> Result<(), String> {
                         h.send(&Msg::Ack { id });
                         h.flush();
                         match rect {
+                            // An update that was already on its way when the screen was switched off.
+                            Ok(_) if state.display == DisplayMode::None => {
+                                ink.forget();
+                                ui.draw_home();
+                            }
                             Ok(r) => {
                                 if ui.overlays_phys().iter().any(|o| r.intersects(*o)) {
                                     ui.redraw_overlays();
                                 }
                                 display.show(&epd, r);
+                                ink.overwritten(&epd.fb, r);
                             }
                             Err(e) => log!("remdesktop: {e}"),
                         }
@@ -418,6 +467,7 @@ pub fn run(args: Args) -> Result<(), String> {
     ui.set_label(Button::Screen, "VIEW");
             ui.set_enabled(Button::Screen, false);
             // Streamed content would otherwise stay on the panel.
+            ink.forget();
             ui.draw_home();
         }
 
@@ -499,7 +549,21 @@ pub fn run(args: Args) -> Result<(), String> {
                                     state.save();
                                 }
                             }
-                            Button::Side | Button::Undo | Button::Redo => {}
+                            Button::Display => {
+                                state.display = state.display.next();
+                                log!("remdesktop: display is now {:?}", state.display);
+                                ui.set_label(b, display_label(state.display));
+                                state.save();
+                                if let Some(h) = host.as_mut() {
+                                    h.send(&Msg::Display { mode: state.display });
+                                }
+                                if state.display == DisplayMode::None {
+                                    // Streamed content would otherwise stay on the panel.
+                                    ink.forget();
+                                    ui.draw_home();
+                                }
+                            }
+                            Button::Side | Button::Undo | Button::Redo | Button::Ink | Button::Clear => {}
                             Button::Net => {
                                 if let Some(h) = host.as_mut().filter(|h| h.remote.is_some()) {
                                     log!("remdesktop: going remote via {}", h.remote.as_deref().unwrap_or(""));
@@ -560,6 +624,24 @@ pub fn run(args: Args) -> Result<(), String> {
                             }
                         }
                     }
+                }
+                if matches!(b, Button::Ink | Button::Clear) {
+                    // Act on touch.
+                    hold = Some((b, Instant::now(), true));
+                    if b == Button::Ink {
+                        ink.on = !ink.on;
+                        if !ink.on {
+                            clear_ink(&mut ink, &epd, &display);
+                        }
+                        log!("remdesktop: ink is now {}", if ink.on { "on" } else { "off" });
+                        ui.set_label(b, ink_label(ink.on));
+                        ui.set_enabled(Button::Clear, ink.on);
+                        state.ink = ink.on;
+                        state.save();
+                    } else {
+                        clear_ink(&mut ink, &epd, &display);
+                    }
+                    ui.set_progress(b, ui::HOLD_STEPS);
                 }
                 if b == Button::Side {
                     // Acts on touch: click the pen's side button where it is.
