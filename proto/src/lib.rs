@@ -7,7 +7,29 @@
 
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 8;
+pub const VERSION: u16 = 9;
+
+/// What the tablet's panel shows of the host's screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayMode {
+    /// The screen in gray.
+    #[default]
+    Normal,
+    /// Nothing streamed (input only).
+    None,
+    /// Just the outlines (edge detection), black on white, which stay
+    /// legible on e-paper.
+    Edge,
+}
+
+impl DisplayMode {
+    pub const ALL: [DisplayMode; 3] = [DisplayMode::Normal, DisplayMode::None, DisplayMode::Edge];
+
+    /// The mode after this one, in the order of `ALL`.
+    pub fn next(self) -> DisplayMode {
+        Self::ALL[(self as usize + 1) % Self::ALL.len()]
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Abs {
@@ -81,6 +103,9 @@ pub enum Msg {
     /// Host → tablet: Linux key codes that type `z` and `y` in the user's
     /// keyboard layout, for the undo/redo buttons (Ctrl + these).
     Keys { undo: u16, redo: u16 },
+    /// Tablet → host: what to show of the screen (sent after `Hello` and on
+    /// each change).
+    Display { mode: DisplayMode },
     /// The tablet is exiting on purpose (X button held, power button).
     Bye,
 }
@@ -102,6 +127,7 @@ const ADDRESSES: u8 = 14;
 const REMOTE_OK: u8 = 15;
 const GO_REMOTE: u8 = 16;
 const KEYS: u8 = 17;
+const DISPLAY: u8 = 18;
 
 impl Msg {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
@@ -208,6 +234,10 @@ impl Msg {
                 p.extend_from_slice(&redo.to_le_bytes());
                 KEYS
             }
+            Msg::Display { mode } => {
+                p.push(*mode as u8);
+                DISPLAY
+            }
         };
         w.write_all(&[tag])?;
         w.write_all(&(p.len() as u32).to_le_bytes())?;
@@ -284,6 +314,9 @@ impl Msg {
             REMOTE_OK => Msg::RemoteOk { addr: c.str()? },
             GO_REMOTE => Msg::GoRemote,
             KEYS => Msg::Keys { undo: c.u16()?, redo: c.u16()? },
+            DISPLAY => Msg::Display {
+                mode: *DisplayMode::ALL.get(c.u8()? as usize).ok_or_else(|| bad("unknown display mode"))?,
+            },
             t => return Err(bad(&format!("unknown message tag {t}"))),
         };
         Ok(Some(msg))
@@ -440,6 +473,7 @@ mod tests {
             Msg::RemoteOk { addr: "192.168.1.5".into() },
             Msg::GoRemote,
             Msg::Keys { undo: 53, redo: 20 },
+            Msg::Display { mode: DisplayMode::Edge },
             Msg::Bye,
         ];
         let mut buf = Vec::new();

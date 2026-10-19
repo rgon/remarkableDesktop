@@ -3,6 +3,7 @@
 
 mod capture;
 mod displayconfig;
+mod edges;
 mod gsettings;
 mod keymap;
 mod mapping;
@@ -12,13 +13,24 @@ mod stream;
 mod uinput;
 
 use mapping::Mapper;
-use remdesktop_proto::{Device, Msg};
+use remdesktop_proto::{Device, DisplayMode, Msg};
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Set while we act as `SSH_ASKPASS` for our own ssh children.
+const ASKPASS_ENV: &str = "REMDESKTOP_ASKPASS";
+/// SSH password for the tablet, also accepted from the environment. Only
+/// used when key login fails: ssh offers keys first.
+const PASSWORD_ENV: &str = "REMDESKTOP_SSH_PASSWORD";
+
+static PASSWORD: Mutex<Option<String>> = Mutex::new(None);
+/// The password is asked for at most once per run.
+static ASKED: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str = "usage: remdesktop-host [--ssh root@10.11.99.1] [--remote /home/root/remdesktop]
                        [--deploy <local remdesktop binary>] [--stats] [--no-usb] [--list-screens]
@@ -86,7 +98,49 @@ fn parse() -> Result<Args, String> {
     Ok(a)
 }
 
+/// Reads a line from the terminal with echo off.
+fn prompt_password(prompt: &str) -> Result<String, String> {
+    use std::io::{BufRead, BufReader};
+    use std::os::fd::AsRawFd;
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").map_err(|e| format!("no terminal to ask the password on: {e}"))?;
+    let fd = tty.as_raw_fd();
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+        return Err("cannot read terminal settings".into());
+    }
+    let mut quiet = saved;
+    quiet.c_lflag &= !libc::ECHO;
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    (&tty).write_all(prompt.as_bytes()).ok();
+    let mut line = String::new();
+    let read = BufReader::new(&tty).read_line(&mut line);
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
+    (&tty).write_all(b"\n").ok();
+    read.map_err(|e| e.to_string())?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Makes `cmd` (ssh or scp) log in with the password, if there is one: ssh
+/// runs this binary as its askpass helper, which prints it back.
+fn with_auth(cmd: &mut Command) -> &mut Command {
+    match PASSWORD.lock().unwrap().as_ref() {
+        Some(pw) => {
+            let me = std::env::current_exe().unwrap_or_else(|_| "remdesktop-host".into());
+            cmd.env("SSH_ASKPASS", me)
+                .env("SSH_ASKPASS_REQUIRE", "force")
+                .env(ASKPASS_ENV, "1")
+                .env(PASSWORD_ENV, pw)
+                .args(["-o", "BatchMode=no", "-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=publickey,password,keyboard-interactive"])
+        }
+        None => cmd.args(["-o", "BatchMode=yes"]),
+    }
+}
+
 fn main() -> ExitCode {
+    if std::env::var_os(ASKPASS_ENV).is_some() {
+        println!("{}", std::env::var(PASSWORD_ENV).unwrap_or_default());
+        return ExitCode::SUCCESS;
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -104,11 +158,43 @@ fn send(w: &Writer, msg: &Msg) -> std::io::Result<()> {
     w.flush()
 }
 
-/// Runs a command on the tablet; its stdout on success.
+/// Asks for the tablet's password, once, after key login was refused.
+/// False if there is nobody to ask or it was asked already.
+fn ask_password(target: &str) -> bool {
+    if ASKED.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    eprintln!("remdesktop-host: {target} refused our ssh key");
+    match prompt_password(&format!("{target}'s password: ")) {
+        Ok(pw) if !pw.is_empty() => {
+            *PASSWORD.lock().unwrap() = Some(pw);
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            eprintln!("remdesktop-host: {e}");
+            false
+        }
+    }
+}
+
+/// Runs a command on the tablet; its stdout on success. Logs in with the
+/// key, and falls back to a password if the key is refused.
 fn ssh(target: &str, cmd: &str) -> Result<String, String> {
-    let out = Command::new("ssh")
-        // Keepalives: a call caught by USB re-enumeration fails fast instead of hanging.
-        .args(["-T", "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "-o", "BatchMode=yes", target, cmd])
+    let first = ssh_once(target, cmd);
+    let have_password = PASSWORD.lock().unwrap().is_some();
+    match first {
+        Err(e) if e.contains("Permission denied") && !have_password && ask_password(target) => ssh_once(target, cmd),
+        other => other,
+    }
+}
+
+fn ssh_once(target: &str, cmd: &str) -> Result<String, String> {
+    let mut ssh = Command::new("ssh");
+    // Keepalives: a call caught by USB re-enumeration fails fast instead of hanging.
+    ssh.args(["-T", "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2"]);
+    let out = with_auth(&mut ssh)
+        .args([target, cmd])
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("ssh: {e}"))?;
@@ -139,6 +225,7 @@ fn find_session(args: &Args, wait: Duration) -> Result<(SocketAddr, [u8; 16]), S
                 return Ok((SocketAddr::new(ip, port), t));
             }
             Err(e) if e.contains("not running") => return Err("remdesktop is not running on the tablet".into()),
+            Err(e) if e.contains("Permission denied") => return Err(format!("ssh login refused: {e}")),
             Err(e) => last = e,
         }
         if std::time::Instant::now() > deadline {
@@ -247,10 +334,15 @@ fn remap(devices: &mut HashMap<u8, Virtual>, screens: &[outputs::Output], target
 
 fn run() -> Result<(), String> {
     let args = parse()?;
+    if let Some(pw) = std::env::var(PASSWORD_ENV).ok().filter(|p| !p.is_empty()) {
+        *PASSWORD.lock().unwrap() = Some(pw);
+    }
     if let Some(local) = &args.deploy {
+        // Log in first, so a password is asked for here and scp can reuse it.
+        ssh(&args.ssh, "true")?;
         // Copy beside, then rename: the running binary can't be overwritten.
         let tmp = format!("{}.new", args.remote);
-        let status = Command::new("scp").args(["-q", "-O", local, &format!("{}:{tmp}", args.ssh)]).status().map_err(|e| format!("scp: {e}"))?;
+        let status = with_auth(Command::new("scp").args(["-q", "-O"])).args([local, &format!("{}:{tmp}", args.ssh)]).status().map_err(|e| format!("scp: {e}"))?;
         if !status.success() {
             return Err("deploy failed".into());
         }
@@ -392,6 +484,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
     let mut logical = (0u32, 0u32);
     let mut streamer: Option<stream::Streamer> = None;
     let mut status = TabletStatus::default();
+    let mut display_mode = DisplayMode::Normal;
     // Messages we feed ourselves (resuming the tablet's saved view).
     let mut queued: std::collections::VecDeque<Msg> = Default::default();
     // Undo/redo keys for the current keyboard layout, re-checked now and then
@@ -459,6 +552,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
                     if initial == 0 {
                         s.set_source(Some(capture::Source::Virtual), mapping::FULL);
                     }
+                    s.set_mode(display_mode);
                     streamer = Some(s);
                 }
                 if initial != 0 {
@@ -526,6 +620,13 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
                     if status.usb_hid {
                         remap_hid(&writer, &screens, &target, gs, status);
                     }
+                }
+            }
+            Ok(Some(Msg::Display { mode })) => {
+                eprintln!("remdesktop-host: display is now {mode:?}");
+                display_mode = mode;
+                if let Some(s) = &streamer {
+                    s.set_mode(mode);
                 }
             }
             Ok(Some(Msg::Ack { id })) => {

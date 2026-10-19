@@ -3,7 +3,8 @@
 //! so no queue (and no latency) builds up on the slow e-ink side.
 
 use crate::capture::{Capture, Source};
-use remdesktop_proto::{Msg, gray4};
+use crate::edges;
+use remdesktop_proto::{DisplayMode, Msg, gray4};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,8 +16,12 @@ struct Shared {
     /// screen); the rest is letterbox, painted white.
     shown: [f64; 4],
     generation: u64,
-    /// Newest frame as gray levels, the generation it belongs to, and when
-    /// it was read from the capture pipeline.
+    /// What the tablet shows. Capture keeps running while it is `None`
+    /// (stopping it would remove the virtual monitor); nothing is sent.
+    mode: DisplayMode,
+    /// Newest frame as gray levels, the epoch it belongs to (it changes with
+    /// the source and the mode, and the next update is then a whole frame),
+    /// and when it was read from the capture pipeline.
     frame: Option<(u64, Vec<u8>, Instant)>,
     fresh: bool,
     acked: bool,
@@ -132,13 +137,19 @@ impl Streamer {
             let (lock, cv) = &*cap_shared;
             let mut current: Option<(u64, Capture)> = None;
             let mut raw = vec![];
+            // `raw` holds a frame of this generation that is not yet rendered.
+            let mut raw_new = false;
+            let mut raw_for: Option<u64> = None;
+            let mut rendered_as: Option<(u64, DisplayMode)> = None;
+            let mut epoch = 0u64;
+            let mut captured_at = Instant::now();
             loop {
-                let (wanted, generation, shown) = {
+                let (wanted, generation, shown, mode) = {
                     let s = lock.lock().unwrap();
                     if s.stop {
                         return;
                     }
-                    (s.source.clone(), s.generation, s.shown)
+                    (s.source.clone(), s.generation, s.shown, s.mode)
                 };
                 if current.as_ref().map(|c| c.0) != Some(generation) {
                     current = None; // stops the old stream (and removes a virtual monitor)
@@ -164,13 +175,10 @@ impl Streamer {
                 let (_, cap) = current.as_mut().unwrap();
                 match cap.next_frame(&mut raw, Duration::from_millis(100)) {
                     Ok(true) => {
-                        let at = Instant::now();
+                        captured_at = Instant::now();
                         whiten_bars(&mut raw, logical, rotation, shown);
-                        let levels: Vec<u8> = raw.iter().map(|&v| gray4::level(v)).collect();
-                        let mut s = lock.lock().unwrap();
-                        s.frame = Some((generation, levels, at));
-                        s.fresh = true;
-                        cv.notify_all();
+                        raw_for = Some(generation);
+                        raw_new = true;
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -178,6 +186,25 @@ impl Streamer {
                         current = None;
                         std::thread::sleep(Duration::from_secs(1));
                     }
+                }
+                // Render a new frame, or the last one again after a mode change
+                // (Mutter sends frames only when the screen changes).
+                let wanted_look = (generation, mode);
+                if raw_for == Some(generation) && (raw_new || rendered_as != Some(wanted_look)) {
+                    if rendered_as != Some(wanted_look) {
+                        rendered_as = Some(wanted_look);
+                        epoch += 1;
+                    }
+                    raw_new = false;
+                    let (pw, ph) = if rotation % 180 == 90 { (logical.1 as usize, logical.0 as usize) } else { (logical.0 as usize, logical.1 as usize) };
+                    let levels: Vec<u8> = match mode {
+                        DisplayMode::Edge => edges::detect(&raw, pw, ph).iter().map(|&v| gray4::level(v)).collect(),
+                        _ => raw.iter().map(|&v| gray4::level(v)).collect(),
+                    };
+                    let mut s = lock.lock().unwrap();
+                    s.frame = Some((epoch, levels, captured_at));
+                    s.fresh = true;
+                    cv.notify_all();
                 }
             }
         });
@@ -199,6 +226,11 @@ impl Streamer {
                         return;
                     }
                     s.fresh = false;
+                    if s.mode == DisplayMode::None {
+                        // Nothing is sent; whatever comes after starts from a whole frame.
+                        last = None;
+                        continue;
+                    }
                     s.frame.clone().unwrap()
                 };
                 if frame.len() != w * h {
@@ -239,6 +271,15 @@ impl Streamer {
         s.source = source;
         s.shown = shown;
         s.generation += 1;
+        s.acked = true;
+        cv.notify_all();
+    }
+
+    /// Switches between the screen, its edges, and nothing at all.
+    pub fn set_mode(&self, mode: DisplayMode) {
+        let (lock, cv) = &*self.shared;
+        let mut s = lock.lock().unwrap();
+        s.mode = mode;
         s.acked = true;
         cv.notify_all();
     }
