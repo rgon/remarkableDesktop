@@ -19,6 +19,29 @@ case $target in *@*) ;; *) target=root@$target ;; esac
 
 ssh_t() { ssh -o ConnectTimeout=5 -o ServerAliveInterval=1 -o ServerAliveCountMax=3 "$target" "$@"; }
 
+# Key login first; only if the tablet refuses the key, ask for the password
+# once and feed it to every later ssh/scp through SSH_ASKPASS.
+asked=no
+ensure_login() {
+    [ "$asked" = no ] || return 0
+    err=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$target" true 2>&1) && return 0
+    case $err in *"Permission denied"*) ;; *) return 0 ;; esac
+    asked=yes
+    [ -t 0 ] || { echo "ssh key refused, and no terminal to ask for a password on" >&2; return 0; }
+    printf '%s refused our ssh key; password: ' "$target" >&2
+    stty -echo
+    read -r REMDESKTOP_SSH_PASSWORD
+    stty echo
+    echo >&2
+    export REMDESKTOP_SSH_PASSWORD
+    askpass=$(mktemp)
+    chmod 700 "$askpass"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$REMDESKTOP_SSH_PASSWORD"\n' >"$askpass"
+    trap 'rm -f "$askpass"' EXIT
+    export SSH_ASKPASS=$askpass SSH_ASKPASS_REQUIRE=force
+}
+
+ensure_login
 arch=$(ssh_t uname -m)
 case $arch in
     armv7l) bin=$here/tablet/remdesktop-armv7 ;;

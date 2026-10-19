@@ -34,6 +34,27 @@ tablet_target() {
     esac
 }
 
+# Key login first; only if the tablet refuses the key, ask for the password
+# once and feed it to every later ssh/scp through SSH_ASKPASS.
+asked=no
+ensure_login() {
+    [ "$asked" = no ] || return 0
+    err=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$RM" true 2>&1) && return 0
+    case $err in *"Permission denied"*) ;; *) return 0 ;; esac
+    asked=yes
+    [ -t 0 ] || { echo "ssh key refused, and no terminal to ask for a password on" >&2; return 0; }
+    printf '%s refused our ssh key; password: ' "$RM" >&2
+    read -rs REMDESKTOP_SSH_PASSWORD
+    echo >&2
+    export REMDESKTOP_SSH_PASSWORD
+    askpass=$(mktemp)
+    chmod 700 "$askpass"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$REMDESKTOP_SSH_PASSWORD"\n' >"$askpass"
+    trap 'rm -f "$askpass"' EXIT
+    export SSH_ASKPASS=$askpass SSH_ASKPASS_REQUIRE=force
+    SSH=("${SSH[@]/BatchMode=yes/BatchMode=no}")
+}
+
 build() {
     wait_ssh
     TARGET=$(tablet_target)
@@ -45,6 +66,7 @@ build() {
 wait_ssh() {
     for _ in $(seq 60); do
         "${SSH[@]}" true 2>/dev/null && return
+        ensure_login
         sleep 1
     done
     echo "tablet unreachable at $RM" >&2
