@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.11.3](https://github.com/rgon/remarkableDesktop/compare/v0.11.2...v0.11.3) (2026-10-19)
+
+
+### Features
+
+* add a pen ink preview with INK and CLR buttons and a display mode button on the tablet ([7a98790](https://github.com/rgon/remarkableDesktop/commit/7a987906b295f52af01dbe73058a2e422ae3de25))
+* ask for the tablet's ssh password when key login is refused in run.sh and install.sh ([c11f782](https://github.com/rgon/remarkableDesktop/commit/c11f78253562175bd5652515004d7a7f00802785))
+* build tablet binaries in CI and bundle an install command in the AppImage ([2bf889a](https://github.com/rgon/remarkableDesktop/commit/2bf889a806cb26d5584e8d7788f5c17a777d4b58))
+* stream display modes (normal, off, edge outlines) and ask for the ssh password in the host ([4d9e200](https://github.com/rgon/remarkableDesktop/commit/4d9e20034101faa0c64ab9dda90af82857173ee8))
+
+
+### Bug Fixes
+
+* set ARCH for appimagetool so the bundled tablet binaries don't confuse it ([732ab0d](https://github.com/rgon/remarkableDesktop/commit/732ab0dbb290eb32311c54c1dc512f0369f636fd))
+
 ## [0.11.2](https://github.com/rgon/remarkableDesktop/compare/v0.11.1...v0.11.2) (2026-10-08)
 
 
