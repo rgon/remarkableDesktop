@@ -36,8 +36,11 @@ if [ ! -x "$linuxdeploy" ]; then
     chmod +x "$linuxdeploy"
 fi
 
-# Extract-and-run so the build needs no FUSE.
+# Extract-and-run so the build needs no FUSE. ARCH is explicit because the
+# bundled ARM tablet binaries would otherwise make appimagetool find several
+# architectures in the AppDir.
 APPIMAGE_EXTRACT_AND_RUN=1 \
+ARCH=$arch \
 OUTPUT="dist/remdesktop-$version-$arch.AppImage" \
 LINUXDEPLOY_OUTPUT_VERSION="$version" \
 "$linuxdeploy" \
