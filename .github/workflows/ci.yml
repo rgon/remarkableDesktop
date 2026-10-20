@@ -44,7 +44,7 @@ jobs:
           cargo zigbuild -p remdesktop-tablet --release --target ${{ matrix.target }}.2.31
           cp target/${{ matrix.target }}/release/remdesktop remdesktop-${{ matrix.arch }}
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: tablet-${{ matrix.arch }}
           path: remdesktop-${{ matrix.arch }}
@@ -68,7 +68,7 @@ jobs:
       - name: Run tests
         run: cargo test --release -p remdesktop-proto -p remdesktop-host
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           pattern: tablet-*
           path: tablet-bin
@@ -81,7 +81,7 @@ jobs:
         run: bash scripts/build-appimage.sh
 
       - name: Stage AppImage for the release job
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: dist/*.AppImage
           key: remdesktop-appimage-${{ github.sha }}
@@ -114,7 +114,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Restore AppImage
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: dist/*.AppImage
           key: remdesktop-appimage-${{ github.sha }}
