@@ -10,7 +10,7 @@
 #
 # Tablet options: --rotate 0|90|180|270  --touch touchpad|touchscreen  --pen tablet|mouse
 #   --no-usb  --palm-major N  --pen-grace-ms N  --log-touch
-#   --fast-mode M  --settle-mode M  --settle-ms N
+#   --fast-mode M  --settle-mode M  (host: --settle-ms N)
 # Client options: --stats  --no-display  --list-screens (the client passes tablet
 #   options on when it starts the tablet side).
 # Before the client starts, checks that /dev/uinput is writable (needed for

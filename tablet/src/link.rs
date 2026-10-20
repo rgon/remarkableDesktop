@@ -136,9 +136,9 @@ impl Link {
             let mut decoder = Decoder::new();
             loop {
                 let item = match Msg::read_from(&mut source) {
-                    Ok(Some(Msg::Rect { id, x, y, w, h, data })) => {
+                    Ok(Some(Msg::Rect { id, x, y, w, h, flags, data })) => {
                         let r = Rect { x: x as i32, y: y as i32, w: w as i32, h: h as i32 };
-                        Incoming::Decoded { id, rect: decoder.write(&fb, r, &data) }
+                        Incoming::Decoded { id, flags, rect: decoder.write(&fb, r, flags, &data) }
                     }
                     Ok(Some(m)) => Incoming::Msg(m),
                     Ok(None) | Err(_) => Incoming::Closed,
@@ -273,7 +273,7 @@ pub fn network_addresses() -> Vec<String> {
 pub enum Incoming {
     Msg(Msg),
     /// A screen update already in the framebuffer, ready to refresh.
-    Decoded { id: u32, rect: Result<Rect, String> },
+    Decoded { id: u32, flags: u8, rect: Result<Rect, String> },
     Closed,
 }
 
