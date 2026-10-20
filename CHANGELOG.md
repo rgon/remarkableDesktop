@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.7](https://github.com/rgon/remarkableDesktop/compare/v0.11.6...v0.11.7) (2026-10-20)
+
+
+### Performance Improvements
+
+* ack the tablet's update after its refresh and report where the latency goes ([12c765b](https://github.com/rgon/remarkableDesktop/commit/12c765b0169295bb5ddf17be8bf98fba68b95ab3))
+* render a captured edge frame only when the sender is free to take it ([3c87967](https://github.com/rgon/remarkableDesktop/commit/3c8796733cc7a933d9cebacf712b0be1b6efcacf))
+
 ## [0.11.6](https://github.com/rgon/remarkableDesktop/compare/v0.11.5...v0.11.6) (2026-10-20)
 
 
