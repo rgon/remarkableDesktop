@@ -125,6 +125,17 @@ impl Capture {
         }
         buf.resize(self.width * self.height, 0);
         self.out.read_exact(buf)?;
+        // While we were busy, GStreamer sat blocked writing its next frame
+        // into the pipe, so that frame is as old as our busy time. Whatever is
+        // already waiting is newer than what we hold: take it instead (a few
+        // at most, as frames keep coming while the screen changes).
+        for _ in 0..4 {
+            let mut more = libc::pollfd { fd: self.out.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut more, 1, 0) } <= 0 {
+                break;
+            }
+            self.out.read_exact(buf)?;
+        }
         Ok(true)
     }
 

@@ -60,61 +60,125 @@ pub fn detect(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// are 8-connected, so a 4-connected fill cannot slip through a diagonal
 /// step. A region is black when its mean gray is below `DARK`.
 fn fill_dark(gray: &[u8], out: &mut [u8], w: usize, h: usize) {
-    let mut seen = vec![false; w * h];
-    let mut stack = Vec::new();
-    let mut region = Vec::new();
-    for start in 0..w * h {
-        if seen[start] || out[start] == 0 {
-            continue;
+    // Work on runs of non-edge pixels instead of single pixels: the regions
+    // are found by joining the runs of neighboring rows that overlap (4-connectivity).
+    let mut runs: Vec<(u32, u32)> = vec![]; // x0..x1 within its row
+    let mut row_start = Vec::with_capacity(h + 1);
+    let mut sum: Vec<u64> = vec![];
+    for y in 0..h {
+        row_start.push(runs.len());
+        let row = &out[y * w..][..w];
+        let g = &gray[y * w..][..w];
+        let mut x = 0;
+        while x < w {
+            if row[x] == 0 {
+                x += 1;
+                continue;
+            }
+            let x0 = x;
+            let mut total = 0u64;
+            while x < w && row[x] != 0 {
+                total += g[x] as u64;
+                x += 1;
+            }
+            runs.push((x0 as u32, x as u32));
+            sum.push(total);
         }
-        seen[start] = true;
-        stack.push(start);
-        region.clear();
-        let mut sum = 0u64;
-        while let Some(i) = stack.pop() {
-            region.push(i);
-            sum += gray[i] as u64;
-            let (x, y) = (i % w, i / w);
-            let neighbors = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
-            for n in neighbors.into_iter().flatten() {
-                if !seen[n] && out[n] != 0 {
-                    seen[n] = true;
-                    stack.push(n);
+    }
+    row_start.push(runs.len());
+
+    let mut parent: Vec<u32> = (0..runs.len() as u32).collect();
+    fn find(parent: &mut [u32], mut i: u32) -> u32 {
+        while parent[i as usize] != i {
+            parent[i as usize] = parent[parent[i as usize] as usize];
+            i = parent[i as usize];
+        }
+        i
+    }
+    for y in 1..h {
+        let (mut p, p_end) = (row_start[y - 1], row_start[y]);
+        let (mut c, c_end) = (row_start[y], row_start[y + 1]);
+        while p < p_end && c < c_end {
+            let ((px0, px1), (cx0, cx1)) = (runs[p], runs[c]);
+            if px0 < cx1 && cx0 < px1 {
+                let (a, b) = (find(&mut parent, p as u32), find(&mut parent, c as u32));
+                if a != b {
+                    parent[b as usize] = a;
                 }
             }
+            if px1 < cx1 {
+                p += 1;
+            } else {
+                c += 1;
+            }
         }
-        if sum < DARK * region.len() as u64 {
-            for &i in &region {
-                out[i] = 0;
+    }
+
+    // Per region: the pixels it has and their gray.
+    let mut total = vec![(0u64, 0u64); runs.len()];
+    for i in 0..runs.len() {
+        let r = find(&mut parent, i as u32) as usize;
+        total[r].0 += sum[i];
+        total[r].1 += (runs[i].1 - runs[i].0) as u64;
+    }
+    for y in 0..h {
+        for i in row_start[y]..row_start[y + 1] {
+            let (gray_sum, count) = total[find(&mut parent, i as u32) as usize];
+            if gray_sum < DARK * count {
+                out[y * w + runs[i].0 as usize..y * w + runs[i].1 as usize].fill(0);
             }
         }
     }
 }
 
+/// Runs `f(first_row, rows_of_a, rows_of_b)` on bands of rows in parallel.
+fn par_rows<A: Send, B: Send>(w: usize, h: usize, a: &mut [A], b: &mut [B], f: impl Fn(usize, &mut [A], &mut [B]) + Sync) {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let rows = h.div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (i, (a, b)) in a.chunks_mut(rows * w).zip(b.chunks_mut(rows * w)).enumerate() {
+            let f = &f;
+            s.spawn(move || f(i * rows, a, b));
+        }
+    });
+}
+
 /// Separable 5-tap binomial blur (1 4 6 4 1) / 16, borders clamped.
 fn blur(src: &[u8], w: usize, h: usize) -> Vec<u8> {
-    const K: [u32; 5] = [1, 4, 6, 4, 1];
     let mut tmp = vec![0u8; w * h];
-    for y in 0..h {
-        let row = &src[y * w..][..w];
-        for x in 0..w {
-            let mut acc = 0;
-            for (i, k) in K.iter().enumerate() {
-                acc += k * row[(x + i).saturating_sub(2).min(w - 1)] as u32;
+    // Horizontal pass.
+    let mut none = vec![(); w * h];
+    par_rows(w, h, &mut tmp, &mut none, |y0, rows, _| {
+        for (r, dst) in rows.chunks_mut(w).enumerate() {
+            let row = &src[(y0 + r) * w..][..w];
+            let px = |x: isize| row[x.clamp(0, w as isize - 1) as usize] as u32;
+            let at = |x: usize| ((px(x as isize - 2) + 4 * px(x as isize - 1) + 6 * px(x as isize) + 4 * px(x as isize + 1) + px(x as isize + 2)) / 16) as u8;
+            for x in 0..2.min(w) {
+                dst[x] = at(x);
             }
-            tmp[y * w + x] = (acc / 16) as u8;
+            for x in w.saturating_sub(2).max(2)..w {
+                dst[x] = at(x);
+            }
+            // Inside, no clamping: a plain loop the compiler can vectorize.
+            if w > 4 {
+                for (x, d) in dst[2..w - 2].iter_mut().enumerate() {
+                    let t = &row[x..x + 5];
+                    *d = ((t[0] as u32 + 4 * t[1] as u32 + 6 * t[2] as u32 + 4 * t[3] as u32 + t[4] as u32) / 16) as u8;
+                }
+            }
         }
-    }
+    });
+    // Vertical pass.
     let mut out = vec![0u8; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = 0;
-            for (i, k) in K.iter().enumerate() {
-                acc += k * tmp[(y + i).saturating_sub(2).min(h - 1) * w + x] as u32;
+    par_rows(w, h, &mut out, &mut none, |y0, rows, _| {
+        for (r, dst) in rows.chunks_mut(w).enumerate() {
+            let line = |dy: isize| &tmp[((y0 + r) as isize + dy).clamp(0, h as isize - 1) as usize * w..][..w];
+            let (a, b, c, d, e) = (line(-2), line(-1), line(0), line(1), line(2));
+            for x in 0..w {
+                dst[x] = ((a[x] as u32 + 4 * b[x] as u32 + 6 * c[x] as u32 + 4 * d[x] as u32 + e[x] as u32) / 16) as u8;
             }
-            out[y * w + x] = (acc / 16) as u8;
         }
-    }
+    });
     out
 }
 
@@ -147,25 +211,32 @@ impl Dir {
 fn gradient(img: &[u8], w: usize, h: usize) -> (Vec<i32>, Vec<Dir>) {
     let mut mag = vec![0i32; w * h];
     let mut dir = vec![Dir::X; w * h];
-    let p = |x: usize, y: usize| img[y * w + x] as i32;
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            let gx = (p(x + 1, y - 1) + 2 * p(x + 1, y) + p(x + 1, y + 1)) - (p(x - 1, y - 1) + 2 * p(x - 1, y) + p(x - 1, y + 1));
-            let gy = (p(x - 1, y + 1) + 2 * p(x, y + 1) + p(x + 1, y + 1)) - (p(x - 1, y - 1) + 2 * p(x, y - 1) + p(x + 1, y - 1));
-            let (ax, ay) = (gx.abs(), gy.abs());
-            mag[y * w + x] = ax + ay;
-            // tan(22.5°) ≈ 0.414 separates the axes from the diagonals.
-            dir[y * w + x] = if ay * 1000 < ax * 414 {
-                Dir::X
-            } else if ax * 1000 < ay * 414 {
-                Dir::Y
-            } else if (gx > 0) == (gy > 0) {
-                Dir::Diag
-            } else {
-                Dir::Anti
-            };
+    par_rows(w, h, &mut mag, &mut dir, |y0, mag, dir| {
+        for (r, (mag, dir)) in mag.chunks_mut(w).zip(dir.chunks_mut(w)).enumerate() {
+            let y = y0 + r;
+            if y == 0 || y + 1 >= h {
+                continue;
+            }
+            let (up, mid, down) = (&img[(y - 1) * w..][..w], &img[y * w..][..w], &img[(y + 1) * w..][..w]);
+            for x in 1..w - 1 {
+                let p = |row: &[u8], dx: usize| row[x + dx - 1] as i32;
+                let gx = (p(up, 2) + 2 * p(mid, 2) + p(down, 2)) - (p(up, 0) + 2 * p(mid, 0) + p(down, 0));
+                let gy = (p(down, 0) + 2 * p(down, 1) + p(down, 2)) - (p(up, 0) + 2 * p(up, 1) + p(up, 2));
+                let (ax, ay) = (gx.abs(), gy.abs());
+                mag[x] = ax + ay;
+                // tan(22.5°) ≈ 0.414 separates the axes from the diagonals.
+                dir[x] = if ay * 1000 < ax * 414 {
+                    Dir::X
+                } else if ax * 1000 < ay * 414 {
+                    Dir::Y
+                } else if (gx > 0) == (gy > 0) {
+                    Dir::Diag
+                } else {
+                    Dir::Anti
+                };
+            }
         }
-    }
+    });
     (mag, dir)
 }
 
@@ -173,25 +244,32 @@ fn gradient(img: &[u8], w: usize, h: usize) -> (Vec<i32>, Vec<Dir>) {
 /// are one pixel wide. Everything below `LOW` is dropped here too.
 fn suppress(mag: &[i32], dir: &[Dir], w: usize, h: usize) -> Vec<i32> {
     let mut out = vec![0i32; w * h];
-    for y in 1..h - 1 {
-        for x in 1..w - 1 {
-            let i = y * w + x;
-            let m = mag[i];
-            if m < LOW {
+    let mut none = vec![(); w * h];
+    par_rows(w, h, &mut out, &mut none, |y0, rows, _| {
+        for (r, dst) in rows.chunks_mut(w).enumerate() {
+            let y = y0 + r;
+            if y == 0 || y + 1 >= h {
                 continue;
             }
-            let (a, b) = match dir[i] {
-                Dir::X => (i - 1, i + 1),
-                Dir::Y => (i - w, i + w),
-                Dir::Diag => (i - w - 1, i + w + 1),
-                Dir::Anti => (i - w + 1, i + w - 1),
-            };
-            // `>` on one side and `>=` on the other: a plateau keeps one pixel.
-            if m > mag[a] && m >= mag[b] {
-                out[i] = m;
+            for x in 1..w - 1 {
+                let i = y * w + x;
+                let m = mag[i];
+                if m < LOW {
+                    continue;
+                }
+                let (a, b) = match dir[i] {
+                    Dir::X => (i - 1, i + 1),
+                    Dir::Y => (i - w, i + w),
+                    Dir::Diag => (i - w - 1, i + w + 1),
+                    Dir::Anti => (i - w + 1, i + w - 1),
+                };
+                // `>` on one side and `>=` on the other: a plateau keeps one pixel.
+                if m > mag[a] && m >= mag[b] {
+                    dst[x] = m;
+                }
             }
         }
-    }
+    });
     out
 }
 
