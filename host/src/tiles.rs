@@ -5,7 +5,7 @@
 
 /// Tile edge in pixels. Even, so rectangles stay on whole bytes of the
 /// 4-bit packing.
-const TILE: usize = 32;
+pub const TILE: usize = 32;
 /// Most rectangles per update: each is a separate panel refresh.
 const MAX_RECTS: usize = 8;
 /// More runs than this and merging them pair by pair costs more than it saves.

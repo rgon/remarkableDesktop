@@ -46,6 +46,17 @@ pub(crate) fn threshold(gray: &[u8], out: &mut [u8]) {
     }
 }
 
+/// One frame's outline.
+pub struct Detected {
+    /// 0 on an outline pixel or a dark one, 255 elsewhere.
+    pub pixels: Vec<u8>,
+    /// Whether the GPU made it, so the previous such frame is what `dirty` is against.
+    pub on_gpu: bool,
+    /// Which tiles (the grid of `tiles.rs`) differ from the previous frame
+    /// of the GPU, if there was one.
+    pub dirty: Option<Vec<bool>>,
+}
+
 enum Backend {
     /// Not tried yet (or the size changed).
     Untried,
@@ -58,7 +69,7 @@ impl Detector {
         Detector { backend: Backend::Untried }
     }
 
-    pub fn detect(&mut self, gray: &[u8], w: usize, h: usize) -> Vec<u8> {
+    pub fn detect(&mut self, gray: &[u8], w: usize, h: usize) -> Detected {
         if matches!(&self.backend, Backend::Gpu(g) if g.size() != (w, h)) {
             self.backend = Backend::Untried;
         }
@@ -84,7 +95,7 @@ impl Detector {
         };
         match gpu_result {
             // The GPU applied the threshold itself.
-            Some(Ok(out)) => out,
+            Some(Ok(o)) => Detected { pixels: o.pixels, on_gpu: true, dirty: o.dirty },
             Some(Err(e)) => {
                 eprintln!("remdesktop-host: the GPU failed ({e}); edge detection on the CPU from now on");
                 self.backend = Backend::Cpu;
@@ -94,12 +105,12 @@ impl Detector {
         }
     }
 
-    fn cpu(&self, gray: &[u8], w: usize, h: usize) -> Vec<u8> {
-        let mut out = outline(gray, w, h);
+    fn cpu(&self, gray: &[u8], w: usize, h: usize) -> Detected {
+        let mut pixels = outline(gray, w, h);
         if usable(gray, w, h) {
-            threshold(gray, &mut out);
+            threshold(gray, &mut pixels);
         }
-        out
+        Detected { pixels, on_gpu: false, dirty: None }
     }
 }
 

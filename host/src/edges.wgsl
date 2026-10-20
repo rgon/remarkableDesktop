@@ -28,6 +28,14 @@ struct Params {
 @group(0) @binding(6) var<storage, read_write> buf_changed: atomic<u32>;
 @group(0) @binding(7) var<storage, read_write> buf_result: array<u32>;
 @group(0) @binding(8) var<storage, read> prm: Params;
+// One flag per tile of the grid in tiles.rs: set when the outline differs
+// from the previous frame's anywhere in it.
+@group(0) @binding(9) var<storage, read_write> buf_tiles: array<atomic<u32>>;
+// The previous frame's outline (copied from buf_out when a frame is done).
+@group(0) @binding(10) var<storage, read> buf_prev: array<u32>;
+
+// Must equal tiles::TILE.
+const TILE: u32 = 32u;
 
 const LOW: i32 = 96;
 const HIGH: i32 = 240;
@@ -229,6 +237,20 @@ fn dark_px(@builtin(global_invocation_id) g: vec3<u32>) {
     let i = g.y * w + g.x;
     if (gray(i) < prm.dark) {
         buf_out[i] = 0u;
+    }
+}
+
+// Which tiles changed since the previous frame.
+@compute @workgroup_size(16, 16)
+fn diff_tiles(@builtin(global_invocation_id) g: vec3<u32>) {
+    let w = prm.w;
+    if (g.x >= w || g.y >= prm.h) {
+        return;
+    }
+    let i = g.y * w + g.x;
+    if ((buf_out[i] & 255u) != (buf_prev[i] & 255u)) {
+        let cols = (w + TILE - 1u) / TILE;
+        atomicStore(&buf_tiles[(g.y / TILE) * cols + g.x / TILE], 1u);
     }
 }
 

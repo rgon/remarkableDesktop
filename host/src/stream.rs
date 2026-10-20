@@ -27,7 +27,9 @@ struct Shared {
     /// the source and the mode, and the next update is then a whole frame),
     /// when it was read from the capture pipeline, and the mode it was
     /// rendered for.
-    frame: Option<(u64, Vec<u8>, Instant, DisplayMode)>,
+    frame: Option<Published>,
+    /// Sequence number of the frame the sender took last.
+    sent_seq: u64,
     fresh: bool,
     acked: bool,
     /// Set when a capture (re)started; carries the virtual monitor's name.
@@ -36,6 +38,20 @@ struct Shared {
     /// The update in flight: id, capture time, size in bytes.
     in_flight: Option<(u32, Instant, usize)>,
     stats: Option<DisplayStats>,
+}
+
+/// A frame as the capture thread hands it over.
+#[derive(Clone)]
+struct Published {
+    epoch: u64,
+    levels: Vec<u8>,
+    captured: Instant,
+    mode: DisplayMode,
+    /// Counts the frames made.
+    seq: u64,
+    /// The tiles that differ from frame number `.0`, as the GPU found out
+    /// (known only when frames came out of it one after the other).
+    dirty: Option<(u64, Vec<bool>)>,
 }
 
 /// Capture → tablet-ack latency of screen updates, reported every 2 s.
@@ -128,6 +144,12 @@ impl Streamer {
             let mut rendered_as: Option<(u64, DisplayMode)> = None;
             let mut epoch = 0u64;
             let mut captured_at = Instant::now();
+            // Frames made, and what the GPU says changed since the one the
+            // sender last took: the changes of every frame since, joined.
+            let mut seq = 0u64;
+            let mut gpu_seq: Option<u64> = None;
+            let mut acc: Vec<bool> = vec![];
+            let mut acc_base: Option<u64> = None;
             loop {
                 let (wanted, generation, shown, mode) = {
                     let s = lock.lock().unwrap();
@@ -182,12 +204,38 @@ impl Streamer {
                     }
                     raw_new = false;
                     let (pw, ph) = if rotation % 180 == 90 { (logical.1 as usize, logical.0 as usize) } else { (logical.0 as usize, logical.1 as usize) };
-                    let levels: Vec<u8> = match mode {
-                        DisplayMode::Edge => detector.detect(&raw, pw, ph).iter().map(|&v| gray4::level(v)).collect(),
-                        _ => raw.iter().map(|&v| gray4::level(v)).collect(),
+                    let (levels, on_gpu, tiles_changed): (Vec<u8>, bool, Option<Vec<bool>>) = match mode {
+                        DisplayMode::Edge => {
+                            let d = detector.detect(&raw, pw, ph);
+                            (d.pixels.iter().map(|&v| gray4::level(v)).collect(), d.on_gpu, d.dirty)
+                        }
+                        _ => (raw.iter().map(|&v| gray4::level(v)).collect(), false, None),
                     };
+                    seq += 1;
                     let mut s = lock.lock().unwrap();
-                    s.frame = Some((epoch, levels, captured_at, mode));
+                    let mut dirty = None;
+                    match tiles_changed {
+                        // Only against the frame right before, which the GPU also made.
+                        Some(d) if gpu_seq == Some(seq - 1) => {
+                            if acc_base != Some(s.sent_seq) {
+                                // The sender took a frame since: count from it, if it was the one before.
+                                if s.sent_seq == seq - 1 {
+                                    acc.clear();
+                                    acc.resize(d.len(), false);
+                                    acc_base = Some(s.sent_seq);
+                                } else {
+                                    acc_base = None;
+                                }
+                            }
+                            if let Some(base) = acc_base {
+                                acc.iter_mut().zip(&d).for_each(|(a, &b)| *a |= b);
+                                dirty = Some((base, acc.clone()));
+                            }
+                        }
+                        _ => acc_base = None,
+                    }
+                    gpu_seq = on_gpu.then_some(seq);
+                    s.frame = Some(Published { epoch, levels, captured: captured_at, mode, seq, dirty });
                     s.fresh = true;
                     cv.notify_all();
                 }
@@ -200,7 +248,8 @@ impl Streamer {
             let (pw, ph) = if rotation % 180 == 90 { (logical.1, logical.0) } else { logical };
             let (w, h) = (pw as usize, ph as usize);
             let grid = Grid::new(w, h);
-            let mut last: Option<(u64, Vec<u8>)> = None;
+            // The epoch, the content and the sequence number of the frame sent last.
+            let mut last: Option<(u64, Vec<u8>, u64)> = None;
             // When each tile last changed, until it got its quality refresh.
             let mut unsettled: Vec<Option<Instant>> = vec![None; grid.tiles()];
             let mut id = 0u32;
@@ -240,7 +289,7 @@ impl Streamer {
             loop {
                 let settle_at = unsettled.iter().flatten().min().map(|t| *t + settle_after);
                 enum Work {
-                    Frame((u64, Vec<u8>, Instant, DisplayMode)),
+                    Frame(Published),
                     Settle,
                 }
                 let work = {
@@ -257,7 +306,9 @@ impl Streamer {
                                 unsettled.fill(None);
                                 continue;
                             }
-                            break Work::Frame(s.frame.clone().unwrap());
+                            let frame = s.frame.clone().unwrap();
+                            s.sent_seq = frame.seq;
+                            break Work::Frame(frame);
                         }
                         let now = Instant::now();
                         match settle_at {
@@ -268,17 +319,23 @@ impl Streamer {
                     }
                 };
                 match work {
-                    Work::Frame((generation, frame, captured, mode)) => {
+                    Work::Frame(Published { epoch: generation, levels: frame, captured, mode, seq, dirty: gpu_dirty }) => {
                         if frame.len() != w * h {
                             continue;
                         }
-                        // A new source starts from a full frame.
-                        let dirty = match &last {
-                            Some((g, prev)) if *g == generation => grid.dirty(prev, &frame),
+                        // A new source starts from a full frame. The GPU's
+                        // answer is good when it is against the frame we sent last.
+                        let dirty = match (&last, gpu_dirty) {
+                            (Some((g, _, sent)), Some((base, d))) if *g == generation && *sent == base && d.len() == grid.tiles() => d,
+                            (Some((g, prev, _)), _) if *g == generation => grid.dirty(prev, &frame),
                             _ => vec![true; grid.tiles()],
                         };
                         let rects = if dirty.iter().all(|&d| d) { vec![(0, 0, w, h)] } else { grid.rects(&dirty) };
                         if rects.is_empty() {
+                            // Same picture as the one sent last.
+                            if let Some(l) = &mut last {
+                                l.2 = seq;
+                            }
                             continue;
                         }
                         if !send_rects(&rects, &frame, mode, 0, Some(captured)) {
@@ -288,10 +345,10 @@ impl Streamer {
                         for (t, _) in dirty.iter().enumerate().filter(|(_, d)| **d) {
                             unsettled[t] = Some(now);
                         }
-                        last = Some((generation, frame));
+                        last = Some((generation, frame, seq));
                     }
                     Work::Settle => {
-                        let Some((_, frame)) = &last else {
+                        let Some((_, frame, _)) = &last else {
                             unsettled.fill(None);
                             continue;
                         };
