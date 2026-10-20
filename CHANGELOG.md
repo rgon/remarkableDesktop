@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.5](https://github.com/rgon/remarkableDesktop/compare/v0.11.4...v0.11.5) (2026-10-20)
+
+
+### Features
+
+* drop the "remote controlling" banner from the tablet's screen ([ba5c02e](https://github.com/rgon/remarkableDesktop/commit/ba5c02ecd744ce11cf07e4ba2164823605603d11))
+* host-driven tile updates, settle refresh and 1-bit edge frames ([d6f863d](https://github.com/rgon/remarkableDesktop/commit/d6f863deb3f08d72f2b572134f9979239adc2780))
+* reject a resting palm in touchpad mode when another finger lands ([c88d0f0](https://github.com/rgon/remarkableDesktop/commit/c88d0f034f19b4c3bf816e82a4d533c762405996))
+
+
+### Bug Fixes
+
+* draw edges one pixel wide on the darker side ([c876d90](https://github.com/rgon/remarkableDesktop/commit/c876d90c6c742d340653746c5907bf4a1eda23e0))
+
+
+### Performance Improvements
+
+* cut input latency and send pen and touch over UDP on Wi-Fi ([fc6c5b6](https://github.com/rgon/remarkableDesktop/commit/fc6c5b6494892eec3a0d6fe3ac09a97214a26b51))
+
 ## [0.11.4](https://github.com/rgon/remarkableDesktop/compare/v0.11.3...v0.11.4) (2026-10-20)
 
 
