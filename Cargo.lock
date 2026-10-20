@@ -710,7 +710,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "remdesktop-host"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "ash",
  "libc",
@@ -725,14 +725,14 @@ dependencies = [
 
 [[package]]
 name = "remdesktop-proto"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "remdesktop-tablet"
-version = "0.11.6"
+version = "0.11.7"
 dependencies = [
  "embedded-graphics",
  "libc",
