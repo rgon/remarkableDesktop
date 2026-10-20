@@ -199,6 +199,8 @@ impl Streamer {
             let mut gpu_seq: Option<u64> = None;
             let mut acc: Vec<bool> = vec![];
             let mut acc_base: Option<u64> = None;
+            // When the last frame was rendered.
+            let mut rendered_at = Instant::now();
             loop {
                 let (wanted, generation, shown, mode) = {
                     let s = lock.lock().unwrap();
@@ -229,7 +231,9 @@ impl Streamer {
                     }
                 }
                 let (_, cap) = current.as_mut().unwrap();
-                match cap.next_frame(&mut raw, Duration::from_millis(100)) {
+                // A frame waiting for the sender to be free is polled for more often.
+                let wait = if raw_new { Duration::from_millis(8) } else { Duration::from_millis(100) };
+                match cap.next_frame(&mut raw, wait) {
                     Ok(true) => {
                         captured_at = Instant::now();
                         whiten_bars(&mut raw, logical, rotation, shown);
@@ -246,7 +250,19 @@ impl Streamer {
                 // Render a new frame, or the last one again after a mode change
                 // (Mutter sends frames only when the screen changes).
                 let wanted_look = (generation, mode);
-                if raw_for == Some(generation) && (raw_new || rendered_as != Some(wanted_look)) {
+                // The panel takes a few updates per second and the sender
+                // drops what it cannot send, so a frame is only worth
+                // rendering when the sender is free (or it has been quite a
+                // while): the screen changes at every pointer move, and
+                // rendering all of them would load the CPU and the GPU the
+                // compositor shares for nothing.
+                let sender_free = {
+                    let s = lock.lock().unwrap();
+                    s.acked && !s.fresh
+                };
+                let render_new = raw_new && (sender_free || rendered_at.elapsed() >= Duration::from_millis(250));
+                if raw_for == Some(generation) && (render_new || rendered_as != Some(wanted_look)) {
+                    rendered_at = Instant::now();
                     if rendered_as != Some(wanted_look) {
                         rendered_as = Some(wanted_look);
                         epoch += 1;
