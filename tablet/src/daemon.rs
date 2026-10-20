@@ -8,7 +8,7 @@
 //! also what streams the screen, so its options are greyed out without it.
 
 use crate::display::{self, Display};
-use crate::epd::Epd;
+use crate::epd::{Epd, Mode};
 use crate::hid::{self, Gadget, Link as UsbLink};
 use crate::hid_report::{self, Encoder, Ranges};
 use crate::ink::Ink;
@@ -64,6 +64,15 @@ fn clear_ink(ink: &mut Ink, epd: &Epd, display: &Display) {
         epd.swap(r.x, r.y, r.w, r.h, display.settle(), 0);
         epd.process_events(0);
     }
+}
+
+/// The CLR button: puts back what the ink covered, then refreshes the whole
+/// panel in the flashing full-quality mode, which clears every ghost, not
+/// just the ink's.
+fn clear_screen(ink: &mut Ink, epd: &Epd) {
+    ink.restore(&epd.fb);
+    epd.swap(0, 0, epd.width(), epd.height(), Mode::Content, 0);
+    epd.process_events(0);
 }
 
 fn pen_label(m: PenMode) -> &'static str {
@@ -751,7 +760,7 @@ pub fn run(args: Args) -> Result<(), String> {
                         state.ink = ink.on;
                         state.save();
                     } else {
-                        clear_ink(&mut ink, &epd, &display);
+                        clear_screen(&mut ink, &epd);
                     }
                     ui.set_progress(b, ui::HOLD_STEPS);
                 }
