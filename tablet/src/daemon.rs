@@ -235,6 +235,9 @@ pub fn run(args: Args) -> Result<(), String> {
     // Non-USB addresses, re-read every few seconds and sent to the host on change.
     let mut addresses = crate::link::network_addresses();
     let mut addresses_at = Instant::now();
+    // What the info box last showed: rebuilt only when this changes.
+    let mut addresses_gen = 0u32;
+    let mut status_key = None;
 
     while !done && !quitting() {
         let mut fds = input_fds.clone();
@@ -342,7 +345,7 @@ pub fn run(args: Args) -> Result<(), String> {
             }
         }
 
-        if let Some(f) = files[2].as_mut() {
+        if let Some(f) = files[2].as_mut().filter(|_| pfds[2].revents != 0) {
             let power = input::read_events(f).unwrap_or_default();
             if power.iter().any(|e| e.kind == input::EV_KEY && e.code == input::KEY_POWER && e.value == 1) {
                 log!("remdesktop: power button pressed");
@@ -421,9 +424,7 @@ pub fn run(args: Args) -> Result<(), String> {
                                 ui.draw_home();
                             }
                             Ok(r) => {
-                                if ui.overlays_phys().iter().any(|o| r.intersects(*o)) {
-                                    ui.redraw_overlays();
-                                }
+                                ui.redraw_overlays_in(r);
                                 display.show(&epd, r);
                                 ink.overwritten(&epd.fb, r);
                             }
@@ -451,6 +452,7 @@ pub fn run(args: Args) -> Result<(), String> {
             let now = crate::link::network_addresses();
             if now != addresses {
                 addresses = now;
+                addresses_gen += 1;
                 if let Some(h) = host.as_mut() {
                     h.send(&Msg::Addresses { addrs: addresses.clone() });
                 }
@@ -480,13 +482,17 @@ pub fn run(args: Args) -> Result<(), String> {
             (_, Some(UsbLink::Suspended)) => "USB  computer asleep",
             _ => "USB  not connected",
         };
-        let host_line = match &host {
-            Some(h) if !crate::link::is_usb(h.link.peer) => format!("HOST {} (unplug ok)", h.link.peer),
-            Some(_) if hid_up => "HOST connected (display)".into(),
-            Some(_) => "HOST connected (input, display)".into(),
-            None => "HOST not connected".into(),
-        };
-        ui.set_status(usb_line, &host_line, &wifi_line(&addresses));
+        let key = (usb_line, host.as_ref().map(|h| h.link.peer), hid_up, addresses_gen);
+        if status_key != Some(key) {
+            let host_line = match &host {
+                Some(h) if !crate::link::is_usb(h.link.peer) => format!("HOST {} (unplug ok)", h.link.peer),
+                Some(_) if hid_up => "HOST connected (display)".into(),
+                Some(_) => "HOST connected (input, display)".into(),
+                None => "HOST not connected".into(),
+            };
+            ui.set_status(usb_line, &host_line, &wifi_line(&addresses));
+            status_key = Some(key);
+        }
 
         // Hold buttons.
         // A finger or the pen tip on a button.
@@ -702,7 +708,7 @@ pub fn run(args: Args) -> Result<(), String> {
 /// The info box line with the tablet's Wi-Fi address, to connect a host to.
 fn wifi_line(addresses: &[String]) -> String {
     match addresses.first() {
-        Some(ip) => format!("WIFI {ip}"),
-        None => "WIFI not connected".into(),
+        Some(ip) => ip.clone(),
+        None => "NO WIFI".into(),
     }
 }

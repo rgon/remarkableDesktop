@@ -65,10 +65,8 @@ impl DrawTarget for Canvas<'_> {
     fn fill_solid(&mut self, area: &Rectangle, color: Gray8) -> Result<(), Infallible> {
         let area = area.intersection(&self.bounding_box());
         let Some(br) = area.bottom_right() else { return Ok(()) };
-        for y in area.top_left.y..=br.y {
-            for x in area.top_left.x..=br.x {
-                self.put(x, y, color.luma());
-            }
+        for im in &self.images {
+            unsafe { im.fill_gray(area.top_left.x, area.top_left.y, br.x + 1, br.y + 1, color.luma()) };
         }
         self.mark(area.top_left.x, area.top_left.y, br.x + 1, br.y + 1);
         Ok(())

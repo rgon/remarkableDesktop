@@ -48,33 +48,50 @@ impl Rect {
 
 /// Writes `Rect` payloads into the framebuffer. Runs on the reader thread.
 pub struct Decoder {
-    /// Level → RGB32 pixel.
-    lut: [u32; 16],
+    /// Packed byte (two levels) → its two RGB32 pixels.
+    pairs: [[u32; 2]; 256],
+    /// Decompressed update, reused between updates.
+    scratch: Vec<u8>,
 }
 
 impl Decoder {
     pub fn new() -> Self {
-        let lut = std::array::from_fn(|l| {
+        let px = |l: usize| {
             let g = gray4::gray(l as u8) as u32;
             0xff00_0000 | g << 16 | g << 8 | g
-        });
-        Self { lut }
+        };
+        let pairs = std::array::from_fn(|b| [px(b >> 4), px(b & 15)]);
+        Self { pairs, scratch: Vec::new() }
     }
 
     /// Writes one update into the framebuffer (no refresh yet).
-    pub fn write(&self, fb: &ImageInfo, r: Rect, packed_lz4: &[u8]) -> Result<Rect, String> {
+    pub fn write(&mut self, fb: &ImageInfo, r: Rect, packed_lz4: &[u8]) -> Result<Rect, String> {
         if r.x < 0 || r.y < 0 || r.w <= 0 || r.h <= 0 || r.x + r.w > fb.width || r.y + r.h > fb.height {
             return Err(format!("update {r:?} outside the panel"));
         }
-        let packed = lz4_flex::block::decompress_size_prepended(packed_lz4).map_err(|e| format!("lz4: {e}"))?;
         let rb = gray4::row_bytes(r.w as usize);
-        if packed.len() != rb * r.h as usize {
-            return Err(format!("update {r:?}: {} bytes, expected {}", packed.len(), rb * r.h as usize));
+        let want = rb * r.h as usize;
+        // lz4_flex's size-prepended format: the length, then the block.
+        let (head, block) = packed_lz4.split_first_chunk::<4>().ok_or("lz4: truncated")?;
+        let got = u32::from_le_bytes(*head) as usize;
+        if got != want {
+            return Err(format!("update {r:?}: {got} bytes, expected {want}"));
         }
+        self.scratch.resize(want, 0);
+        lz4_flex::block::decompress_into(block, &mut self.scratch).map_err(|e| format!("lz4: {e}"))?;
+        let (w, pairs) = (r.w as usize, &self.pairs);
         for row in 0..r.h as usize {
             let line = unsafe { fb.pixels.add((r.y as usize + row) * fb.stride as usize + r.x as usize * 4) as *mut u32 };
-            let lut = &self.lut;
-            gray4::unpack_row(&packed[row * rb..][..rb], r.w as usize, |i, l| unsafe { line.add(i).write(lut[l as usize]) });
+            let packed = &self.scratch[row * rb..][..rb];
+            for (i, &b) in packed.iter().enumerate() {
+                let [hi, lo] = pairs[b as usize];
+                unsafe {
+                    line.add(2 * i).write_unaligned(hi);
+                    if 2 * i + 1 < w {
+                        line.add(2 * i + 1).write_unaligned(lo);
+                    }
+                }
+            }
         }
         Ok(r)
     }

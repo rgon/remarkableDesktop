@@ -85,6 +85,26 @@ impl ImageInfo {
         }
     }
 
+    /// Fills the pixels `[x0, x1)` × `[y0, y1)` with one gray level. Caller bounds-checks.
+    pub unsafe fn fill_gray(&self, x0: i32, y0: i32, x1: i32, y1: i32, v: u8) {
+        let n = (x1 - x0) as usize;
+        for y in y0..y1 {
+            let row = unsafe { self.pixels.add(y as usize * self.stride as usize) };
+            match self.format {
+                FORMAT_GRAYSCALE8 => unsafe { std::ptr::write_bytes(row.add(x0 as usize), v, n) },
+                FORMAT_RGB16 => {
+                    let px = ((v as u16 >> 3) << 11) | ((v as u16 >> 2) << 5) | (v as u16 >> 3);
+                    let p = unsafe { row.add(x0 as usize * 2) } as *mut u16;
+                    (0..n).for_each(|i| unsafe { p.add(i).write_unaligned(px) });
+                }
+                _ => {
+                    let px = 0xff00_0000 | (v as u32) << 16 | (v as u32) << 8 | v as u32;
+                    let p = unsafe { row.add(x0 as usize * 4) } as *mut u32;
+                    (0..n).for_each(|i| unsafe { p.add(i).write_unaligned(px) });
+                }
+            }
+        }
+    }
 }
 
 static CAPTURE: AtomicBool = AtomicBool::new(false);

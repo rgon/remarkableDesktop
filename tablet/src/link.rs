@@ -103,7 +103,7 @@ impl Link {
             let normal = libc::sched_param { sched_priority: 0 };
             unsafe { libc::sched_setscheduler(0, libc::SCHED_OTHER, &normal) };
             let mut source = io::BufReader::with_capacity(1 << 16, source);
-            let decoder = Decoder::new();
+            let mut decoder = Decoder::new();
             loop {
                 let item = match Msg::read_from(&mut source) {
                     Ok(Some(Msg::Rect { id, x, y, w, h, data })) => {

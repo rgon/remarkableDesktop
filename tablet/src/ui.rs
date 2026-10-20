@@ -122,7 +122,7 @@ struct Slot {
 }
 
 /// Lines of the info box in the bottom-left corner.
-const STATUS_LINES: usize = 4;
+const STATUS_LINES: usize = 3;
 const STATUS_W: u32 = 800;
 const STATUS_LINE_H: i32 = 44;
 
@@ -134,6 +134,8 @@ pub struct Ui<'a> {
     status: [String; STATUS_LINES],
     /// Battery charge in percent, shown right of the version line.
     battery: Option<u8>,
+    /// The tablet's Wi-Fi address (or a placeholder), right of the HOST line.
+    wifi: String,
 }
 
 impl<'a> Ui<'a> {
@@ -149,8 +151,8 @@ impl<'a> Ui<'a> {
                 Slot { rect: Rectangle::new(Point::new(x, MARGIN), Size::new(BUTTON, BUTTON)), label: String::new(), drawn: None, enabled: true }
             })
             .collect();
-        let status = [concat!("remdesktop v", env!("CARGO_PKG_VERSION")).to_string(), String::new(), String::new(), String::new()];
-        Self { canvas, rotation, size, buttons, status, battery: None }
+        let status = [concat!("remdesktop v", env!("CARGO_PKG_VERSION")).to_string(), String::new(), String::new()];
+        Self { canvas, rotation, size, buttons, status, battery: None, wifi: String::new() }
     }
 
     fn target(&mut self) -> Rotated<'_, Canvas<'a>> {
@@ -183,30 +185,31 @@ impl<'a> Ui<'a> {
         crate::display::Rect { x, y, w: (a.x - b.x).abs() + 1, h: (a.y - b.y).abs() + 1 }
     }
 
-    /// Panel areas our UI draws over streamed content: buttons, info box.
-    pub fn overlays_phys(&mut self) -> [crate::display::Rect; 2] {
-        let s = self.status_rect();
-        [self.bar_phys(), self.rect_phys(s)]
-    }
-
-    /// Redraws buttons and the info box (after screen content covered them).
-    pub fn redraw_overlays(&mut self) {
+    /// Redraws the buttons and info box that panel area `r` covered (after
+    /// screen content was drawn over them), and refreshes just those.
+    pub fn redraw_overlays_in(&mut self, r: crate::display::Rect) {
         for b in Button::ALL {
-            let steps = self.buttons[b as usize].drawn.unwrap_or(0);
-            self.draw_button(b, steps);
+            let rect = self.buttons[b as usize].rect;
+            if self.rect_phys(rect).intersects(r) {
+                let steps = self.buttons[b as usize].drawn.unwrap_or(0);
+                self.draw_button(b, steps);
+            }
         }
-        self.draw_status();
+        let status = self.status_rect();
+        if self.rect_phys(status).intersects(r) {
+            self.draw_status();
+        }
         self.canvas.flush(Mode::Ui);
     }
 
     /// Sets the info box's status lines (below the version), redrawing if changed.
     pub fn set_status(&mut self, usb: &str, host: &str, wifi: &str) {
-        if self.status[1] == usb && self.status[2] == host && self.status[3] == wifi {
+        if self.status[1] == usb && self.status[2] == host && self.wifi == wifi {
             return;
         }
         self.status[1] = usb.into();
         self.status[2] = host.into();
-        self.status[3] = wifi.into();
+        self.wifi = wifi.into();
         self.draw_status();
         self.canvas.flush(Mode::Ui);
     }
@@ -224,7 +227,7 @@ impl<'a> Ui<'a> {
     fn draw_status(&mut self) {
         let r = self.status_rect();
         let lines = self.status.clone();
-        let battery = self.battery;
+        let (battery, wifi) = (self.battery, self.wifi.clone());
         let mut t = self.target();
         let frame = PrimitiveStyleBuilder::new().fill_color(Gray8::WHITE).stroke_color(Gray8::new(0x80)).stroke_width(3).build();
         let _ = r.into_styled(frame).draw(&mut t);
@@ -233,10 +236,14 @@ impl<'a> Ui<'a> {
             let y = r.top_left.y + 8 + STATUS_LINE_H * i as i32 + 30;
             let _ = Text::new(line, Point::new((r.top_left.x + 16) / 2, y / 2), style).draw(&mut Scaled { target: &mut t, factor: 2 });
         }
-        if let Some(p) = battery {
-            let text = format!("{p}%");
-            let x = (r.top_left.x + r.size.width as i32 - 16) / 2 - 10 * text.len() as i32;
-            let _ = Text::new(&text, Point::new(x, (r.top_left.y + 8 + 30) / 2), style).draw(&mut Scaled { target: &mut t, factor: 2 });
+        // Right-aligned: the battery on the version line, the Wi-Fi address on the HOST line.
+        let right = [(battery.map(|p| format!("{p}%")), 0), (Some(wifi), 2)];
+        for (text, row) in right {
+            if let Some(text) = text {
+                let x = (r.top_left.x + r.size.width as i32 - 16) / 2 - 10 * text.len() as i32;
+                let y = r.top_left.y + 8 + STATUS_LINE_H * row + 30;
+                let _ = Text::new(&text, Point::new(x, y / 2), style).draw(&mut Scaled { target: &mut t, factor: 2 });
+            }
         }
     }
 
@@ -256,16 +263,6 @@ impl<'a> Ui<'a> {
             self.canvas.flush(Mode::Ui);
         }
     }
-
-    pub fn bar_phys(&mut self) -> crate::display::Rect {
-        let first = self.buttons[0].rect.top_left;
-        let last = self.buttons[self.buttons.len() - 1].rect.top_left + Point::new(BUTTON as i32 - 1, BUTTON as i32 - 1);
-        let t = self.target();
-        let (a, b) = (t.phys(first), t.phys(last));
-        let (x, y) = (a.x.min(b.x), a.y.min(b.y));
-        crate::display::Rect { x, y, w: (a.x - b.x).abs() + 1, h: (a.y - b.y).abs() + 1 }
-    }
-
 
     /// Classifies a pen position (logical pixels): on a button, within the
     /// grace margin around the buttons, or outside. Everything but
