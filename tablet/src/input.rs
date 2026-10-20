@@ -411,19 +411,29 @@ pub struct PalmConfig {
     pub max_major: i32,
     /// Touches stay blocked this long after the pen leaves hover range.
     pub pen_grace_us: u64,
+    /// Touchpad mode: a contact that has rested this long without moving is a
+    /// palm as soon as another finger lands (zero: off).
+    pub rest_us: u64,
     /// Log a summary of every contact when it lifts.
     pub log: bool,
 }
 
 impl Default for PalmConfig {
     fn default() -> Self {
-        Self { max_major: 40, pen_grace_us: 500_000, log: false }
+        Self { max_major: 40, pen_grace_us: 500_000, rest_us: 300_000, log: false }
     }
 }
 
 const MT_TOOL_PALM: i32 = 2;
 const ABS_MT_TOOL_TYPE: u16 = 0x37;
 const SLOTS: usize = 16;
+/// A contact that stays within this many mm of where it landed hasn't moved.
+const REST_SLOP_MM: i32 = 3;
+
+/// A contact that has stayed put for `rest_us` is a hand resting on the pad.
+fn is_resting(age_us: u64, travel: i32, rest_us: u64, slop: i32) -> bool {
+    rest_us > 0 && age_us >= rest_us && travel <= slop
+}
 
 /// Who a contact belongs to. Decided when it lands; a forwarded contact can
 /// still turn into a palm, but a rejected one never comes back.
@@ -460,6 +470,9 @@ struct Slot {
     inside: bool,
     start_us: u64,
     peak: [i32; 3],
+    /// Where the contact landed, and the farthest it has been from there.
+    origin: [i32; 2],
+    travel: i32,
 }
 
 /// Multitouch screen → virtual touchpad/touchscreen, with palm rejection.
@@ -478,6 +491,8 @@ pub struct Touch {
     last_count: usize,
     pen_in_range: bool,
     pen_left_us: Option<u64>,
+    /// `REST_SLOP_MM` in output units.
+    rest_slop: i32,
 }
 
 impl Touch {
@@ -505,7 +520,8 @@ impl Touch {
             abs.push(Abs { code, min: i.min, max: i.max, resolution: 0 });
         }
         let slots = [Slot { id: -1, ..Default::default() }; SLOTS];
-        Ok(Self { map, raw, out, mode, palm, abs, slots, current: 0, last_count: 0, pen_in_range: false, pen_left_us: None })
+        let rest_slop = abs.iter().filter(|a| a.code == ABS_X || a.code == ABS_Y).map(|a| a.resolution).min().unwrap_or(1) * REST_SLOP_MM;
+        Ok(Self { map, raw, out, mode, palm, abs, slots, current: 0, last_count: 0, pen_in_range: false, pen_left_us: None, rest_slop })
     }
 
     pub fn device(&self) -> Device {
@@ -632,6 +648,21 @@ impl Touch {
         let key = |code, down: bool| Event { kind: EV_KEY, code, value: down as i32 };
         let pen_blocks = self.pen_blocks(now_us);
         let mut ev = vec![];
+        // A palm resting on the pad while a finger moves: when a new finger
+        // lands, contacts that haven't moved since they were put down are the
+        // palm, so the host never sees a two-finger gesture.
+        if self.mode == TouchMode::Touchpad {
+            let lands = self.slots.iter().any(|s| s.dirty && s.began && self.palm_reason(s).is_none() && on_ui(s.pos).is_none() && !pen_blocks);
+            if lands {
+                let (rest_us, slop) = (self.palm.rest_us, self.rest_slop);
+                for s in self.slots.iter_mut().filter(|s| s.id >= 0 && !s.began && s.owner == Owner::Host) {
+                    if is_resting(now_us.saturating_sub(s.start_us), s.travel, rest_us, slop) {
+                        s.owner = Owner::Palm;
+                        s.dirty = true;
+                    }
+                }
+            }
+        }
         for i in 0..SLOTS {
             if !self.slots[i].dirty {
                 continue;
@@ -642,6 +673,8 @@ impl Touch {
             if s.began {
                 s.began = false;
                 s.peak = [0; 3];
+                s.origin = s.pos;
+                s.travel = 0;
                 // Our buttons work even while the pen hovers (e.g. the side
                 // button); palms never press them.
                 s.owner = if let Some(p) = palm {
@@ -660,6 +693,7 @@ impl Touch {
                 }
             }
             if s.id >= 0 {
+                s.travel = s.travel.max((s.pos[0] - s.origin[0]).abs()).max((s.pos[1] - s.origin[1]).abs());
                 s.peak = [s.peak[0].max(s.major), s.peak[1].max(s.minor), s.peak[2].max(s.pressure)];
             }
             if let Owner::Ui(b) = s.owner {
@@ -721,6 +755,14 @@ impl Touch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resting_contact_needs_time_and_stillness() {
+        assert!(is_resting(400_000, 5, 300_000, 20));
+        assert!(!is_resting(100_000, 5, 300_000, 20)); // just landed
+        assert!(!is_resting(400_000, 50, 300_000, 20)); // moved
+        assert!(!is_resting(400_000, 0, 0, 20)); // disabled
+    }
 
     #[test]
     fn rotation_maps_portrait_axes() {

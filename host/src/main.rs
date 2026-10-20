@@ -36,7 +36,7 @@ const USAGE: &str = "usage: remdesktop-host [--ssh root@10.11.99.1] [--remote /h
                        [--deploy <local remdesktop binary>] [--stats] [--no-usb] [--list-screens]
                        [--no-display]
                        [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
-                       [--palm-major N] [--pen-grace-ms N] [--log-touch]
+                       [--palm-major N] [--pen-grace-ms N] [--palm-rest-ms N] [--log-touch]
                        [--fast-mode M] [--settle-mode M] [--settle-ms N]";
 
 struct Args {
@@ -86,7 +86,7 @@ fn parse() -> Result<Args, String> {
                 }
                 std::process::exit(0);
             }
-            "--rotate" | "--touch" | "--pen" | "--palm-major" | "--pen-grace-ms" | "--fast-mode" | "--settle-mode" | "--settle-ms" => {
+            "--rotate" | "--touch" | "--pen" | "--palm-major" | "--pen-grace-ms" | "--palm-rest-ms" | "--fast-mode" | "--settle-mode" | "--settle-ms" => {
                 let v = value()?;
                 a.run_args.extend([flag, v]);
             }
