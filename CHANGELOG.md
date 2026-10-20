@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.11.4](https://github.com/rgon/remarkableDesktop/compare/v0.11.3...v0.11.4) (2026-10-20)
+
+
+### Features
+
+* reconnect over usb or wifi, update outdated tablets and warn when uinput is not writable ([4549c9d](https://github.com/rgon/remarkableDesktop/commit/4549c9d9043c199391e5c080bc1f353690ae1d33))
+* right-align the wifi address on the tablet's HOST row ([00e5a2e](https://github.com/rgon/remarkableDesktop/commit/00e5a2e3930f2377f62412c075dcc41d28d487fe))
+* show the battery percentage on the tablet's version line ([07e4898](https://github.com/rgon/remarkableDesktop/commit/07e4898f786491c85c98a8efd4b5a5b922d188a9))
+* show the tablet's wifi address in the info box ([9f13c3a](https://github.com/rgon/remarkableDesktop/commit/9f13c3a4343c58a43ee87fb4efa979a4a4759e5b))
+
+
+### Bug Fixes
+
+* reuse the host's ssh password in install.sh instead of asking again ([a12ff7a](https://github.com/rgon/remarkableDesktop/commit/a12ff7aab912cadd9e03d4fcf72d66104e801fb5))
+
+
+### Performance Improvements
+
+* build the release profile with opt-level 3 ([332e307](https://github.com/rgon/remarkableDesktop/commit/332e3072056bf983105b23a2a52cf42b077426da))
+* track pen ink with a bitmask so streamed updates no longer scan every inked pixel ([80b220d](https://github.com/rgon/remarkableDesktop/commit/80b220d8f146d05a910649d5f4d2fbd0aa65bbf7))
+
 ## [0.11.3](https://github.com/rgon/remarkableDesktop/compare/v0.11.2...v0.11.3) (2026-10-19)
 
 
