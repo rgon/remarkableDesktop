@@ -121,6 +121,7 @@ impl Streamer {
             let (lock, cv) = &*cap_shared;
             let mut current: Option<(u64, Capture)> = None;
             let mut raw = vec![];
+            let mut detector = edges::Detector::new();
             // `raw` holds a frame of this generation that is not yet rendered.
             let mut raw_new = false;
             let mut raw_for: Option<u64> = None;
@@ -182,7 +183,7 @@ impl Streamer {
                     raw_new = false;
                     let (pw, ph) = if rotation % 180 == 90 { (logical.1 as usize, logical.0 as usize) } else { (logical.0 as usize, logical.1 as usize) };
                     let levels: Vec<u8> = match mode {
-                        DisplayMode::Edge => edges::detect(&raw, pw, ph).iter().map(|&v| gray4::level(v)).collect(),
+                        DisplayMode::Edge => detector.detect(&raw, pw, ph).iter().map(|&v| gray4::level(v)).collect(),
                         _ => raw.iter().map(|&v| gray4::level(v)).collect(),
                     };
                     let mut s = lock.lock().unwrap();

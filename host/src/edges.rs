@@ -19,8 +19,78 @@ const DARK: u64 = 100;
 /// `gray` is `w`×`h`, one byte per pixel. Returns the same size: 0 on an
 /// edge, 255 elsewhere.
 pub fn detect(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = outline(gray, w, h);
+    if usable(gray, w, h) {
+        fill_dark(gray, &mut out, w, h);
+    }
+    out
+}
+
+fn usable(gray: &[u8], w: usize, h: usize) -> bool {
+    w >= 5 && h >= 5 && gray.len() == w * h
+}
+
+/// Edge detection on the GPU where there is one (see `gpu.rs`), on the CPU
+/// otherwise. The frame size may change between calls.
+pub struct Detector {
+    backend: Backend,
+}
+
+enum Backend {
+    /// Not tried yet (or the size changed).
+    Untried,
+    Gpu(crate::gpu::Gpu),
+    Cpu,
+}
+
+impl Detector {
+    pub fn new() -> Detector {
+        Detector { backend: Backend::Untried }
+    }
+
+    pub fn detect(&mut self, gray: &[u8], w: usize, h: usize) -> Vec<u8> {
+        if matches!(&self.backend, Backend::Gpu(g) if g.size() != (w, h)) {
+            self.backend = Backend::Untried;
+        }
+        if matches!(self.backend, Backend::Untried) {
+            self.backend = if std::env::var_os("REMDESKTOP_NO_GPU").is_some() || !usable(gray, w, h) {
+                Backend::Cpu
+            } else {
+                match crate::gpu::Gpu::new(w, h) {
+                    Ok(g) => {
+                        eprintln!("remdesktop-host: edge detection on the GPU ({})", g.name());
+                        Backend::Gpu(g)
+                    }
+                    Err(e) => {
+                        eprintln!("remdesktop-host: edge detection on the CPU ({e})");
+                        Backend::Cpu
+                    }
+                }
+            };
+        }
+        let gpu_result = match &mut self.backend {
+            Backend::Gpu(g) => Some(g.outline(gray)),
+            _ => None,
+        };
+        match gpu_result {
+            Some(Ok(mut out)) => {
+                fill_dark(gray, &mut out, w, h);
+                out
+            }
+            Some(Err(e)) => {
+                eprintln!("remdesktop-host: the GPU failed ({e}); edge detection on the CPU from now on");
+                self.backend = Backend::Cpu;
+                detect(gray, w, h)
+            }
+            None => detect(gray, w, h),
+        }
+    }
+}
+
+/// The one-pixel outlines, before the dark regions are filled.
+pub(crate) fn outline(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = vec![255u8; w * h];
-    if w < 5 || h < 5 || gray.len() != w * h {
+    if !usable(gray, w, h) {
         return out;
     }
     let blurred = blur(gray, w, h);
@@ -49,7 +119,6 @@ pub fn detect(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
             out[py * w + px] = 0;
         }
     }
-    fill_dark(gray, &mut out, w, h);
     out
 }
 

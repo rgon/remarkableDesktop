@@ -90,6 +90,13 @@ logs to the journal.
   once. Replayed late, a tap shows up as a press and release at the place it
   happened. Keyboard-like undo/redo and the screen stream stay on TCP.
 
+- **Edge mode on the GPU:** the host runs edge detection through Vulkan
+  (`libvulkan` is loaded at run time, nothing is linked) on the first
+  discrete or integrated GPU with a compute queue, and the dark-region fill
+  on the CPU. Without a Vulkan driver, or with `REMDESKTOP_NO_GPU` set, the
+  whole thing runs on the CPU. A weak edge chain longer than about 500 pixels
+  is cut short on the GPU.
+
 ## Input
 - **Monitor targeting:** pen and touchscreen are mapped through GNOME's
   per-device `output` settings (restored when `remdesktop-host` exits normally).

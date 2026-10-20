@@ -4,6 +4,7 @@
 mod capture;
 mod displayconfig;
 mod edges;
+mod gpu;
 mod gsettings;
 mod keymap;
 mod mapping;
