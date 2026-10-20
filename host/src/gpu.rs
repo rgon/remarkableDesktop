@@ -19,7 +19,7 @@ use std::ffi::CStr;
 const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/edges.spv"));
 
 /// Entry points of the shader, in `Stage` order.
-const STAGES: [&CStr; 10] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"diff_tiles", c"pack_bits", c"convert"];
+const STAGES: [&CStr; 12] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"diff_tiles", c"pack_bits", c"convert", c"pack_gray4", c"diff_gray4"];
 
 #[derive(Clone, Copy)]
 enum Stage {
@@ -33,6 +33,8 @@ enum Stage {
     Diff,
     PackBits,
     Convert,
+    PackGray4,
+    DiffGray4,
 }
 
 /// Gray (0..=255) under which a pixel is drawn black, outline or not.
@@ -53,7 +55,9 @@ const PARAMS: usize = 8;
 const TILES: usize = 9;
 const PREV: usize = 10;
 const SRC: usize = 11;
-const BUFFERS: usize = 12;
+const GRAY4: usize = 12;
+const PREV4: usize = 13;
+const BUFFERS: usize = 14;
 
 struct Buf {
     buffer: vk::Buffer,
@@ -93,14 +97,25 @@ pub struct Gpu {
     tiles: usize,
     /// Bytes of a one-word-per-pixel buffer.
     words: u64,
-    /// A frame has been through, so `PREV` holds something to compare with.
+    /// A frame has been through each view, so `PREV` / `PREV4` hold something to compare with.
     have_prev: bool,
+    have_prev4: bool,
+    /// Bytes of the 4-bit frame buffers.
+    gray4_bytes: u64,
     dark: u32,
     convert: Convert,
     name: String,
 }
 
-/// One frame's result.
+/// The gray view of one frame.
+pub struct Gray4 {
+    /// The frame as `gray4` packs it: 4-bit levels, two pixels a byte, rows padded to bytes.
+    pub bytes: Vec<u8>,
+    /// The tiles of the grid that differ from the previous frame (None for the first).
+    pub dirty: Option<Vec<bool>>,
+}
+
+/// One frame's result (the edge view).
 pub struct Outline {
     /// The frame as `bits1` packs it: one bit per pixel, set where the
     /// pixel is white (not on an outline and not dark), rows padded to bytes.
@@ -142,6 +157,7 @@ impl Gpu {
         let packed = px.div_ceil(4).max(1) * 4;
         let words = (px * 4).max(4);
         let bits_bytes = ((w.div_ceil(8) * h) as u64).div_ceil(4).max(1) * 4;
+        let gray4_bytes = ((w.div_ceil(2) * h) as u64).div_ceil(4).max(1) * 4;
         // (size, host access) per binding.
         let layout = [
             (packed, true),
@@ -156,6 +172,8 @@ impl Gpu {
             ((tiles as u64 * 4).max(4), true),
             (words, false),
             ((convert.src.0 * convert.src.1 * 4) as u64, true),
+            (gray4_bytes, true),
+            (gray4_bytes, false),
         ];
         let mut buffers = Vec::with_capacity(BUFFERS);
         for (size, host) in layout {
@@ -190,7 +208,7 @@ impl Gpu {
         let cmds = ve("command buffers", unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(4)) })?;
         let fence = ve("fence", unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) })?;
 
-        let gpu = Gpu { _entry: entry, instance, device, queue, pool, set_layout, desc_pool, pipe_layout, module, pipelines, buffers, cmds: [cmds[0], cmds[1], cmds[2], cmds[3]], fence, size: (w, h), tiles, words, have_prev: false, dark, convert, name };
+        let gpu = Gpu { _entry: entry, instance, device, queue, pool, set_layout, desc_pool, pipe_layout, module, pipelines, buffers, cmds: [cmds[0], cmds[1], cmds[2], cmds[3]], fence, size: (w, h), tiles, words, have_prev: false, have_prev4: false, gray4_bytes, dark, convert, name };
         gpu.write_params([0.0, 1.0, 0.0, 1.0]);
         gpu.record(set)?;
         Ok(gpu)
@@ -317,7 +335,17 @@ impl Gpu {
                         rounds(cb);
                     }
                     1 => rounds(cb),
-                    3 => run(cb, Stage::Convert),
+                    3 => {
+                        d.cmd_fill_buffer(cb, self.buffers[TILES].buffer, 0, vk::WHOLE_SIZE, 0);
+                        sync(cb);
+                        run(cb, Stage::Convert);
+                        run(cb, Stage::PackGray4);
+                        run(cb, Stage::DiffGray4);
+                        // This frame is the next one's reference.
+                        let copy = [vk::BufferCopy::default().size(self.gray4_bytes)];
+                        d.cmd_copy_buffer(cb, self.buffers[GRAY4].buffer, self.buffers[PREV4].buffer, &copy);
+                        sync(cb);
+                    }
                     _ => {
                         d.cmd_fill_buffer(cb, self.buffers[TILES].buffer, 0, vk::WHOLE_SIZE, 0);
                         sync(cb);
@@ -356,15 +384,18 @@ impl Gpu {
         self.frame()
     }
 
-    /// Just the gray panel frame of a raw BGRx capture, for the view that
-    /// shows grays: `w * h` bytes.
-    pub fn gray_bgrx(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<Vec<u8>, String> {
+    /// The gray view of a raw BGRx capture: the panel frame as 4-bit levels
+    /// (packed as `gray4` does), and the tiles that changed since the
+    /// previous call.
+    pub fn gray_bgrx(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<Gray4, String> {
         self.upload(raw, shown)?;
         self.submit(3)?;
-        let px = self.size.0 * self.size.1;
-        let mut gray = vec![0u8; px];
-        unsafe { std::ptr::copy_nonoverlapping(self.buffers[INPUT].ptr, gray.as_mut_ptr(), px) };
-        Ok(gray)
+        let mut bytes = vec![0u8; self.size.0.div_ceil(2) * self.size.1];
+        unsafe { std::ptr::copy_nonoverlapping(self.buffers[GRAY4].ptr, bytes.as_mut_ptr(), bytes.len()) };
+        let flags = unsafe { std::slice::from_raw_parts(self.buffers[TILES].ptr as *const u32, self.tiles) };
+        let dirty = self.have_prev4.then(|| flags.iter().map(|&f| f != 0).collect());
+        self.have_prev4 = true;
+        Ok(Gray4 { bytes, dirty })
     }
 
     fn upload(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<(), String> {
@@ -446,6 +477,12 @@ mod tests {
     fn unpack(bits: &[u8], w: usize, h: usize) -> Vec<u8> {
         let rb = w.div_ceil(8);
         (0..w * h).map(|i| if bits[(i / w) * rb + (i % w) / 8] >> (7 - (i % w) % 8) & 1 != 0 { 255 } else { 0 }).collect()
+    }
+
+    /// The levels of a packed 4-bit frame, one byte each.
+    fn nibbles(packed: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let rb = w.div_ceil(2);
+        (0..w * h).map(|i| { let b = packed[(i / w) * rb + (i % w) / 2]; if (i % w) % 2 == 0 { b >> 4 } else { b & 15 } }).collect()
     }
 
     fn edges_of(gpu: &mut Gpu, gray: &[u8], w: usize, h: usize) -> Vec<u8> {
@@ -542,7 +579,32 @@ mod tests {
         }
         let next = gpu.outline_bgrx(&bgrx(&other), FULL).expect("third frame");
         let grid = crate::tiles::Grid::new(w, h);
-        assert_eq!(next.dirty.expect("flags"), grid.dirty_bits(&again.bits, &next.bits));
+        assert_eq!(next.dirty.expect("flags"), grid.dirty_packed(&again.bits, &next.bits, 8));
+    }
+
+    #[test]
+    fn gray_frames_are_four_bit_levels_and_report_changed_tiles() {
+        let (w, h) = (203, 157);
+        let Some(mut gpu) = gpu(w, h) else { return };
+        let img: Vec<u8> = (0..w * h).map(|i| ((i % w) * 255 / w) as u8).collect();
+        let first = gpu.gray_bgrx(&bgrx(&img), FULL).expect("first frame");
+        assert!(first.dirty.is_none());
+        let levels = nibbles(&first.bytes, w, h);
+        let want: Vec<u8> = img.iter().map(|&v| ((v as u16 * 15 + 127) / 255) as u8).collect();
+        assert_eq!(levels, want, "the same levels gray4::level gives");
+        assert_eq!(first.bytes.len(), w.div_ceil(2) * h);
+        let same = gpu.gray_bgrx(&bgrx(&img), FULL).expect("second frame");
+        assert!(same.dirty.expect("flags").iter().all(|&d| !d));
+        // One block changes by a few levels: only its tiles are flagged.
+        let mut other = img.clone();
+        for y in 40..70 {
+            for x in 90..140 {
+                other[y * w + x] = other[y * w + x].saturating_add(60);
+            }
+        }
+        let next = gpu.gray_bgrx(&bgrx(&other), FULL).expect("third frame");
+        let grid = crate::tiles::Grid::new(w, h);
+        assert_eq!(next.dirty.expect("flags"), grid.dirty_packed(&same.bytes, &next.bytes, 2));
     }
 
     /// The conversion on the CPU, step by step as `edges.wgsl` does it.
@@ -605,12 +667,13 @@ mod tests {
         }
         // 0.125 * 180 = 22.5 rounds to 23; the picture is 0.75 * 180 = 135 high.
         let want = reference(&raw, src_size, logical, 90, panel, (0, 23, 240, 135));
-        let got = gpu.gray_bgrx(&raw, shown).expect("gpu frame");
+        let got = nibbles(&gpu.gray_bgrx(&raw, shown).expect("gpu frame").bytes, panel.0, panel.1);
         assert_eq!(got.len(), want.len());
-        let worst = want.iter().zip(&got).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
-        let off = want.iter().zip(&got).filter(|(a, b)| a != b).count();
-        assert!(worst <= 1, "differs by {worst} somewhere ({off} pixels off) on {}", gpu.name());
+        // Within a level (the gray itself may be a step off, which can flip a level).
+        let level = |v: u8| ((v as u16 * 15 + 127) / 255) as i32;
+        let worst = want.iter().zip(&got).map(|(a, b)| (level(*a) - *b as i32).abs()).max().unwrap();
+        assert!(worst <= 1, "differs by {worst} levels somewhere on {}", gpu.name());
         // The bars are white: the panel's first and last columns are the logical frame's top and bottom rows.
-        assert!(got.chunks(panel.0).all(|row| row[0] == 255 && row[panel.0 - 1] == 255));
+        assert!(got.chunks(panel.0).all(|row| row[0] == 15 && row[panel.0 - 1] == 15));
     }
 }

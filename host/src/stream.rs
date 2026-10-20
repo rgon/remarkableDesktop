@@ -42,11 +42,12 @@ struct Shared {
     stats: Option<DisplayStats>,
 }
 
-/// A rendered frame: gray levels (4 bits used, one per byte), or, for the
-/// edge view, one bit per pixel as the GPU packs it (`bits1`'s layout).
+/// A rendered frame as the GPU packs it: 4-bit gray levels, two pixels a
+/// byte (`gray4`'s layout), or, for the edge view, one bit per pixel
+/// (`bits1`'s layout). Rows are padded to whole bytes.
 #[derive(Clone)]
 enum Picture {
-    Gray(Vec<u8>),
+    Gray4(Vec<u8>),
     Bits(Vec<u8>),
 }
 
@@ -54,7 +55,7 @@ impl Picture {
     /// Whether it has the size of a `w`×`h` frame.
     fn fits(&self, w: usize, h: usize) -> bool {
         match self {
-            Picture::Gray(v) => v.len() == w * h,
+            Picture::Gray4(v) => v.len() == gray4::row_bytes(w) * h,
             Picture::Bits(v) => v.len() == bits1::row_bytes(w) * h,
         }
     }
@@ -62,33 +63,27 @@ impl Picture {
     /// The tiles that differ from `prev` (all of them if it is another kind).
     fn dirty(&self, prev: &Picture, grid: &Grid) -> Vec<bool> {
         match (self, prev) {
-            (Picture::Gray(a), Picture::Gray(b)) => grid.dirty(b, a),
-            (Picture::Bits(a), Picture::Bits(b)) => grid.dirty_bits(b, a),
+            (Picture::Gray4(a), Picture::Gray4(b)) => grid.dirty_packed(b, a, 2),
+            (Picture::Bits(a), Picture::Bits(b)) => grid.dirty_packed(b, a, 8),
             _ => vec![true; grid.tiles()],
         }
     }
 
     /// The `rw`×`rh` window at (`x`, `y`) of a `w`-wide frame as it goes on
     /// the wire, and whether that is 1-bit (`RECT_BITS1`). Rectangles start
-    /// on tile boundaries, so a bit window is whole bytes of the packed rows.
+    /// on tile boundaries, so a window is whole bytes of the packed rows.
     fn pack(&self, w: usize, x: usize, y: usize, rw: usize, rh: usize) -> (bool, Vec<u8>) {
-        match self {
-            Picture::Gray(v) => (false, gray4::pack(v, w, x, y, rw, rh)),
-            Picture::Bits(v) if x % 8 == 0 => {
-                let (rb, wb) = (bits1::row_bytes(w), bits1::row_bytes(rw));
-                let mut out = Vec::with_capacity(wb * rh);
-                for r in 0..rh {
-                    out.extend_from_slice(&v[(y + r) * rb + x / 8..][..wb]);
-                }
-                (true, out)
-            }
-            // Not on a byte boundary (never from the tile grid): the slow way.
-            Picture::Bits(v) => {
-                let rb = bits1::row_bytes(w);
-                let levels: Vec<u8> = (0..w * (y + rh)).map(|i| if v[(i / w) * rb + (i % w) / 8] >> (7 - (i % w) % 8) & 1 != 0 { 15 } else { 0 }).collect();
-                (true, bits1::pack(&levels, w, x, y, rw, rh))
-            }
+        let (bits, frame, per_byte) = match self {
+            Picture::Gray4(v) => (false, v, 2),
+            Picture::Bits(v) => (true, v, 8),
+        };
+        debug_assert!(x % per_byte == 0);
+        let (rb, wb) = (w.div_ceil(per_byte), rw.div_ceil(per_byte));
+        let mut out = Vec::with_capacity(wb * rh);
+        for r in 0..rh {
+            out.extend_from_slice(&frame[(y + r) * rb + x / per_byte..][..wb]);
         }
+        (bits, out)
     }
 }
 
@@ -260,9 +255,9 @@ impl Streamer {
                     raw_new = false;
                     let rendered: Result<(Picture, bool, Option<Vec<bool>>), String> = match (&mut gpu, mode) {
                         // Nothing is sent; the frame is never looked at.
-                        (_, DisplayMode::None) => Ok((Picture::Gray(vec![]), false, None)),
+                        (_, DisplayMode::None) => Ok((Picture::Gray4(vec![]), false, None)),
                         (Some(g), DisplayMode::Edge) => g.outline_bgrx(&raw, shown).map(|o| (Picture::Bits(o.bits), true, o.dirty)),
-                        (Some(g), _) => g.gray_bgrx(&raw, shown).map(|gray| (Picture::Gray(gray.iter().map(|&v| gray4::level(v)).collect()), false, None)),
+                        (Some(g), _) => g.gray_bgrx(&raw, shown).map(|o| (Picture::Gray4(o.bytes), true, o.dirty)),
                         (None, _) => Err("no GPU set up".to_string()),
                     };
                     let (picture, on_gpu, tiles_changed) = match rendered {

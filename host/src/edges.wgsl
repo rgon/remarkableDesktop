@@ -47,6 +47,9 @@ struct Params {
 @group(0) @binding(8) var<storage, read> prm: Params;
 // The raw capture: one BGRx pixel per word.
 @group(0) @binding(11) var<storage, read> buf_src: array<u32>;
+// The gray frame as `gray4` packs it (see pack_gray4), and the previous one.
+@group(0) @binding(12) var<storage, read_write> buf_gray4: array<u32>;
+@group(0) @binding(13) var<storage, read_write> buf_prev4: array<u32>;
 // One flag per tile of the grid in tiles.rs: set when the outline differs
 // from the previous frame's anywhere in it.
 @group(0) @binding(9) var<storage, read_write> buf_tiles: array<atomic<u32>>;
@@ -372,4 +375,63 @@ fn pack_bits(@builtin(global_invocation_id) g: vec3<u32>) {
         }
     }
     buf_bits[k] = word;
+}
+
+fn level4(v: u32) -> u32 {
+    return (v * 15u + 127u) / 255u;
+}
+
+// The gray frame as 4-bit levels, two pixels a byte (the first in the high
+// nibble), rows padded to whole bytes: the wire format of `gray4` in the
+// proto crate. Each thread makes one output word, found from its byte index.
+@compute @workgroup_size(16, 16)
+fn pack_gray4(@builtin(global_invocation_id) g: vec3<u32>) {
+    let w = prm.w;
+    if (g.x >= w || g.y >= prm.h) {
+        return;
+    }
+    let row_bytes = (w + 1u) / 2u;
+    let total = row_bytes * prm.h;
+    let k = g.y * w + g.x;
+    if (k * 4u >= total) {
+        return;
+    }
+    var word = 0u;
+    for (var j = 0u; j < 4u; j++) {
+        let b = k * 4u + j;
+        if (b < total) {
+            let row = b / row_bytes;
+            let x = (b % row_bytes) * 2u;
+            let hi = level4(gray(row * w + x));
+            var lo = 0u;
+            if (x + 1u < w) {
+                lo = level4(gray(row * w + x + 1u));
+            }
+            word |= ((hi << 4u) | lo) << (8u * j);
+        }
+    }
+    buf_gray4[k] = word;
+}
+
+// Which tiles changed since the previous gray frame.
+@compute @workgroup_size(16, 16)
+fn diff_gray4(@builtin(global_invocation_id) g: vec3<u32>) {
+    let w = prm.w;
+    if (g.x >= w || g.y >= prm.h) {
+        return;
+    }
+    let b = g.y * ((w + 1u) / 2u) + g.x / 2u;
+    let shift = (b & 3u) * 8u;
+    let a = (buf_gray4[b >> 2u] >> shift) & 255u;
+    let p = (buf_prev4[b >> 2u] >> shift) & 255u;
+    var now = a & 15u;
+    var before = p & 15u;
+    if ((g.x & 1u) == 0u) {
+        now = a >> 4u;
+        before = p >> 4u;
+    }
+    if (now != before) {
+        let cols = (w + TILE - 1u) / TILE;
+        atomicStore(&buf_tiles[(g.y / TILE) * cols + g.x / TILE], 1u);
+    }
 }
