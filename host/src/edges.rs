@@ -4,13 +4,17 @@
 //! Gaussian blur, Sobel gradient, non-maximum suppression, then hysteresis
 //! thresholding. The result is one-pixel black lines on white, drawn on the
 //! darker side of each edge, so outlines sit inside shapes instead of
-//! growing them.
+//! growing them. Enclosed regions that are dark in the original are then
+//! filled solid.
 
 /// Gradient magnitude (|gx| + |gy| of a Sobel over 0..=255 gray, so four
 /// times the step in brightness) from which an edge is certain.
 const HIGH: i32 = 4 * 60;
 /// Gradient magnitude an edge may fade to while still joined to a certain one.
 const LOW: i32 = 4 * 24;
+
+/// Mean gray (0..=255) under which an enclosed region is filled black.
+const DARK: u64 = 100;
 
 /// `gray` is `w`×`h`, one byte per pixel. Returns the same size: 0 on an
 /// edge, 255 elsewhere.
@@ -45,7 +49,46 @@ pub fn detect(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
             out[py * w + px] = 0;
         }
     }
+    fill_dark(gray, &mut out, w, h);
     out
+}
+
+/// Fills the regions the outlines enclose that are dark in the original, so
+/// dark shapes and strokes come out solid instead of hollow.
+///
+/// Regions are the 4-connected runs of non-edge pixels: the one-pixel lines
+/// are 8-connected, so a 4-connected fill cannot slip through a diagonal
+/// step. A region is black when its mean gray is below `DARK`.
+fn fill_dark(gray: &[u8], out: &mut [u8], w: usize, h: usize) {
+    let mut seen = vec![false; w * h];
+    let mut stack = Vec::new();
+    let mut region = Vec::new();
+    for start in 0..w * h {
+        if seen[start] || out[start] == 0 {
+            continue;
+        }
+        seen[start] = true;
+        stack.push(start);
+        region.clear();
+        let mut sum = 0u64;
+        while let Some(i) = stack.pop() {
+            region.push(i);
+            sum += gray[i] as u64;
+            let (x, y) = (i % w, i / w);
+            let neighbors = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+            for n in neighbors.into_iter().flatten() {
+                if !seen[n] && out[n] != 0 {
+                    seen[n] = true;
+                    stack.push(n);
+                }
+            }
+        }
+        if sum < DARK * region.len() as u64 {
+            for &i in &region {
+                out[i] = 0;
+            }
+        }
+    }
 }
 
 /// Separable 5-tap binomial blur (1 4 6 4 1) / 16, borders clamped.
@@ -195,15 +238,35 @@ mod tests {
     fn step_gives_a_thin_line_on_its_dark_side() {
         let (w, h) = (32, 32);
         // Left half black, right half white: the line stays in the black half.
-        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 0 } else { 255 }).collect();
+        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 120 } else { 255 }).collect();
         let black = black_columns(&img, w, h);
         assert!(!black.is_empty() && black.len() == 1, "{black:?}");
         assert!(black.iter().all(|&x| (14..=15).contains(&x)), "{black:?}");
         // And mirrored: right half black, line in the right half.
-        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 255 } else { 0 }).collect();
+        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 255 } else { 120 }).collect();
         let black = black_columns(&img, w, h);
         assert!(!black.is_empty() && black.len() == 1, "{black:?}");
         assert!(black.iter().all(|&x| (16..=17).contains(&x)), "{black:?}");
+    }
+
+    #[test]
+    fn dark_square_is_filled_and_light_one_is_not() {
+        let (w, h) = (48, 32);
+        // A black square on the left and a light gray one on the right, on white.
+        let img: Vec<u8> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                match (x, y) {
+                    (6..=17, 8..=23) => 0,
+                    (30..=41, 8..=23) => 200,
+                    _ => 255,
+                }
+            })
+            .collect();
+        let out = detect(&img, w, h);
+        assert_eq!(out[16 * w + 12], 0, "dark interior is filled");
+        assert_eq!(out[16 * w + 36], 255, "light interior stays white");
+        assert_eq!(out[16 * w + 24], 255, "background stays white");
     }
 
     #[test]
