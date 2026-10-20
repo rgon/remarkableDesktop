@@ -5,10 +5,16 @@
 //! version of the outline). `libvulkan` is loaded at run time: where
 //! there is no Vulkan driver, `Gpu::new` fails and the CPU does the work.
 //!
+//! Frames come in either as gray (the CPU converted them) or as the raw
+//! BGRx capture, which the GPU turns into the gray panel frame itself
+//! (scaling, letterbox bars, rotation: `Convert`), so a busy CPU is not in the
+//! way of the picture.
+//!
 //! One compute pipeline per stage of `edges.wgsl`, all sharing one
-//! descriptor set of nine storage buffers. The work is recorded once into
-//! three command buffers (setup and the first hysteresis rounds; more
-//! hysteresis rounds; placement and read-back) and submitted for each frame.
+//! descriptor set of storage buffers. The work is recorded once into four
+//! command buffers (setup and the first hysteresis rounds; more hysteresis
+//! rounds; placement and read-back; just the conversion) and submitted for
+//! each frame.
 //! Must be created and used on one thread.
 
 use ash::{Device, Entry, Instance, vk};
@@ -18,7 +24,7 @@ use std::ffi::CStr;
 const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/edges.spv"));
 
 /// Entry points of the shader, in `Stage` order.
-const STAGES: [&CStr; 9] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"diff_tiles", c"pack_bits"];
+const STAGES: [&CStr; 10] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"diff_tiles", c"pack_bits", c"convert"];
 
 #[derive(Clone, Copy)]
 enum Stage {
@@ -31,6 +37,7 @@ enum Stage {
     Dark,
     Diff,
     PackBits,
+    Convert,
 }
 
 /// Hysteresis rounds per submission, and submissions at most. A round
@@ -47,13 +54,25 @@ const BITS: usize = 7;
 const PARAMS: usize = 8;
 const TILES: usize = 9;
 const PREV: usize = 10;
-const BUFFERS: usize = 11;
+const SRC: usize = 11;
+const BUFFERS: usize = 12;
 
 struct Buf {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     /// Where the CPU sees it (null for buffers only the GPU touches).
     ptr: *mut u8,
+}
+
+/// A raw BGRx capture that the GPU converts to the panel's gray frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Convert {
+    /// Size of the raw capture.
+    pub src: (usize, usize),
+    /// The tablet's logical (unrotated) size.
+    pub logical: (usize, usize),
+    /// Degrees from the logical screen to the panel: 0, 90, 180 or 270.
+    pub rotation: u16,
 }
 
 pub struct Gpu {
@@ -68,8 +87,8 @@ pub struct Gpu {
     module: vk::ShaderModule,
     pipelines: Vec<vk::Pipeline>,
     buffers: Vec<Buf>,
-    /// Setup, more hysteresis, placement.
-    cmds: [vk::CommandBuffer; 3],
+    /// Setup, more hysteresis, placement, conversion only.
+    cmds: [vk::CommandBuffer; 4],
     fence: vk::Fence,
     size: (usize, usize),
     /// Tiles in the grid of `tiles.rs`.
@@ -78,6 +97,8 @@ pub struct Gpu {
     words: u64,
     /// A frame has been through, so `PREV` holds something to compare with.
     have_prev: bool,
+    dark: u32,
+    convert: Option<Convert>,
     name: String,
 }
 
@@ -99,9 +120,16 @@ fn find_memory(props: &vk::PhysicalDeviceMemoryProperties, bits: u32, want: vk::
 }
 
 impl Gpu {
-    /// Opens the best GPU and prepares for frames of `w`×`h`. Pixels of the
-    /// frame darker than `dark` come out black (0: none do).
-    pub fn new(w: usize, h: usize, dark: u32) -> Result<Gpu, String> {
+    /// Whether there is a GPU to use (and its name), found by setting up a
+    /// tiny one.
+    pub fn available() -> Result<String, String> {
+        Gpu::new(16, 16, 0, None).map(|g| g.name().to_string())
+    }
+
+    /// Opens the best GPU and prepares for frames of `w`×`h` (the panel's
+    /// size). Pixels of the frame darker than `dark` come out black (0: none
+    /// do). With `convert`, frames come in raw (`outline_bgrx`, `gray_bgrx`).
+    pub fn new(w: usize, h: usize, dark: u32, convert: Option<Convert>) -> Result<Gpu, String> {
         let spirv = ash::util::read_spv(&mut std::io::Cursor::new(SPIRV)).map_err(|e| format!("shader: {e}"))?;
         let entry = unsafe { Entry::load() }.map_err(|e| format!("no Vulkan loader: {e}"))?;
         let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 0, 0));
@@ -132,19 +160,14 @@ impl Gpu {
             (words, false),
             (4, true),
             (bits_bytes, true),
-            (16, true),
+            (64, true),
             ((tiles as u64 * 4).max(4), true),
             (words, false),
+            (convert.map_or(4, |c| (c.src.0 * c.src.1 * 4) as u64), true),
         ];
         let mut buffers = Vec::with_capacity(BUFFERS);
         for (size, host) in layout {
             buffers.push(Self::buffer(&device, &mem_props, size, host)?);
-        }
-        unsafe {
-            let params = buffers[PARAMS].ptr as *mut u32;
-            params.write(w as u32);
-            params.add(1).write(h as u32);
-            params.add(2).write(dark);
         }
 
         let bindings: Vec<_> = (0..BUFFERS as u32)
@@ -172,12 +195,47 @@ impl Gpu {
         let pipelines = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &pipeline_infos, None) }.map_err(|(_, e)| format!("vulkan pipelines: {e}"))?;
 
         let pool = ve("command pool", unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None) })?;
-        let cmds = ve("command buffers", unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(3)) })?;
+        let cmds = ve("command buffers", unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(4)) })?;
         let fence = ve("fence", unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) })?;
 
-        let gpu = Gpu { _entry: entry, instance, device, queue, pool, set_layout, desc_pool, pipe_layout, module, pipelines, buffers, cmds: [cmds[0], cmds[1], cmds[2]], fence, size: (w, h), tiles, words, have_prev: false, name };
+        let gpu = Gpu { _entry: entry, instance, device, queue, pool, set_layout, desc_pool, pipe_layout, module, pipelines, buffers, cmds: [cmds[0], cmds[1], cmds[2], cmds[3]], fence, size: (w, h), tiles, words, have_prev: false, dark, convert, name };
+        gpu.write_params([0.0, 1.0, 0.0, 1.0]);
         gpu.record(set)?;
         Ok(gpu)
+    }
+
+    /// What the stages need to know about the frame, for the shader's `Params`.
+    /// `shown` is where the capture sits in the tablet's logical frame
+    /// (x0, x1, y0, y1 as fractions): the rest is letterbox, drawn white.
+    fn write_params(&self, shown: [f64; 4]) {
+        let (w, h) = self.size;
+        let c = self.convert;
+        let (lw, lh) = c.map_or((w, h), |c| c.logical);
+        let at = |f: f64, of: usize| (f * of as f64).round().max(0.0) as u32;
+        let len = |a: f64, b: f64, of: usize| (((b - a) * of as f64).round().max(1.0)) as u32;
+        let rot = match c.map_or(0, |c| c.rotation % 360) {
+            90 => 1,
+            180 => 2,
+            270 => 3,
+            _ => 0,
+        };
+        let (sw, sh) = c.map_or((1, 1), |c| c.src);
+        let words: [u32; 13] = [
+            w as u32,
+            h as u32,
+            self.dark,
+            c.is_some() as u32,
+            sw as u32,
+            sh as u32,
+            lw as u32,
+            lh as u32,
+            rot,
+            at(shown[0], lw),
+            at(shown[2], lh),
+            len(shown[0], shown[1], lw),
+            len(shown[2], shown[3], lh),
+        ];
+        unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), self.buffers[PARAMS].ptr as *mut u32, words.len()) };
     }
 
     /// The device's name, for the log.
@@ -230,7 +288,7 @@ impl Gpu {
         Ok(Buf { buffer, memory, ptr })
     }
 
-    /// Records the three command buffers.
+    /// Records the command buffers.
     fn record(&self, set: vk::DescriptorSet) -> Result<(), String> {
         let d = &self.device;
         let groups = (self.size.0.div_ceil(16) as u32, self.size.1.div_ceil(16) as u32);
@@ -268,12 +326,13 @@ impl Gpu {
                     0 => {
                         d.cmd_fill_buffer(cb, self.buffers[OUTLINE].buffer, 0, vk::WHOLE_SIZE, 0xffff_ffff);
                         sync(cb);
-                        for stage in [Stage::BlurH, Stage::BlurV, Stage::Sobel, Stage::Nms] {
+                        for stage in [Stage::Convert, Stage::BlurH, Stage::BlurV, Stage::Sobel, Stage::Nms] {
                             run(cb, stage);
                         }
                         rounds(cb);
                     }
                     1 => rounds(cb),
+                    3 => run(cb, Stage::Convert),
                     _ => {
                         d.cmd_fill_buffer(cb, self.buffers[TILES].buffer, 0, vk::WHOLE_SIZE, 0);
                         sync(cb);
@@ -308,10 +367,43 @@ impl Gpu {
     /// changed since the previous call.
     pub fn outline(&mut self, gray: &[u8]) -> Result<Outline, String> {
         let px = self.size.0 * self.size.1;
-        if gray.len() != px {
+        if gray.len() != px || self.convert.is_some() {
             return Err("frame size changed".into());
         }
         unsafe { std::ptr::copy_nonoverlapping(gray.as_ptr(), self.buffers[INPUT].ptr, px) };
+        self.frame()
+    }
+
+    /// The same for a raw BGRx capture (`Convert::src` in size), `shown`
+    /// being where it sits in the tablet's logical frame.
+    pub fn outline_bgrx(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<Outline, String> {
+        self.upload(raw, shown)?;
+        self.frame()
+    }
+
+    /// Just the gray panel frame of a raw BGRx capture, for the view that
+    /// shows grays: `w * h` bytes.
+    pub fn gray_bgrx(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<Vec<u8>, String> {
+        self.upload(raw, shown)?;
+        self.submit(3)?;
+        let px = self.size.0 * self.size.1;
+        let mut gray = vec![0u8; px];
+        unsafe { std::ptr::copy_nonoverlapping(self.buffers[INPUT].ptr, gray.as_mut_ptr(), px) };
+        Ok(gray)
+    }
+
+    fn upload(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<(), String> {
+        let c = self.convert.ok_or("not set up for raw frames")?;
+        if raw.len() != c.src.0 * c.src.1 * 4 {
+            return Err("capture size changed".into());
+        }
+        self.write_params(shown);
+        unsafe { std::ptr::copy_nonoverlapping(raw.as_ptr(), self.buffers[SRC].ptr, raw.len()) };
+        Ok(())
+    }
+
+    /// Runs the stages on what is in the input buffer(s).
+    fn frame(&mut self) -> Result<Outline, String> {
         self.submit(0)?;
         let changed = || unsafe { (self.buffers[CHANGED].ptr as *const u32).read_volatile() };
         let mut batches = 1;
@@ -361,7 +453,7 @@ mod tests {
     #[test]
     fn matches_the_cpu() {
         let (w, h) = (203, 157);
-        let mut gpu = match Gpu::new(w, h, crate::edges::DARK as u32) {
+        let mut gpu = match Gpu::new(w, h, crate::edges::DARK as u32, None) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("skipped, no GPU: {e}");
@@ -415,5 +507,74 @@ mod tests {
         let grid = crate::tiles::Grid::new(w, h);
         let (a, b) = (crate::edges::unpack_bits(&again.bits, w, h), crate::edges::unpack_bits(&next.bits, w, h));
         assert_eq!(next.dirty.expect("flags"), grid.dirty(&a, &b));
+    }
+
+    /// The same conversion on the CPU, step by step as `edges.wgsl` does it.
+    fn reference(src: &[u8], (sw, sh): (usize, usize), (lw, lh): (usize, usize), rotation: u16, (w, h): (usize, usize), sc: (i32, i32, i32, i32)) -> Vec<u8> {
+        let luma = |x: i32, y: i32| {
+            let p = &src[(y as usize * sw + x as usize) * 4..][..4];
+            0.299 * p[2] as f32 + 0.587 * p[1] as f32 + 0.114 * p[0] as f32
+        };
+        let mut out = vec![0u8; w * h];
+        for oy in 0..h as i32 {
+            for ox in 0..w as i32 {
+                let (lw, lh) = (lw as i32, lh as i32);
+                let (lx, ly) = match rotation {
+                    90 => (lw - 1 - oy, ox),
+                    180 => (lw - 1 - ox, lh - 1 - oy),
+                    270 => (oy, lh - 1 - ox),
+                    _ => (ox, oy),
+                };
+                let (rx, ry) = (lx - sc.0, ly - sc.1);
+                out[oy as usize * w + ox as usize] = if rx < 0 || ry < 0 || rx >= sc.2 || ry >= sc.3 {
+                    255
+                } else {
+                    let fx = (rx as f32 + 0.5) * sw as f32 / sc.2 as f32 - 0.5;
+                    let fy = (ry as f32 + 0.5) * sh as f32 / sc.3 as f32 - 0.5;
+                    let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+                    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                    let (maxx, maxy) = (sw as i32 - 1, sh as i32 - 1);
+                    let (xa, xb, ya, yb) = (x0.clamp(0, maxx), (x0 + 1).clamp(0, maxx), y0.clamp(0, maxy), (y0 + 1).clamp(0, maxy));
+                    let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
+                    let top = mix(luma(xa, ya), luma(xb, ya), tx);
+                    let bottom = mix(luma(xa, yb), luma(xb, yb), tx);
+                    (mix(top, bottom, ty) + 0.5).clamp(0.0, 255.0) as u8
+                };
+            }
+        }
+        out
+    }
+
+    /// A raw capture turns into the panel's gray frame: scaled into the
+    /// letterbox, bars white, rotated. Skipped where there is no GPU.
+    #[test]
+    fn converts_a_raw_capture_like_the_reference() {
+        // A 320x180 capture shown in a 240x180 logical screen (bars above and
+        // below), rotated a quarter turn onto a 180x240 panel.
+        let (src_size, logical, panel) = ((320usize, 180usize), (240usize, 180usize), (180usize, 240usize));
+        let shown = [0.0, 1.0, 0.125, 0.875];
+        let mut gpu = match Gpu::new(panel.0, panel.1, 0, Some(Convert { src: src_size, logical, rotation: 90 })) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("skipped, no GPU: {e}");
+                return;
+            }
+        };
+        let mut raw = vec![0u8; src_size.0 * src_size.1 * 4];
+        for y in 0..src_size.1 {
+            for x in 0..src_size.0 {
+                let p = &mut raw[(y * src_size.0 + x) * 4..][..4];
+                p.copy_from_slice(&[(x * 255 / src_size.0) as u8, (y * 255 / src_size.1) as u8, ((x + y) * 255 / (src_size.0 + src_size.1)) as u8, 0]);
+            }
+        }
+        // 0.125 * 180 = 22.5 rounds to 23; the picture is 0.75 * 180 = 135 high.
+        let want = reference(&raw, src_size, logical, 90, panel, (0, 23, 240, 135));
+        let got = gpu.gray_bgrx(&raw, shown).expect("gpu frame");
+        assert_eq!(got.len(), want.len());
+        let worst = want.iter().zip(&got).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        let off = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+        assert!(worst <= 1, "differs by {worst} somewhere ({off} pixels off) on {}", gpu.name());
+        // The bars are white: the panel's first and last columns are the logical frame's top and bottom rows.
+        assert!(got.chunks(panel.0).all(|row| row[0] == 255 && row[panel.0 - 1] == 255));
     }
 }

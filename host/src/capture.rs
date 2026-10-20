@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use zbus::blocking::{Connection, Proxy};
-use zbus::zvariant::{OwnedObjectPath, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 const DEST: &str = "org.gnome.Mutter.ScreenCast";
 /// Embed the pointer in the frames so it shows on the tablet.
@@ -20,6 +20,16 @@ pub enum Source {
     Monitor(String),
 }
 
+/// How frames leave GStreamer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Format {
+    /// Gray, scaled, letterboxed and rotated to the panel's portrait layout
+    /// (all done by GStreamer, on the CPU).
+    Gray,
+    /// The capture as it is, BGRx at its own size: the GPU does the rest.
+    Bgrx,
+}
+
 pub struct Capture {
     /// Connector of the virtual monitor we created, if any.
     pub virtual_name: Option<String>,
@@ -27,9 +37,23 @@ pub struct Capture {
     session: OwnedObjectPath,
     gst: Child,
     out: ChildStdout,
-    /// Output frame size (panel portrait), bytes = width * height.
+    /// Output frame size (panel portrait), bytes = width * height (`Gray`).
     pub width: usize,
     pub height: usize,
+    pub format: Format,
+    /// The capture's own size (`Bgrx` frames are this wide and high, 4 bytes a pixel).
+    pub src_size: (usize, usize),
+}
+
+/// The size in a stream's `Parameters`, written the way a GVariant prints:
+/// `{"position": (0, 0), "size": (1920, 1080), ...}`.
+fn parse_size(parameters: &str) -> Option<(usize, usize)> {
+    let tail = &parameters[parameters.find("size")?..];
+    let numbers: Vec<usize> = tail.split(|c: char| !c.is_ascii_digit()).filter(|n| !n.is_empty()).take(2).filter_map(|n| n.parse().ok()).collect();
+    match numbers[..] {
+        [w, h] if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    }
 }
 
 /// GStreamer `videoflip` method turning the tablet's logical (rotated)
@@ -46,7 +70,7 @@ fn flip(rotation: u16) -> &'static str {
 impl Capture {
     /// `logical` is the tablet's screen size as the user sees it (e.g.
     /// 1872x1404 when rotated 90°); frames come out in panel portrait.
-    pub fn start(source: &Source, logical: (u32, u32), rotation: u16) -> Result<Capture, String> {
+    pub fn start(source: &Source, logical: (u32, u32), rotation: u16, format: Format) -> Result<Capture, String> {
         let err = |what: &'static str| move |e: zbus::Error| format!("{what}: {e}");
         let conn = Connection::session().map_err(err("session bus"))?;
         let screencast = Proxy::new(&conn, DEST, "/org/gnome/Mutter/ScreenCast", "org.gnome.Mutter.ScreenCast").map_err(err("ScreenCast"))?;
@@ -65,6 +89,16 @@ impl Capture {
             Source::Monitor(c) => sess.call("RecordMonitor", &(c.as_str(), props)).map_err(err("RecordMonitor"))?,
         };
         let stream = Proxy::new(&conn, DEST, stream.as_str(), "org.gnome.Mutter.ScreenCast.Stream").map_err(err("stream"))?;
+        // Raw frames need to be told their size: a virtual monitor has the
+        // one we ask for, a real one says in its `Parameters`.
+        let src_size = match (format, source) {
+            (Format::Bgrx, Source::Virtual) => (logical.0 as usize, logical.1 as usize),
+            (Format::Bgrx, Source::Monitor(_)) => {
+                let parameters: OwnedValue = stream.get_property("Parameters").map_err(err("stream parameters"))?;
+                parse_size(&parameters.to_string()).ok_or("the monitor's size is not in the stream parameters")?
+            }
+            (Format::Gray, _) => (0, 0),
+        };
         let mut added = stream.receive_signal("PipeWireStreamAdded").map_err(err("subscribe"))?;
         sess.call_method("Start", &()).map_err(err("Start"))?;
         let node: u32 = added
@@ -81,16 +115,25 @@ impl Capture {
             Source::Virtual => format!("video/x-raw,width={lw},height={lh} ! "),
             Source::Monitor(_) => String::new(),
         };
-        let pipeline = format!(
-            // Leaky single-buffer queues: when we are busy, stale frames are
-            // dropped instead of queued (latency over completeness).
-            "pipewiresrc path={node} always-copy=true ! {source_caps}queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! \
-             videoconvert ! videoscale add-borders=true ! \
-             video/x-raw,format=GRAY8,width={lw},height={lh},pixel-aspect-ratio=1/1 ! videoflip method={} ! \
-             video/x-raw,format=GRAY8,width={pw},height={ph} ! \
-             queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! fdsink fd=1 sync=false",
-            flip(rotation)
-        );
+        let pipeline = match format {
+            Format::Gray => format!(
+                // Leaky single-buffer queues: when we are busy, stale frames are
+                // dropped instead of queued (latency over completeness).
+                "pipewiresrc path={node} always-copy=true ! {source_caps}queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! \
+                 videoconvert ! videoscale add-borders=true ! \
+                 video/x-raw,format=GRAY8,width={lw},height={lh},pixel-aspect-ratio=1/1 ! videoflip method={} ! \
+                 video/x-raw,format=GRAY8,width={pw},height={ph} ! \
+                 queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! fdsink fd=1 sync=false",
+                flip(rotation)
+            ),
+            // Nothing to compute here: the frame goes to the pipe as it is
+            // (`videoconvert` only passes it on when it is BGRx already).
+            Format::Bgrx => format!(
+                "pipewiresrc path={node} always-copy=true ! {source_caps}queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! \
+                 videoconvert ! video/x-raw,format=BGRx ! \
+                 queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 ! fdsink fd=1 sync=false"
+            ),
+        };
         let mut gst = Command::new("gst-launch-1.0")
             .arg("-q")
             .args(pipeline.split_whitespace())
@@ -112,7 +155,15 @@ impl Capture {
             },
             None => None,
         };
-        Ok(Capture { virtual_name, _conn: conn, session, gst, out, width: pw as usize, height: ph as usize })
+        Ok(Capture { virtual_name, _conn: conn, session, gst, out, width: pw as usize, height: ph as usize, format, src_size })
+    }
+
+    /// The size of one frame in the pipe.
+    pub fn frame_bytes(&self) -> usize {
+        match self.format {
+            Format::Gray => self.width * self.height,
+            Format::Bgrx => self.src_size.0 * self.src_size.1 * 4,
+        }
     }
 
     /// Waits up to `timeout` for a frame to start arriving, then reads all
@@ -123,7 +174,7 @@ impl Capture {
         if unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as i32) } <= 0 {
             return Ok(false);
         }
-        buf.resize(self.width * self.height, 0);
+        buf.resize(self.frame_bytes(), 0);
         self.out.read_exact(buf)?;
         // While we were busy, GStreamer sat blocked writing its next frame
         // into the pipe, so that frame is as old as our busy time. Whatever is
@@ -149,5 +200,18 @@ impl Drop for Capture {
         if let Ok(sess) = Proxy::new(&self._conn, DEST, self.session.as_str(), "org.gnome.Mutter.ScreenCast.Session") {
             let _ = sess.call_method("Stop", &());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_size;
+
+    #[test]
+    fn reads_the_size_from_printed_parameters() {
+        assert_eq!(parse_size(r#"{"position": (1440, 1731), "size": (1920, 1080), "output-name": "eDP-1"}"#), Some((1920, 1080)));
+        assert_eq!(parse_size(r#"[{"size": <(3440, 1440)>, "position": <(1440, 291)>}]"#), Some((3440, 1440)));
+        assert_eq!(parse_size(r#"{"position": (0, 0)}"#), None);
+        assert_eq!(parse_size(r#"{"size": (0, 0)}"#), None);
     }
 }

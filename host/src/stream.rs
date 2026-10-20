@@ -5,7 +5,7 @@
 //! again for the tablet's quality refresh, which clears the fast mode's
 //! ghosting; the host decides which tiles and when, as it knows what changed.
 
-use crate::capture::{Capture, Source};
+use crate::capture::{Capture, Format, Source};
 use crate::edges;
 use crate::tiles::{self, Grid};
 use remdesktop_proto::{DisplayMode, Msg, RECT_BITS1, RECT_LAST, RECT_SETTLE, bits1, gray4};
@@ -199,6 +199,12 @@ impl Streamer {
             let mut current: Option<(u64, Capture)> = None;
             let mut raw = vec![];
             let mut detector = edges::Detector::new();
+            // The panel's frame size (portrait for a quarter turn).
+            let (pw, ph) = if rotation % 180 == 90 { (logical.1 as usize, logical.0 as usize) } else { (logical.0 as usize, logical.1 as usize) };
+            // Raw captures, converted on the GPU, while there is one and it works.
+            let mut raw_ok = detector.gpu_ready();
+            // How `raw` came out of the pipe.
+            let mut raw_format = Format::Gray;
             // `raw` holds a frame of this generation that is not yet rendered.
             let mut raw_new = false;
             let mut raw_for: Option<u64> = None;
@@ -224,7 +230,32 @@ impl Streamer {
                 if current.as_ref().map(|c| c.0) != Some(generation) {
                     current = None; // stops the old stream (and removes a virtual monitor)
                     if let Some(src) = &wanted {
-                        match Capture::start(src, logical, rotation) {
+                        // Raw frames for the GPU if it can take them, else GStreamer converts.
+                        let mut started = None;
+                        if raw_ok {
+                            match Capture::start(src, logical, rotation, Format::Bgrx) {
+                                Ok(c) => {
+                                    let geometry = edges::Convert { src: c.src_size, logical: (logical.0 as usize, logical.1 as usize), rotation };
+                                    if detector.use_raw(geometry, pw, ph) {
+                                        started = Some(Ok(c));
+                                    } else {
+                                        raw_ok = false;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("remdesktop-host: capture {src:?} as raw frames: {e}; converting on the CPU");
+                                    raw_ok = false;
+                                }
+                            }
+                        }
+                        let started = match started {
+                            Some(c) => c,
+                            None => {
+                                detector.reset();
+                                Capture::start(src, logical, rotation, Format::Gray)
+                            }
+                        };
+                        match started {
                             Ok(c) => {
                                 let mut s = lock.lock().unwrap();
                                 s.started = Some(c.virtual_name.clone());
@@ -248,7 +279,10 @@ impl Streamer {
                 match cap.next_frame(&mut raw, wait) {
                     Ok(true) => {
                         captured_at = Instant::now();
-                        whiten_bars(&mut raw, logical, rotation, shown);
+                        raw_format = cap.format;
+                        if raw_format == Format::Gray {
+                            whiten_bars(&mut raw, logical, rotation, shown);
+                        }
                         raw_for = Some(generation);
                         raw_new = true;
                     }
@@ -280,13 +314,27 @@ impl Streamer {
                         epoch += 1;
                     }
                     raw_new = false;
-                    let (pw, ph) = if rotation % 180 == 90 { (logical.1 as usize, logical.0 as usize) } else { (logical.0 as usize, logical.1 as usize) };
-                    let (picture, on_gpu, tiles_changed) = match mode {
-                        DisplayMode::Edge => {
+                    let rendered: Result<(Picture, bool, Option<Vec<bool>>), String> = match (raw_format, mode) {
+                        // Nothing is sent; the frame is never looked at.
+                        (_, DisplayMode::None) => Ok((Picture::Gray(vec![]), false, None)),
+                        (Format::Bgrx, DisplayMode::Edge) => detector.detect_raw(&raw, shown).map(|d| (Picture::Bits(d.bits), d.on_gpu, d.dirty)),
+                        (Format::Bgrx, _) => detector.gray_raw(&raw, shown).map(|g| (Picture::Gray(g.iter().map(|&v| gray4::level(v)).collect()), false, None)),
+                        (Format::Gray, DisplayMode::Edge) => {
                             let d = detector.detect(&raw, pw, ph);
-                            (Picture::Bits(d.bits), d.on_gpu, d.dirty)
+                            Ok((Picture::Bits(d.bits), d.on_gpu, d.dirty))
                         }
-                        _ => (Picture::Gray(raw.iter().map(|&v| gray4::level(v)).collect()), false, None),
+                        (Format::Gray, _) => Ok((Picture::Gray(raw.iter().map(|&v| gray4::level(v)).collect()), false, None)),
+                    };
+                    let (picture, on_gpu, tiles_changed) = match rendered {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // The GPU let us down: start over with GStreamer converting.
+                            eprintln!("remdesktop-host: the GPU failed on a raw frame ({e}); converting on the CPU from now on");
+                            raw_ok = false;
+                            current = None;
+                            raw_for = None;
+                            continue;
+                        }
                     };
                     seq += 1;
                     let mut s = lock.lock().unwrap();

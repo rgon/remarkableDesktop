@@ -74,7 +74,7 @@ fn parse() -> Result<Args, String> {
                 let src = value()?;
                 let path = it.next().ok_or("--capture-test needs an output path")?;
                 let source = if src == "virtual" { capture::Source::Virtual } else { capture::Source::Monitor(src) };
-                let mut cap = capture::Capture::start(&source, (1872, 1404), 90)?;
+                let mut cap = capture::Capture::start(&source, (1872, 1404), 90, capture::Format::Gray)?;
                 let mut frame = vec![];
                 let t = std::time::Instant::now();
                 while !cap.next_frame(&mut frame, Duration::from_secs(5)).map_err(|e| format!("frame: {e}"))? {}
