@@ -11,7 +11,6 @@ use crate::display::Rect;
 use crate::epd::ImageInfo;
 use crate::input::{ABS_X, ABS_Y, BTN_LEFT, BTN_TOOL_RUBBER, BTN_TOUCH, EV_ABS, EV_KEY};
 use remdesktop_proto::Event;
-use std::collections::HashMap;
 
 const BLACK: u32 = 0xff00_0000;
 /// Brush radius in pixels (a 3 px square).
@@ -20,9 +19,14 @@ const BRUSH: i32 = 1;
 #[derive(Default)]
 pub struct Ink {
     pub on: bool,
-    /// Panel pixel index (y * width + x) → the pixel the ink covers.
-    under: HashMap<usize, u32>,
-    /// Bounding box of `under`.
+    /// What each inked pixel covered, by panel pixel index (y * width + x).
+    /// Only meaningful where `mask` has the bit set.
+    saved: Vec<u32>,
+    /// One bit per panel pixel: inked.
+    mask: Vec<u64>,
+    width: usize,
+    /// Bounding box of the ink (may be larger than the ink itself once
+    /// streamed updates drop parts of it).
     dirty: Option<Rect>,
     /// Drawn since the last `take_pending`.
     pending: Option<Rect>,
@@ -40,6 +44,47 @@ fn grow(r: Option<Rect>, add: Rect) -> Option<Rect> {
 impl Ink {
     pub fn new(on: bool) -> Self {
         Self { on, ..Self::default() }
+    }
+
+    /// Allocates the snapshot on first use (about 10 MB on an rM2).
+    fn ensure(&mut self, fb: &ImageInfo) {
+        let n = fb.width as usize * fb.height as usize;
+        if self.saved.len() != n {
+            self.saved = vec![0; n];
+            self.mask = vec![0; n.div_ceil(64)];
+            self.width = fb.width as usize;
+        }
+    }
+
+    /// Clears the mask bits of `[start, end)`.
+    fn clear_bits(&mut self, start: usize, end: usize) {
+        let mut i = start;
+        while i < end {
+            let (word, bit) = (i / 64, i % 64);
+            let n = (64 - bit).min(end - i);
+            let m = if n == 64 { u64::MAX } else { ((1u64 << n) - 1) << bit };
+            self.mask[word] &= !m;
+            i += n;
+        }
+    }
+
+    /// Calls `f` with the index of every set bit in `[start, end)`.
+    fn for_each_set(&self, start: usize, end: usize, mut f: impl FnMut(usize)) {
+        let mut i = start;
+        while i < end {
+            let (word, bit) = (i / 64, i % 64);
+            let n = (64 - bit).min(end - i);
+            let mut w = self.mask[word] >> bit;
+            if n < 64 {
+                w &= (1u64 << n) - 1;
+            }
+            while w != 0 {
+                let t = w.trailing_zeros() as usize;
+                f(i + t);
+                w &= w - 1;
+            }
+            i += n;
+        }
     }
 
     /// Tracks one pen frame (events as `Pen::feed` makes them). Returns the
@@ -71,6 +116,7 @@ impl Ink {
 
     /// Draws to panel pixel `p`, joined to the previous point of the stroke.
     pub fn stroke(&mut self, fb: &ImageInfo, p: [i32; 2]) {
+        self.ensure(fb);
         let from = self.last.unwrap_or(p);
         self.last = Some(p);
         let (mut x, mut y) = (from[0], from[1]);
@@ -106,7 +152,12 @@ impl Ink {
         for y in (cy - BRUSH).max(0)..=(cy + BRUSH).min(fb.height - 1) {
             for x in (cx - BRUSH).max(0)..=(cx + BRUSH).min(fb.width - 1) {
                 let px = unsafe { fb.pixels.add(y as usize * fb.stride as usize + x as usize * 4) as *mut u32 };
-                self.under.entry(y as usize * fb.width as usize + x as usize).or_insert_with(|| unsafe { px.read_unaligned() });
+                let i = y as usize * self.width + x as usize;
+                let bit = 1u64 << (i % 64);
+                if self.mask[i / 64] & bit == 0 {
+                    self.mask[i / 64] |= bit;
+                    self.saved[i] = unsafe { px.read_unaligned() };
+                }
                 unsafe { px.write_unaligned(BLACK) };
             }
         }
@@ -118,43 +169,48 @@ impl Ink {
     }
 
     /// A streamed update overwrote `r`: the ink in it is gone.
-    pub fn overwritten(&mut self, fb: &ImageInfo, r: Rect) {
-        if !self.dirty.is_some_and(|d| d.intersects(r)) {
-            return;
+    pub fn overwritten(&mut self, _fb: &ImageInfo, r: Rect) {
+        let Some(d) = self.dirty.filter(|d| d.intersects(r)) else { return };
+        let (x0, x1) = (r.x.max(d.x) as usize, (r.x + r.w).min(d.x + d.w) as usize);
+        for y in r.y.max(d.y)..(r.y + r.h).min(d.y + d.h) {
+            let row = y as usize * self.width;
+            self.clear_bits(row + x0, row + x1);
         }
-        let w = fb.width as usize;
-        self.under.retain(|&i, _| {
-            let (x, y) = ((i % w) as i32, (i / w) as i32);
-            !(x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
-        });
-        self.dirty = self.bounds(w);
-    }
-
-    fn bounds(&self, w: usize) -> Option<Rect> {
-        let mut it = self.under.keys().map(|&i| ((i % w) as i32, (i / w) as i32));
-        let (x, y) = it.next()?;
-        let (x0, y0, x1, y1) = it.fold((x, y, x, y), |(a, b, c, d), (x, y)| (a.min(x), b.min(y), c.max(x), d.max(y)));
-        Some(Rect { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 })
     }
 
     /// Forgets the ink without touching the panel buffer (it was redrawn).
     pub fn forget(&mut self) {
-        self.under.clear();
-        self.dirty = None;
+        if let Some(d) = self.dirty.take() {
+            for y in d.y..d.y + d.h {
+                let row = y as usize * self.width;
+                self.clear_bits(row + d.x as usize, row + (d.x + d.w) as usize);
+            }
+        }
         self.pending = None;
         self.last = None;
     }
 
     /// Puts back everything the ink covered. Returns the area to refresh.
     pub fn restore(&mut self, fb: &ImageInfo) -> Option<Rect> {
-        let w = fb.width as usize;
-        for (&i, &old) in &self.under {
-            let px = unsafe { fb.pixels.add((i / w) * fb.stride as usize + (i % w) * 4) as *mut u32 };
-            unsafe { px.write_unaligned(old) };
+        let d = self.dirty?;
+        let w = self.width;
+        let mut bounds: Option<(i32, i32, i32, i32)> = None;
+        for y in d.y..d.y + d.h {
+            let row = y as usize * w;
+            let mut hit: Option<(usize, usize)> = None;
+            self.for_each_set(row + d.x as usize, row + (d.x + d.w) as usize, |i| {
+                let x = i - row;
+                let px = unsafe { fb.pixels.add(y as usize * fb.stride as usize + x * 4) as *mut u32 };
+                unsafe { px.write_unaligned(self.saved[i]) };
+                hit = Some(hit.map_or((x, x), |(a, b)| (a.min(x), b.max(x))));
+            });
+            if let Some((a, b)) = hit {
+                let (a, b) = (a as i32, b as i32);
+                bounds = Some(bounds.map_or((a, y, b, y), |(x0, y0, x1, _)| (x0.min(a), y0, x1.max(b), y)));
+            }
         }
-        let area = self.dirty;
         self.forget();
-        area
+        bounds.map(|(x0, y0, x1, y1)| Rect { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 })
     }
 }
 
