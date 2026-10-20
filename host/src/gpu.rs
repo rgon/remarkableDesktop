@@ -1,21 +1,16 @@
-//! Edge detection's per-pixel stages (blur, Sobel, suppression, hysteresis,
-//! line placement, dark pixels) and the comparison with the previous frame
-//! (which tiles changed) on the GPU through Vulkan, so a frame costs the CPU
-//! only a copy in and a copy out (see `edges.rs`, which also has the CPU
-//! version of the outline). `libvulkan` is loaded at run time: where
-//! there is no Vulkan driver, `Gpu::new` fails and the CPU does the work.
-//!
-//! Frames come in either as gray (the CPU converted them) or as the raw
-//! BGRx capture, which the GPU turns into the gray panel frame itself
-//! (scaling, letterbox bars, rotation: `Convert`), so a busy CPU is not in the
-//! way of the picture.
+//! The picture path on the GPU through Vulkan: the raw BGRx capture becomes
+//! the panel's gray frame (scaling, letterbox bars, rotation), and for the
+//! edge view that frame goes through blur, Sobel, suppression, hysteresis,
+//! line placement and dark pixels, then is compared with the previous frame
+//! (which tiles changed) and packed to bits. The CPU only copies the capture
+//! in and the result out, so a busy CPU is not in the way of the picture.
+//! `libvulkan` is loaded at run time; without a Vulkan GPU `Gpu::new` fails.
 //!
 //! One compute pipeline per stage of `edges.wgsl`, all sharing one
 //! descriptor set of storage buffers. The work is recorded once into four
 //! command buffers (setup and the first hysteresis rounds; more hysteresis
 //! rounds; placement and read-back; just the conversion) and submitted for
-//! each frame.
-//! Must be created and used on one thread.
+//! each frame. Must be created and used on one thread.
 
 use ash::{Device, Entry, Instance, vk};
 use std::ffi::CStr;
@@ -39,6 +34,9 @@ enum Stage {
     PackBits,
     Convert,
 }
+
+/// Gray (0..=255) under which a pixel is drawn black, outline or not.
+pub const DARK: u32 = 100;
 
 /// Hysteresis rounds per submission, and submissions at most. A round
 /// extends edges by one pixel, so this covers weak edge chains of 512 pixels
@@ -98,7 +96,7 @@ pub struct Gpu {
     /// A frame has been through, so `PREV` holds something to compare with.
     have_prev: bool,
     dark: u32,
-    convert: Option<Convert>,
+    convert: Convert,
     name: String,
 }
 
@@ -120,16 +118,10 @@ fn find_memory(props: &vk::PhysicalDeviceMemoryProperties, bits: u32, want: vk::
 }
 
 impl Gpu {
-    /// Whether there is a GPU to use (and its name), found by setting up a
-    /// tiny one.
-    pub fn available() -> Result<String, String> {
-        Gpu::new(16, 16, 0, None).map(|g| g.name().to_string())
-    }
-
-    /// Opens the best GPU and prepares for frames of `w`×`h` (the panel's
-    /// size). Pixels of the frame darker than `dark` come out black (0: none
-    /// do). With `convert`, frames come in raw (`outline_bgrx`, `gray_bgrx`).
-    pub fn new(w: usize, h: usize, dark: u32, convert: Option<Convert>) -> Result<Gpu, String> {
+    /// Opens the best GPU and prepares for panel frames of `w`×`h` made from
+    /// raw captures as `convert` says. Pixels darker than `dark` come out
+    /// black in the edge view (0: none do).
+    pub fn new(w: usize, h: usize, dark: u32, convert: Convert) -> Result<Gpu, String> {
         let spirv = ash::util::read_spv(&mut std::io::Cursor::new(SPIRV)).map_err(|e| format!("shader: {e}"))?;
         let entry = unsafe { Entry::load() }.map_err(|e| format!("no Vulkan loader: {e}"))?;
         let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 0, 0));
@@ -163,7 +155,7 @@ impl Gpu {
             (64, true),
             ((tiles as u64 * 4).max(4), true),
             (words, false),
-            (convert.map_or(4, |c| (c.src.0 * c.src.1 * 4) as u64), true),
+            ((convert.src.0 * convert.src.1 * 4) as u64, true),
         ];
         let mut buffers = Vec::with_capacity(BUFFERS);
         for (size, host) in layout {
@@ -210,23 +202,21 @@ impl Gpu {
     fn write_params(&self, shown: [f64; 4]) {
         let (w, h) = self.size;
         let c = self.convert;
-        let (lw, lh) = c.map_or((w, h), |c| c.logical);
+        let (lw, lh) = c.logical;
         let at = |f: f64, of: usize| (f * of as f64).round().max(0.0) as u32;
         let len = |a: f64, b: f64, of: usize| (((b - a) * of as f64).round().max(1.0)) as u32;
-        let rot = match c.map_or(0, |c| c.rotation % 360) {
+        let rot = match c.rotation % 360 {
             90 => 1,
             180 => 2,
             270 => 3,
             _ => 0,
         };
-        let (sw, sh) = c.map_or((1, 1), |c| c.src);
-        let words: [u32; 13] = [
+        let words: [u32; 12] = [
             w as u32,
             h as u32,
             self.dark,
-            c.is_some() as u32,
-            sw as u32,
-            sh as u32,
+            c.src.0 as u32,
+            c.src.1 as u32,
             lw as u32,
             lh as u32,
             rot,
@@ -241,11 +231,6 @@ impl Gpu {
     /// The device's name, for the log.
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// The frame size this was set up for.
-    pub fn size(&self) -> (usize, usize) {
-        self.size
     }
 
     /// A GPU (not a software renderer) with a compute queue: discrete first.
@@ -362,20 +347,10 @@ impl Gpu {
         }
     }
 
-    /// The outline of `gray` (`w`×`h` as given to `new`) as `edges::outline`
-    /// makes it, with dark pixels black, packed to bits, and the tiles that
+    /// The outline of a raw BGRx capture (`Convert::src` in size), `shown`
+    /// being where it sits in the tablet's logical frame: the edge view of
+    /// the panel frame packed to bits (set = white), and the tiles that
     /// changed since the previous call.
-    pub fn outline(&mut self, gray: &[u8]) -> Result<Outline, String> {
-        let px = self.size.0 * self.size.1;
-        if gray.len() != px || self.convert.is_some() {
-            return Err("frame size changed".into());
-        }
-        unsafe { std::ptr::copy_nonoverlapping(gray.as_ptr(), self.buffers[INPUT].ptr, px) };
-        self.frame()
-    }
-
-    /// The same for a raw BGRx capture (`Convert::src` in size), `shown`
-    /// being where it sits in the tablet's logical frame.
     pub fn outline_bgrx(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<Outline, String> {
         self.upload(raw, shown)?;
         self.frame()
@@ -393,7 +368,7 @@ impl Gpu {
     }
 
     fn upload(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<(), String> {
-        let c = self.convert.ok_or("not set up for raw frames")?;
+        let c = self.convert;
         if raw.len() != c.src.0 * c.src.1 * 4 {
             return Err("capture size changed".into());
         }
@@ -402,7 +377,7 @@ impl Gpu {
         Ok(())
     }
 
-    /// Runs the stages on what is in the input buffer(s).
+    /// Runs the stages on the capture in the source buffer.
     fn frame(&mut self) -> Result<Outline, String> {
         self.submit(0)?;
         let changed = || unsafe { (self.buffers[CHANGED].ptr as *const u32).read_volatile() };
@@ -448,18 +423,90 @@ impl Drop for Gpu {
 mod tests {
     use super::*;
 
-    /// The GPU outline is the CPU one, pixel for pixel. Skipped where there
-    /// is no GPU (a CI runner, say).
-    #[test]
-    fn matches_the_cpu() {
-        let (w, h) = (203, 157);
-        let mut gpu = match Gpu::new(w, h, crate::edges::DARK as u32, None) {
-            Ok(g) => g,
+    const FULL: [f64; 4] = [0.0, 1.0, 0.0, 1.0];
+
+    /// A GPU taking frames as they are (no scaling, no rotation), or None
+    /// where there is no GPU (a CI runner, say): the tests then skip.
+    fn gpu(w: usize, h: usize) -> Option<Gpu> {
+        match Gpu::new(w, h, DARK, Convert { src: (w, h), logical: (w, h), rotation: 0 }) {
+            Ok(g) => Some(g),
             Err(e) => {
                 eprintln!("skipped, no GPU: {e}");
-                return;
+                None
             }
-        };
+        }
+    }
+
+    /// A gray image as the raw capture it stands for.
+    fn bgrx(gray: &[u8]) -> Vec<u8> {
+        gray.iter().flat_map(|&g| [g, g, g, 0]).collect()
+    }
+
+    /// The bits of a frame as one byte a pixel: 255 white, 0 black.
+    fn unpack(bits: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let rb = w.div_ceil(8);
+        (0..w * h).map(|i| if bits[(i / w) * rb + (i % w) / 8] >> (7 - (i % w) % 8) & 1 != 0 { 255 } else { 0 }).collect()
+    }
+
+    fn edges_of(gpu: &mut Gpu, gray: &[u8], w: usize, h: usize) -> Vec<u8> {
+        unpack(&gpu.outline_bgrx(&bgrx(gray), FULL).expect("gpu frame").bits, w, h)
+    }
+
+    fn black_columns(out: &[u8], w: usize, row: usize) -> Vec<usize> {
+        (0..w).filter(|&x| out[row * w + x] == 0).collect()
+    }
+
+    #[test]
+    fn a_flat_image_has_no_edges() {
+        let Some(mut gpu) = gpu(32, 32) else { return };
+        assert!(edges_of(&mut gpu, &[128u8; 32 * 32], 32, 32).iter().all(|&v| v == 255));
+    }
+
+    #[test]
+    fn a_step_gives_a_thin_line_on_its_dark_side() {
+        let (w, h) = (32, 32);
+        let Some(mut gpu) = gpu(w, h) else { return };
+        // Left half gray, right half white: the line stays in the gray half.
+        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 120 } else { 255 }).collect();
+        let black = black_columns(&edges_of(&mut gpu, &img, w, h), w, 10);
+        assert!(black.len() == 1 && (14..=15).contains(&black[0]), "{black:?}");
+        // And mirrored: right half gray, line in the right half.
+        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 255 } else { 120 }).collect();
+        let black = black_columns(&edges_of(&mut gpu, &img, w, h), w, 10);
+        assert!(black.len() == 1 && (16..=17).contains(&black[0]), "{black:?}");
+    }
+
+    #[test]
+    fn a_dark_square_is_filled_and_a_light_one_is_not() {
+        let (w, h) = (48, 32);
+        let Some(mut gpu) = gpu(w, h) else { return };
+        // A black square on the left and a light gray one on the right, on white.
+        let img: Vec<u8> = (0..w * h)
+            .map(|i| match (i % w, i / w) {
+                (6..=17, 8..=23) => 0,
+                (30..=41, 8..=23) => 200,
+                _ => 255,
+            })
+            .collect();
+        let out = edges_of(&mut gpu, &img, w, h);
+        assert_eq!(out[16 * w + 12], 0, "dark interior is black");
+        assert_eq!(out[16 * w + 36], 255, "light interior stays white");
+        assert_eq!(out[16 * w + 24], 255, "background stays white");
+    }
+
+    #[test]
+    fn a_weak_isolated_edge_is_dropped() {
+        let (w, h) = (32, 32);
+        let Some(mut gpu) = gpu(w, h) else { return };
+        // A faint step (contrast 20) never reaches the high threshold.
+        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 100 } else { 120 }).collect();
+        assert!(edges_of(&mut gpu, &img, w, h).iter().all(|&v| v == 255));
+    }
+
+    #[test]
+    fn frames_report_the_tiles_that_changed() {
+        let (w, h) = (203, 157);
+        let Some(mut gpu) = gpu(w, h) else { return };
         // Blobs and ramps with some noise: strong and weak edges, all directions.
         let mut seed = 7u32;
         let mut rand = move || {
@@ -480,36 +527,25 @@ mod tests {
                 }
             }
         }
-        for v in img.iter_mut() {
-            *v = v.saturating_add((rand() % 5) as u8);
-        }
-        let mut want = crate::edges::outline(&img, w, h);
-        crate::edges::threshold(&img, &mut want);
-        let first = gpu.outline(&img).expect("gpu frame");
-        let got = &first.bits;
-        let want_bits = crate::edges::pack_bits(&want, w, h);
-        let differing = want_bits.iter().zip(got).filter(|(a, b)| a != b).count();
-        assert_eq!(got.len(), want_bits.len());
-        assert_eq!(differing, 0, "{differing} of {} bytes differ on {}", want_bits.len(), gpu.name());
+        let first = gpu.outline_bgrx(&bgrx(&img), FULL).expect("first frame");
         assert!(first.dirty.is_none(), "nothing to compare the first frame with");
         // The same frame again: nothing changed.
-        let again = gpu.outline(&img).expect("second frame");
-        assert_eq!(&again.bits, got);
+        let again = gpu.outline_bgrx(&bgrx(&img), FULL).expect("second frame");
+        assert_eq!(again.bits, first.bits);
         assert!(again.dirty.expect("flags").iter().all(|&d| !d));
-        // A different one: the tiles the GPU flags are the ones the CPU finds.
+        // A different one: the tiles flagged are the ones that differ.
         let mut other = img.clone();
         for y in 40..70 {
             for x in 90..140 {
                 other[y * w + x] = 255 - other[y * w + x];
             }
         }
-        let next = gpu.outline(&other).expect("third frame");
+        let next = gpu.outline_bgrx(&bgrx(&other), FULL).expect("third frame");
         let grid = crate::tiles::Grid::new(w, h);
-        let (a, b) = (crate::edges::unpack_bits(&again.bits, w, h), crate::edges::unpack_bits(&next.bits, w, h));
-        assert_eq!(next.dirty.expect("flags"), grid.dirty(&a, &b));
+        assert_eq!(next.dirty.expect("flags"), grid.dirty_bits(&again.bits, &next.bits));
     }
 
-    /// The same conversion on the CPU, step by step as `edges.wgsl` does it.
+    /// The conversion on the CPU, step by step as `edges.wgsl` does it.
     fn reference(src: &[u8], (sw, sh): (usize, usize), (lw, lh): (usize, usize), rotation: u16, (w, h): (usize, usize), sc: (i32, i32, i32, i32)) -> Vec<u8> {
         let luma = |x: i32, y: i32| {
             let p = &src[(y as usize * sw + x as usize) * 4..][..4];
@@ -546,14 +582,14 @@ mod tests {
     }
 
     /// A raw capture turns into the panel's gray frame: scaled into the
-    /// letterbox, bars white, rotated. Skipped where there is no GPU.
+    /// letterbox, bars white, rotated.
     #[test]
     fn converts_a_raw_capture_like_the_reference() {
         // A 320x180 capture shown in a 240x180 logical screen (bars above and
         // below), rotated a quarter turn onto a 180x240 panel.
         let (src_size, logical, panel) = ((320usize, 180usize), (240usize, 180usize), (180usize, 240usize));
         let shown = [0.0, 1.0, 0.125, 0.875];
-        let mut gpu = match Gpu::new(panel.0, panel.1, 0, Some(Convert { src: src_size, logical, rotation: 90 })) {
+        let mut gpu = match Gpu::new(panel.0, panel.1, 0, Convert { src: src_size, logical, rotation: 90 }) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("skipped, no GPU: {e}");

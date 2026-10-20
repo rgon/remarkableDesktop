@@ -1,7 +1,8 @@
-// The per-pixel stages of edges.rs on the GPU: blur, Sobel, non-maximum
-// suppression, hysteresis and the placement of the one-pixel line on the
-// darker side. Each stage mirrors its CPU twin there, so both give the same
-// outline. build.rs turns this into SPIR-V (naga); gpu.rs runs it.
+// The whole picture path on the GPU: the raw capture to the panel's gray
+// frame (scale, letterbox, rotate), then for the edge view blur, Sobel,
+// non-maximum suppression, hysteresis, the placement of the one-pixel line on
+// the darker side, dark pixels, the diff against the previous frame and the
+// packing to bits. build.rs turns this into SPIR-V (naga); gpu.rs runs it.
 //
 // Every buffer holds one u32 per pixel, except the packed input and result
 // (four pixels per word), so no stage needs 8-bit storage access.
@@ -13,9 +14,6 @@ struct Params {
     // Pixels of the original darker than this turn black, whatever the
     // outlines say (0: off).
     dark: u32,
-    // 1: `convert` makes the gray frame from the raw capture (below);
-    // 0: the CPU has put it in src_px already.
-    convert: u32,
     // The raw capture's size, the tablet's logical (unrotated) size, the
     // rotation to the panel (0 none, 1 counterclockwise, 2 half turn, 3
     // clockwise) and where the scaled capture sits in the logical frame.
@@ -30,7 +28,7 @@ struct Params {
     sc_h: u32,
 }
 
-// The gray frame, four pixels to a word.
+// The gray frame (made by `convert` from the raw capture), four pixels to a word.
 @group(0) @binding(0) var<storage, read_write> src_px: array<u32>;
 @group(0) @binding(1) var<storage, read_write> buf_tmp: array<u32>;
 @group(0) @binding(2) var<storage, read_write> buf_blur: array<u32>;
@@ -58,7 +56,8 @@ struct Params {
 // Must equal tiles::TILE.
 const TILE: u32 = 32u;
 
-// Must equal LOW and HIGH in edges.rs (4 * 28 and 4 * 70).
+// Gradient magnitudes (|gx| + |gy| of a Sobel, four times the brightness step):
+// an edge is certain from HIGH, and may fade to LOW while joined to one.
 const LOW: i32 = 112;
 const HIGH: i32 = 280;
 
@@ -114,7 +113,7 @@ fn converted(ox: u32, oy: u32) -> u32 {
 @compute @workgroup_size(16, 16)
 fn convert(@builtin(global_invocation_id) g: vec3<u32>) {
     let w = prm.w;
-    if (prm.convert == 0u || g.x >= w || g.y >= prm.h) {
+    if (g.x >= w || g.y >= prm.h) {
         return;
     }
     let n = w * prm.h;
