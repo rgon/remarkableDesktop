@@ -132,6 +132,8 @@ pub struct Ui<'a> {
     pub size: [i32; 2],
     buttons: Vec<Slot>,
     status: [String; STATUS_LINES],
+    /// Battery charge in percent, shown right of the version line.
+    battery: Option<u8>,
 }
 
 impl<'a> Ui<'a> {
@@ -148,7 +150,7 @@ impl<'a> Ui<'a> {
             })
             .collect();
         let status = [concat!("remdesktop v", env!("CARGO_PKG_VERSION")).to_string(), String::new(), String::new(), String::new()];
-        Self { canvas, rotation, size, buttons, status }
+        Self { canvas, rotation, size, buttons, status, battery: None }
     }
 
     fn target(&mut self) -> Rotated<'_, Canvas<'a>> {
@@ -209,9 +211,20 @@ impl<'a> Ui<'a> {
         self.canvas.flush(Mode::Ui);
     }
 
+    /// Sets the battery percentage shown on the version line, redrawing if changed.
+    pub fn set_battery(&mut self, percent: Option<u8>) {
+        if self.battery == percent {
+            return;
+        }
+        self.battery = percent;
+        self.draw_status();
+        self.canvas.flush(Mode::Ui);
+    }
+
     fn draw_status(&mut self) {
         let r = self.status_rect();
         let lines = self.status.clone();
+        let battery = self.battery;
         let mut t = self.target();
         let frame = PrimitiveStyleBuilder::new().fill_color(Gray8::WHITE).stroke_color(Gray8::new(0x80)).stroke_width(3).build();
         let _ = r.into_styled(frame).draw(&mut t);
@@ -219,6 +232,11 @@ impl<'a> Ui<'a> {
         for (i, line) in lines.iter().enumerate() {
             let y = r.top_left.y + 8 + STATUS_LINE_H * i as i32 + 30;
             let _ = Text::new(line, Point::new((r.top_left.x + 16) / 2, y / 2), style).draw(&mut Scaled { target: &mut t, factor: 2 });
+        }
+        if let Some(p) = battery {
+            let text = format!("{p}%");
+            let x = (r.top_left.x + r.size.width as i32 - 16) / 2 - 10 * text.len() as i32;
+            let _ = Text::new(&text, Point::new(x, (r.top_left.y + 8 + 30) / 2), style).draw(&mut Scaled { target: &mut t, factor: 2 });
         }
     }
 

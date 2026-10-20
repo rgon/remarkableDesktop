@@ -179,6 +179,7 @@ pub fn run(args: Args) -> Result<(), String> {
     ui.set_label(Button::Clear, "CLR");
     ui.set_enabled(Button::Clear, state.ink);
     ui.set_enabled(Button::Screen, false);
+    ui.set_battery(crate::link::battery_percent());
     ui.set_status("USB  starting", "HOST not connected", &wifi_line(&crate::link::network_addresses()));
     ui.draw_home();
 
@@ -446,6 +447,7 @@ pub fn run(args: Args) -> Result<(), String> {
         }
         if addresses_at.elapsed() >= Duration::from_secs(5) {
             addresses_at = Instant::now();
+            ui.set_battery(crate::link::battery_percent());
             let now = crate::link::network_addresses();
             if now != addresses {
                 addresses = now;

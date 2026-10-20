@@ -136,6 +136,19 @@ pub fn is_usb(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Battery charge in percent, from the first battery in sysfs.
+pub fn battery_percent() -> Option<u8> {
+    for entry in std::fs::read_dir("/sys/class/power_supply").ok()?.flatten() {
+        let dir = entry.path();
+        if std::fs::read_to_string(dir.join("type")).is_ok_and(|t| t.trim() == "Battery") {
+            if let Some(p) = std::fs::read_to_string(dir.join("capacity")).ok().and_then(|c| c.trim().parse::<u8>().ok()) {
+                return Some(p.min(100));
+            }
+        }
+    }
+    None
+}
+
 /// IPv4 addresses on interfaces other than loopback and USB (e.g. Wi-Fi).
 pub fn network_addresses() -> Vec<String> {
     let mut out = vec![];
