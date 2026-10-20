@@ -2,8 +2,9 @@
 //! far easier to read on e-paper than the screen's grays are.
 //!
 //! Gaussian blur, Sobel gradient, non-maximum suppression, then hysteresis
-//! thresholding. The result is black lines on white, thickened a little so
-//! single-pixel lines survive the panel.
+//! thresholding. The result is one-pixel black lines on white, drawn on the
+//! darker side of each edge, so outlines sit inside shapes instead of
+//! growing them.
 
 /// Gradient magnitude (|gx| + |gy| of a Sobel over 0..=255 gray, so four
 /// times the step in brightness) from which an edge is certain.
@@ -22,16 +23,26 @@ pub fn detect(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
     let (mag, dir) = gradient(&blurred, w, h);
     let thin = suppress(&mag, &dir, w, h);
     let edges = hysteresis(&thin, w, h);
-    // Thicken to 2×2 (down and right), for visibility.
-    for y in 0..h {
-        for x in 0..w {
-            if edges[y * w + x] {
-                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                    if x + dx < w && y + dy < h {
-                        out[(y + dy) * w + x + dx] = 0;
-                    }
-                }
+    // One pixel, on the darker side of the edge.
+    for y in 1..h - 1 {
+        for x in 1..w - 1 {
+            let i = y * w + x;
+            if !edges[i] {
+                continue;
             }
+            let (dx, dy) = dir[i].step();
+            // Toward the brighter side.
+            let (sx, sy) = if blurred[(y as isize + dy) as usize * w + (x as isize + dx) as usize] >= blurred[(y as isize - dy) as usize * w + (x as isize - dx) as usize] {
+                (dx, dy)
+            } else {
+                (-dx, -dy)
+            };
+            // The edge pixel itself, or the one behind it if that is darker.
+            let at = |k: isize| ((y as isize + k * sy) as usize, (x as isize + k * sx) as usize);
+            let (py, px) = at(-1);
+            let k = if gray[py * w + px] < gray[i] { -1 } else { 0 };
+            let (py, px) = at(k);
+            out[py * w + px] = 0;
         }
     }
     out
@@ -75,6 +86,18 @@ enum Dir {
     Diag,
     /// Gradient along the anti-diagonal.
     Anti,
+}
+
+impl Dir {
+    /// A step along the gradient's axis.
+    fn step(self) -> (isize, isize) {
+        match self {
+            Dir::X => (1, 0),
+            Dir::Y => (0, 1),
+            Dir::Diag => (1, 1),
+            Dir::Anti => (1, -1),
+        }
+    }
 }
 
 /// Sobel magnitude and gradient direction; the one-pixel border stays zero.
@@ -162,16 +185,25 @@ mod tests {
         assert!(out.iter().all(|&v| v == 255));
     }
 
-    #[test]
-    fn step_gives_a_thin_line() {
-        // Left half black, right half white: one vertical line near x = 16.
-        let (w, h) = (32, 32);
-        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 0 } else { 255 }).collect();
-        let out = detect(&img, w, h);
+    fn black_columns(img: &[u8], w: usize, h: usize) -> Vec<usize> {
+        let out = detect(img, w, h);
         let row = &out[10 * w..][..w];
-        let black: Vec<usize> = (0..w).filter(|&x| row[x] == 0).collect();
-        assert!(!black.is_empty() && black.len() <= 2, "{black:?}");
-        assert!(black.iter().all(|&x| (14..=17).contains(&x)), "{black:?}");
+        (0..w).filter(|&x| row[x] == 0).collect()
+    }
+
+    #[test]
+    fn step_gives_a_thin_line_on_its_dark_side() {
+        let (w, h) = (32, 32);
+        // Left half black, right half white: the line stays in the black half.
+        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 0 } else { 255 }).collect();
+        let black = black_columns(&img, w, h);
+        assert!(!black.is_empty() && black.len() == 1, "{black:?}");
+        assert!(black.iter().all(|&x| (14..=15).contains(&x)), "{black:?}");
+        // And mirrored: right half black, line in the right half.
+        let img: Vec<u8> = (0..w * h).map(|i| if i % w < 16 { 255 } else { 0 }).collect();
+        let black = black_columns(&img, w, h);
+        assert!(!black.is_empty() && black.len() == 1, "{black:?}");
+        assert!(black.iter().all(|&x| (16..=17).contains(&x)), "{black:?}");
     }
 
     #[test]
