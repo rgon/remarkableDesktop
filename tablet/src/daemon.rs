@@ -588,11 +588,16 @@ pub fn run(args: Args) -> Result<(), String> {
             ui.draw_home();
         }
 
-        let usb_line = match (&gadget, gadget.as_ref().map(|g| g.link())) {
-            (None, _) if !usb => "USB  off",
-            (None, _) => "USB  unavailable",
-            (_, Some(UsbLink::Up)) => "USB  connected (HID input)",
-            (_, Some(UsbLink::Suspended)) => "USB  computer asleep",
+        // The host reaches us over the USB network (in the 10.11.99.x range), not Wi-Fi.
+        let usb_net = host.as_ref().is_some_and(|h| crate::link::is_usb(h.link.peer));
+        let usb_line = match (&gadget, gadget.as_ref().map(|g| g.link()), usb_net) {
+            (None, _, true) => "USB  connected (network)",
+            (None, _, false) if !usb => "USB  off",
+            (None, _, false) => "USB  unavailable",
+            (_, Some(UsbLink::Up), true) => "USB  connected (HID input, network)",
+            (_, Some(UsbLink::Up), false) => "USB  connected (HID input)",
+            (_, Some(UsbLink::Suspended), _) => "USB  computer asleep",
+            (_, _, true) => "USB  connected (network)",
             _ => "USB  not connected",
         };
         let key = (usb_line, host.as_ref().map(|h| h.link.peer), hid_up, addresses_gen);
