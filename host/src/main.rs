@@ -3,7 +3,6 @@
 
 mod capture;
 mod displayconfig;
-mod edges;
 mod gpu;
 mod gsettings;
 mod keymap;
@@ -74,16 +73,18 @@ fn parse() -> Result<Args, String> {
                 let src = value()?;
                 let path = it.next().ok_or("--capture-test needs an output path")?;
                 let source = if src == "virtual" { capture::Source::Virtual } else { capture::Source::Monitor(src) };
-                let mut cap = capture::Capture::start(&source, (1872, 1404), 90, capture::Format::Gray)?;
+                let mut cap = capture::Capture::start(&source, (1872, 1404))?;
                 let mut frame = vec![];
                 let t = std::time::Instant::now();
                 while !cap.next_frame(&mut frame, Duration::from_secs(5)).map_err(|e| format!("frame: {e}"))? {}
                 let first = t.elapsed();
                 println!("virtual monitor: {:?}", cap.virtual_name);
-                let mut pgm = format!("P5\n{} {}\n255\n", cap.width, cap.height).into_bytes();
-                pgm.extend_from_slice(&frame);
+                let (w, h) = cap.src_size;
+                // The raw BGRx frame as a gray picture.
+                let mut pgm = format!("P5\n{w} {h}\n255\n").into_bytes();
+                pgm.extend(frame.chunks_exact(4).map(|p| ((77 * p[2] as u32 + 150 * p[1] as u32 + 29 * p[0] as u32) >> 8) as u8));
                 std::fs::write(&path, pgm).map_err(|e| e.to_string())?;
-                println!("{}x{} frame in {first:?}; outputs now:", cap.width, cap.height);
+                println!("{w}x{h} frame in {first:?}; outputs now:");
                 for o in outputs::list()? {
                     println!("  {} {}x{} at {},{}", o.name, o.w, o.h, o.x, o.y);
                 }

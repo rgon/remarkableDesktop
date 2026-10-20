@@ -5,8 +5,8 @@
 //! again for the tablet's quality refresh, which clears the fast mode's
 //! ghosting; the host decides which tiles and when, as it knows what changed.
 
-use crate::capture::{Capture, Format, Source};
-use crate::edges;
+use crate::capture::{Capture, Source};
+use crate::gpu::{Convert, DARK, Gpu};
 use crate::tiles::{self, Grid};
 use remdesktop_proto::{DisplayMode, Msg, RECT_BITS1, RECT_LAST, RECT_SETTLE, bits1, gray4};
 use std::sync::{Arc, Condvar, Mutex};
@@ -154,38 +154,6 @@ pub struct Streamer {
 
 pub type Send = Box<dyn FnMut(&Msg) -> std::io::Result<()> + std::marker::Send>;
 
-/// Paints the letterbox bars white (GStreamer pads with black). Only rows
-/// and columns that are entirely black and within the expected bar size
-/// (plus rounding slack) are touched, so dark content is left alone.
-fn whiten_bars(frame: &mut [u8], logical: (u32, u32), rotation: u16, shown: [f64; 4]) {
-    let (lw, lh) = (logical.0 as f64, logical.1 as f64);
-    // Bar thickness in logical pixels: (left/right, top/bottom).
-    let bars = (((shown[0] * lw).round() as usize + 2), ((shown[2] * lh).round() as usize + 2));
-    if bars == (2, 2) {
-        return;
-    }
-    // In the panel's portrait layout a 90°/270° rotation swaps the axes.
-    let (pw, ph) = if rotation % 180 == 90 { (logical.1 as usize, logical.0 as usize) } else { (logical.0 as usize, logical.1 as usize) };
-    let (bar_x, bar_y) = if rotation % 180 == 90 { (bars.1, bars.0) } else { bars };
-    if frame.len() != pw * ph {
-        return;
-    }
-    let row_black = |f: &[u8], y: usize| f[y * pw..][..pw].iter().all(|&v| v == 0);
-    let col_black = |f: &[u8], x: usize| (0..ph).all(|y| f[y * pw + x] == 0);
-    for y in (0..bar_y.min(ph)).take_while(|&y| row_black(frame, y)).collect::<Vec<_>>() {
-        frame[y * pw..][..pw].fill(255);
-    }
-    for y in (ph.saturating_sub(bar_y)..ph).rev().take_while(|&y| row_black(frame, y)).collect::<Vec<_>>() {
-        frame[y * pw..][..pw].fill(255);
-    }
-    for x in (0..bar_x.min(pw)).take_while(|&x| col_black(frame, x)).collect::<Vec<_>>() {
-        (0..ph).for_each(|y| frame[y * pw + x] = 255);
-    }
-    for x in (pw.saturating_sub(bar_x)..pw).rev().take_while(|&x| col_black(frame, x)).collect::<Vec<_>>() {
-        (0..ph).for_each(|y| frame[y * pw + x] = 255);
-    }
-}
-
 impl Streamer {
     /// `logical` is the tablet's screen as the user sees it; frames are
     /// produced in panel portrait for `rotation`.
@@ -198,13 +166,10 @@ impl Streamer {
             let (lock, cv) = &*cap_shared;
             let mut current: Option<(u64, Capture)> = None;
             let mut raw = vec![];
-            let mut detector = edges::Detector::new();
             // The panel's frame size (portrait for a quarter turn).
             let (pw, ph) = if rotation % 180 == 90 { (logical.1 as usize, logical.0 as usize) } else { (logical.0 as usize, logical.1 as usize) };
-            // Raw captures, converted on the GPU, while there is one and it works.
-            let mut raw_ok = detector.gpu_ready();
-            // How `raw` came out of the pipe.
-            let mut raw_format = Format::Gray;
+            // Where the picture is made, set up with each capture; rebuilt, with the capture, whenever it fails.
+            let mut gpu: Option<Gpu> = None;
             // `raw` holds a frame of this generation that is not yet rendered.
             let mut raw_new = false;
             let mut raw_for: Option<u64> = None;
@@ -230,39 +195,22 @@ impl Streamer {
                 if current.as_ref().map(|c| c.0) != Some(generation) {
                     current = None; // stops the old stream (and removes a virtual monitor)
                     if let Some(src) = &wanted {
-                        // Raw frames for the GPU if it can take them, else GStreamer converts.
-                        let mut started = None;
-                        if raw_ok {
-                            match Capture::start(src, logical, rotation, Format::Bgrx) {
-                                Ok(c) => {
-                                    let geometry = edges::Convert { src: c.src_size, logical: (logical.0 as usize, logical.1 as usize), rotation };
-                                    if detector.use_raw(geometry, pw, ph) {
-                                        started = Some(Ok(c));
-                                    } else {
-                                        raw_ok = false;
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("remdesktop-host: capture {src:?} as raw frames: {e}; converting on the CPU");
-                                    raw_ok = false;
-                                }
-                            }
-                        }
-                        let started = match started {
-                            Some(c) => c,
-                            None => {
-                                detector.reset();
-                                Capture::start(src, logical, rotation, Format::Gray)
-                            }
-                        };
+                        // The old GPU setup goes first: one device at a time.
+                        gpu = None;
+                        let started = Capture::start(src, logical).and_then(|c| {
+                            let geometry = Convert { src: c.src_size, logical: (logical.0 as usize, logical.1 as usize), rotation };
+                            Gpu::new(pw, ph, DARK, geometry).map(|g| (c, g))
+                        });
                         match started {
-                            Ok(c) => {
+                            Ok((c, g)) => {
+                                eprintln!("remdesktop-host: the picture is made on the GPU ({})", g.name());
+                                gpu = Some(g);
                                 let mut s = lock.lock().unwrap();
                                 s.started = Some(c.virtual_name.clone());
                                 current = Some((generation, c));
                             }
                             Err(e) => {
-                                eprintln!("remdesktop-host: capture {src:?}: {e}");
+                                eprintln!("remdesktop-host: capture {src:?}: {e}; trying again");
                                 std::thread::sleep(Duration::from_secs(1));
                                 continue;
                             }
@@ -279,10 +227,6 @@ impl Streamer {
                 match cap.next_frame(&mut raw, wait) {
                     Ok(true) => {
                         captured_at = Instant::now();
-                        raw_format = cap.format;
-                        if raw_format == Format::Gray {
-                            whiten_bars(&mut raw, logical, rotation, shown);
-                        }
                         raw_for = Some(generation);
                         raw_new = true;
                     }
@@ -314,25 +258,22 @@ impl Streamer {
                         epoch += 1;
                     }
                     raw_new = false;
-                    let rendered: Result<(Picture, bool, Option<Vec<bool>>), String> = match (raw_format, mode) {
+                    let rendered: Result<(Picture, bool, Option<Vec<bool>>), String> = match (&mut gpu, mode) {
                         // Nothing is sent; the frame is never looked at.
                         (_, DisplayMode::None) => Ok((Picture::Gray(vec![]), false, None)),
-                        (Format::Bgrx, DisplayMode::Edge) => detector.detect_raw(&raw, shown).map(|d| (Picture::Bits(d.bits), d.on_gpu, d.dirty)),
-                        (Format::Bgrx, _) => detector.gray_raw(&raw, shown).map(|g| (Picture::Gray(g.iter().map(|&v| gray4::level(v)).collect()), false, None)),
-                        (Format::Gray, DisplayMode::Edge) => {
-                            let d = detector.detect(&raw, pw, ph);
-                            Ok((Picture::Bits(d.bits), d.on_gpu, d.dirty))
-                        }
-                        (Format::Gray, _) => Ok((Picture::Gray(raw.iter().map(|&v| gray4::level(v)).collect()), false, None)),
+                        (Some(g), DisplayMode::Edge) => g.outline_bgrx(&raw, shown).map(|o| (Picture::Bits(o.bits), true, o.dirty)),
+                        (Some(g), _) => g.gray_bgrx(&raw, shown).map(|gray| (Picture::Gray(gray.iter().map(|&v| gray4::level(v)).collect()), false, None)),
+                        (None, _) => Err("no GPU set up".to_string()),
                     };
                     let (picture, on_gpu, tiles_changed) = match rendered {
                         Ok(r) => r,
                         Err(e) => {
-                            // The GPU let us down: start over with GStreamer converting.
-                            eprintln!("remdesktop-host: the GPU failed on a raw frame ({e}); converting on the CPU from now on");
-                            raw_ok = false;
+                            // Start over: a new capture and a new GPU setup.
+                            eprintln!("remdesktop-host: the GPU failed ({e}); setting it up again");
+                            gpu = None;
                             current = None;
                             raw_for = None;
+                            std::thread::sleep(Duration::from_millis(500));
                             continue;
                         }
                     };
@@ -548,20 +489,5 @@ impl Drop for Streamer {
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn whitens_only_black_bars() {
-        // 4x6 portrait panel, logical 6x4 rotated 90°, picture letterboxed
-        // left/right in logical = top/bottom rows in portrait.
-        let mut f = vec![0u8; 4 * 6];
-        f[2 * 4..4 * 4].fill(100); // content rows 2..4
-        super::whiten_bars(&mut f, (6, 4), 90, [0.25, 0.75, 0.0, 1.0]);
-        assert!(f[..2 * 4].iter().all(|&v| v == 255));
-        assert!(f[4 * 4..].iter().all(|&v| v == 255));
-        assert!(f[2 * 4..4 * 4].iter().all(|&v| v == 100));
     }
 }

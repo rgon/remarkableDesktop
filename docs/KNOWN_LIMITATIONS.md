@@ -90,21 +90,17 @@ logs to the journal.
   once. Replayed late, a tap shows up as a press and release at the place it
   happened. Keyboard-like undo/redo and the screen stream stay on TCP.
 
-- **Edge mode on the GPU:** the host runs edge detection through Vulkan
-  (`libvulkan` is loaded at run time, nothing is linked) on the first
-  discrete or integrated GPU with a compute queue. Without a Vulkan driver,
-  or with `REMDESKTOP_NO_GPU` set, it runs on the CPU. A weak edge chain
-  longer than about 500 pixels is cut short on the GPU.
-- **Capture conversion on the GPU:** with a GPU, GStreamer only copies the
-  raw BGRx capture into a pipe (no conversion, scaling or rotation), and the
-  GPU makes the gray, letterboxed, rotated panel frame from it (bilinear
-  scaling, white bars). A real monitor's size comes from its stream
-  parameters; if they can't be read, or the GPU fails, the old GStreamer
-  conversion runs instead (`REMDESKTOP_NO_GPU` forces it). The GPU scaler and
-  GStreamer's `videoscale` are both bilinear but may differ by a gray level.
-- **Dark areas in edge mode:** every pixel darker than gray 100 is drawn
-  black, on the GPU (or a cheap pass on the CPU fallback). Dark shapes with
-  lighter pixels inside come out speckled; there is no region fill.
+- **The picture is made on the GPU:** the host needs a Vulkan GPU with a
+  compute queue (`libvulkan` is loaded at run time, nothing is linked; the
+  first discrete or integrated GPU is used) and has no CPU path for it. If
+  setting the GPU up or a frame fails, the capture and the GPU setup are
+  rebuilt and tried again, with the reason in the log. GStreamer only copies
+  the raw BGRx capture into a pipe; the GPU scales it (bilinear, white
+  letterbox bars), rotates it and, in the edge view, finds the outlines. A real
+  monitor's size comes from its stream parameters.
+- **Edge detection limits:** a weak edge chain longer than about 500 pixels is
+  cut short. Every pixel darker than gray 100 is drawn black; dark shapes with
+  lighter pixels inside come out speckled, as there is no region fill.
 
 ## Input
 - **Monitor targeting:** pen and touchscreen are mapped through GNOME's
