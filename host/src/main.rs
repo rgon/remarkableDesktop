@@ -332,6 +332,33 @@ fn remap(devices: &mut HashMap<u8, Virtual>, screens: &[outputs::Output], target
     }
 }
 
+/// Replaces the tablet's binary with the one bundled in the AppImage, using
+/// the same installer as `<AppImage> install`.
+fn update_tablet(args: &Args) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let script = exe.parent().and_then(|bin| bin.parent()).map(|usr| usr.join("share/remdesktop/install.sh")).filter(|p| p.is_file()).ok_or("no tablet binary is bundled with this build")?;
+    eprintln!("remdesktop-host: updating the tablet");
+    let mut cmd = Command::new("sh");
+    cmd.arg(script).args(["--ssh", &args.ssh, "--remote", &args.remote]);
+    if let Some(pw) = PASSWORD.lock().unwrap().clone() {
+        cmd.env(PASSWORD_ENV, pw);
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => Ok(()),
+        Ok(_) => Err("updating the tablet failed".into()),
+        Err(e) => Err(format!("sh: {e}")),
+    }
+}
+
+/// Input over the network is replayed through /dev/uinput; say so when we can't write it.
+fn warn_uinput() {
+    let writable = std::fs::OpenOptions::new().write(true).open("/dev/uinput").is_ok();
+    if !writable {
+        eprintln!("remdesktop-host: WARNING: /dev/uinput is not writable, so pen and touch won't work without USB.");
+        eprintln!("remdesktop-host:          install host/99-remdesktop-uinput.rules into /etc/udev/rules.d/, reload udev and join the input group (run.sh offers to do this).");
+    }
+}
+
 fn run() -> Result<(), String> {
     let args = parse()?;
     if let Some(pw) = std::env::var(PASSWORD_ENV).ok().filter(|p| !p.is_empty()) {
@@ -350,17 +377,28 @@ fn run() -> Result<(), String> {
     }
     let start = std::iter::once(format!("{} start", args.remote)).chain(args.run_args.iter().cloned()).collect::<Vec<_>>().join(" ");
     eprintln!("remdesktop-host: tablet: {}", ssh(&args.ssh, &start)?.trim());
+    // An outdated tablet is replaced from the bundled binary once per run.
+    let mut updated = false;
 
     // Settings changes are undone when this drops, across reconnects.
     let mut gs = gsettings::Outputs::default();
     let mut wait = Duration::from_secs(30);
-    // After "go remote": the tablet's address off USB, reached without SSH.
+    // The tablet's non-USB addresses, as it last reported them, and the port
+    // and token of its instance: enough to find it again over Wi-Fi once USB
+    // is unplugged (the token stays valid as long as the instance runs).
+    let known: Arc<Mutex<Vec<String>>> = Default::default();
+    let mut last: Option<(u16, [u8; 16])> = None;
+    // The tablet's USB address, which is always preferred when it is there.
+    let usb = usb_address(&args.ssh);
+    // After "go remote": the address to connect to next, staying off USB.
     let mut remote: Option<(SocketAddr, [u8; 16])> = None;
     loop {
-        let (addr, token) = match remote {
+        let pinned = remote.is_some();
+        let (addr, token) = match remote.take() {
             Some(r) => r,
-            None => find_session(&args, wait)?,
+            None => find_tablet(&args, wait, &known, last, usb)?,
         };
+        last = Some((addr.port(), token));
         let tcp = match connect(addr, &token) {
             Ok(t) => t,
             Err(e) => {
@@ -370,25 +408,86 @@ fn run() -> Result<(), String> {
             }
         };
         eprintln!("remdesktop-host: connected to {addr}");
-        match session(tcp, addr.port(), &args, &mut gs) {
+        // Off USB, a returning USB link takes the session back, unless we were
+        // asked to stay off it.
+        let watch_usb = usb.filter(|&u| !pinned && addr.ip() != u);
+        match session(tcp, addr.port(), &args, &mut gs, &known, watch_usb) {
             Ok(End::Bye) => return Ok(()),
+            Ok(End::Outdated(version)) => {
+                eprintln!("remdesktop-host: tablet speaks protocol {version}, we speak {}", remdesktop_proto::VERSION);
+                if updated {
+                    return Err("the tablet still speaks another protocol after updating it".into());
+                }
+                updated = true;
+                if let Err(e) = update_tablet(&args) {
+                    return Err(format!("{e}; update the tablet with `<AppImage> install` (or --deploy)"));
+                }
+                eprintln!("remdesktop-host: tablet: {}", ssh(&args.ssh, &start)?.trim());
+                last = None;
+                wait = Duration::from_secs(30);
+                continue;
+            }
             Ok(End::GoRemote(ip)) => {
                 eprintln!("remdesktop-host: going remote via {ip}");
                 remote = Some((SocketAddr::new(ip, addr.port()), token));
             }
-            // USB re-enumeration or a network blip: the instance keeps
-            // running, so find it again (directly if we went remote).
+            Ok(End::UsbBack) => eprintln!("remdesktop-host: USB is back; moving the session to it"),
+            // USB unplugged, re-enumeration or a network blip: the instance
+            // keeps running, so find it again over USB or Wi-Fi.
             Err(e) => {
                 eprintln!("remdesktop-host: {e}; reconnecting");
-                if let Some((r, _)) = remote {
-                    if !wait_reachable(r, Duration::from_secs(30)) {
-                        eprintln!("remdesktop-host: {r} unreachable; trying over USB");
-                        remote = None;
-                    }
-                }
+                std::thread::sleep(Duration::from_secs(1));
             }
         }
         wait = Duration::from_secs(20);
+    }
+}
+
+/// The USB address in an ssh target (`user@10.11.99.1`), if it is one.
+fn usb_address(target: &str) -> Option<std::net::IpAddr> {
+    let ip: std::net::IpAddr = target.rsplit('@').next()?.parse().ok()?;
+    match ip {
+        std::net::IpAddr::V4(v4) if v4.octets()[..3] == [10, 11, 99] => Some(ip),
+        _ => None,
+    }
+}
+
+/// Finds the tablet's instance: over SSH first (USB, or wherever `--ssh`
+/// points), then, once that has failed for a few seconds, over the Wi-Fi
+/// addresses it reported earlier with the token we already have. Keeps
+/// trying for `wait`, or for good when there are Wi-Fi addresses to watch.
+fn find_tablet(
+    args: &Args,
+    wait: Duration,
+    known: &Arc<Mutex<Vec<String>>>,
+    last: Option<(u16, [u8; 16])>,
+    usb: Option<std::net::IpAddr>,
+) -> Result<(SocketAddr, [u8; 16]), String> {
+    let started = std::time::Instant::now();
+    let forever = last.is_some() && !known.lock().unwrap().is_empty();
+    let mut announced = false;
+    loop {
+        match find_session(args, Duration::ZERO) {
+            Ok(found) => return Ok(found),
+            Err(e) if e.contains("not running") || e.contains("login refused") => return Err(e),
+            Err(_) => {}
+        }
+        // Give a USB link that is merely re-enumerating time to come back.
+        if let (Some((port, token)), true) = (last, usb.is_none() || started.elapsed() >= Duration::from_secs(4)) {
+            let candidates: Vec<std::net::IpAddr> = known.lock().unwrap().iter().filter_map(|a| a.parse().ok()).collect();
+            if let Some(ip) = candidates.into_iter().find(|&ip| reachable(SocketAddr::new(ip, port))) {
+                eprintln!("remdesktop-host: tablet found over the network at {ip}");
+                return Ok((SocketAddr::new(ip, port), token));
+            }
+        }
+        if !forever && started.elapsed() > wait {
+            return Err("tablet unreachable over USB".into());
+        }
+        if forever && !announced {
+            announced = true;
+            eprintln!("remdesktop-host: waiting for the tablet over USB or Wi-Fi");
+        }
+        std::thread::sleep(Duration::from_millis(700));
     }
 }
 
@@ -396,23 +495,16 @@ fn run() -> Result<(), String> {
 enum End {
     /// The tablet ended it.
     Bye,
+    /// The tablet runs another protocol version (this one).
+    Outdated(u16),
     /// The tablet asked to move the connection off USB, to this address.
     GoRemote(std::net::IpAddr),
+    /// USB came back while we were on Wi-Fi, and USB is preferred.
+    UsbBack,
 }
 
 fn reachable(addr: SocketAddr) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
-}
-
-fn wait_reachable(addr: SocketAddr, wait: Duration) -> bool {
-    let deadline = std::time::Instant::now() + wait;
-    while std::time::Instant::now() < deadline {
-        if reachable(addr) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    false
 }
 
 /// Tests, every few seconds, which of the tablet's non-USB addresses we can
@@ -451,7 +543,7 @@ fn spawn_prober(
 }
 
 /// One connection to the instance.
-fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) -> Result<End, String> {
+fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, tablet_addrs: &Arc<Mutex<Vec<String>>>, watch_usb: Option<std::net::IpAddr>) -> Result<End, String> {
     // The tablet answers our 100 ms pings, so 1.5 s of silence is a dead
     // link (e.g. USB unplugged), which TCP alone would not report.
     tcp.set_read_timeout(Some(Duration::from_millis(1500))).map_err(|e| e.to_string())?;
@@ -459,10 +551,25 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
     let mut stream = BufReader::new(tcp.try_clone().map_err(|e| e.to_string())?);
     let closer = tcp.try_clone().map_err(|e| e.to_string())?;
     let writer: Writer = Arc::new(Mutex::new(Box::new(tcp)));
-    let tablet_addrs: Arc<Mutex<Vec<String>>> = Default::default();
+    let tablet_addrs = tablet_addrs.clone();
     let verified: Arc<Mutex<Option<std::net::IpAddr>>> = Default::default();
     let stop_prober: Arc<std::sync::atomic::AtomicBool> = Default::default();
     spawn_prober(writer.clone(), port, tablet_addrs.clone(), verified.clone(), stop_prober.clone());
+
+    // Off USB: notice when the tablet's USB address answers SSH again.
+    let usb_back: Arc<std::sync::atomic::AtomicBool> = Default::default();
+    if let Some(ip) = watch_usb {
+        let (flag, stop) = (usb_back.clone(), stop_prober.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if reachable(SocketAddr::new(ip, 22)) {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+    }
 
     // Clock probes for latency stats, 10 Hz.
     let pinger = {
@@ -494,6 +601,9 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
     let offset: stats::Offset = Default::default();
     let mut hid_probe: Option<stats::HidProbe> = None;
     let result = loop {
+        if usb_back.load(std::sync::atomic::Ordering::Relaxed) {
+            break Ok(End::UsbBack);
+        }
         // Pongs arrive every 100 ms, so this runs often enough.
         if let Some(Some(name)) = streamer.as_ref().and_then(|s| s.take_started()) {
             // A virtual monitor appeared: point input at it.
@@ -527,8 +637,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
         match msg {
             Ok(Some(Msg::Hello { version, width, height, rotation, view })) => {
                 if version != remdesktop_proto::VERSION {
-                    eprintln!("remdesktop-host: tablet speaks protocol {version}, we speak {}", remdesktop_proto::VERSION);
-                    break Ok(End::Bye);
+                    break Ok(End::Outdated(version));
                 }
                 eprintln!("remdesktop-host: tablet ready, {width}x{height} rotated {rotation}°");
                 logical = (width as u32, height as u32);
@@ -564,6 +673,9 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs) 
                 let st = TabletStatus { usb_hid, pen_mouse, touchpad };
                 if st.usb_hid != status.usb_hid {
                     eprintln!("remdesktop-host: input arrives over {}", if usb_hid { "USB HID" } else { "this connection (uinput)" });
+                }
+                if !usb_hid {
+                    warn_uinput();
                 }
                 status = st;
                 if usb_hid {
