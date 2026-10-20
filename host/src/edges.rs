@@ -13,11 +13,14 @@ const HIGH: i32 = 4 * 60;
 /// Gradient magnitude an edge may fade to while still joined to a certain one.
 const LOW: i32 = 4 * 24;
 
-/// Mean gray (0..=255) under which an enclosed region is filled black.
-const DARK: u64 = 100;
+/// Mean gray (0..=255) under which an enclosed region is filled black, and
+/// the gray under which the naive fill blackens a pixel.
+pub(crate) const DARK: u64 = 100;
 
 /// `gray` is `w`×`h`, one byte per pixel. Returns the same size: 0 on an
-/// edge, 255 elsewhere.
+/// edge, 255 elsewhere. (The CPU way with the region fill; the streamer
+/// goes through `Detector`.)
+#[cfg(test)]
 pub fn detect(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = outline(gray, w, h);
     if usable(gray, w, h) {
@@ -34,6 +37,25 @@ fn usable(gray: &[u8], w: usize, h: usize) -> bool {
 /// otherwise. The frame size may change between calls.
 pub struct Detector {
     backend: Backend,
+    fill: Fill,
+}
+
+/// What turns dark areas solid.
+#[derive(Clone, Copy, PartialEq)]
+enum Fill {
+    /// Every pixel darker than `DARK` is black: nothing for the CPU to do.
+    Threshold,
+    /// Enclosed regions whose mean is darker than `DARK` are black (`fill_dark`, on the CPU).
+    Region,
+}
+
+/// The naive fill: pixels of `gray` darker than `DARK` turn black in `out`.
+pub(crate) fn threshold(gray: &[u8], out: &mut [u8]) {
+    for (o, &g) in out.iter_mut().zip(gray) {
+        if (g as u64) < DARK {
+            *o = 0;
+        }
+    }
 }
 
 enum Backend {
@@ -44,8 +66,22 @@ enum Backend {
 }
 
 impl Detector {
+    /// `REMDESKTOP_EDGE_FILL=region` fills enclosed dark regions on the CPU
+    /// instead of the default per-pixel threshold.
     pub fn new() -> Detector {
-        Detector { backend: Backend::Untried }
+        let fill = if std::env::var("REMDESKTOP_EDGE_FILL").is_ok_and(|v| v == "region") { Fill::Region } else { Fill::Threshold };
+        Detector { backend: Backend::Untried, fill }
+    }
+
+    /// The outline `out` of `gray` with the chosen fill applied.
+    fn finish(&self, gray: &[u8], out: &mut [u8], w: usize, h: usize) {
+        if !usable(gray, w, h) {
+            return;
+        }
+        match self.fill {
+            Fill::Threshold => threshold(gray, out),
+            Fill::Region => fill_dark(gray, out, w, h),
+        }
     }
 
     pub fn detect(&mut self, gray: &[u8], w: usize, h: usize) -> Vec<u8> {
@@ -56,7 +92,7 @@ impl Detector {
             self.backend = if std::env::var_os("REMDESKTOP_NO_GPU").is_some() || !usable(gray, w, h) {
                 Backend::Cpu
             } else {
-                match crate::gpu::Gpu::new(w, h) {
+                match crate::gpu::Gpu::new(w, h, if self.fill == Fill::Threshold { DARK as u32 } else { 0 }) {
                     Ok(g) => {
                         eprintln!("remdesktop-host: edge detection on the GPU ({})", g.name());
                         Backend::Gpu(g)
@@ -74,16 +110,25 @@ impl Detector {
         };
         match gpu_result {
             Some(Ok(mut out)) => {
-                fill_dark(gray, &mut out, w, h);
+                // The GPU applied the threshold itself.
+                if self.fill == Fill::Region {
+                    self.finish(gray, &mut out, w, h);
+                }
                 out
             }
             Some(Err(e)) => {
                 eprintln!("remdesktop-host: the GPU failed ({e}); edge detection on the CPU from now on");
                 self.backend = Backend::Cpu;
-                detect(gray, w, h)
+                self.cpu(gray, w, h)
             }
-            None => detect(gray, w, h),
+            None => self.cpu(gray, w, h),
         }
+    }
+
+    fn cpu(&self, gray: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let mut out = outline(gray, w, h);
+        self.finish(gray, &mut out, w, h);
+        out
     }
 }
 

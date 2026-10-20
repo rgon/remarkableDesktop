@@ -17,7 +17,7 @@ use std::ffi::CStr;
 const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/edges.spv"));
 
 /// Entry points of the shader, in `Stage` order.
-const STAGES: [&CStr; 7] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"pack_out"];
+const STAGES: [&CStr; 8] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"pack_out"];
 
 #[derive(Clone, Copy)]
 enum Stage {
@@ -27,6 +27,7 @@ enum Stage {
     Nms,
     Hyst,
     Place,
+    Dark,
     Pack,
 }
 
@@ -79,8 +80,9 @@ fn find_memory(props: &vk::PhysicalDeviceMemoryProperties, bits: u32, want: vk::
 }
 
 impl Gpu {
-    /// Opens the best GPU and prepares for frames of `w`×`h`.
-    pub fn new(w: usize, h: usize) -> Result<Gpu, String> {
+    /// Opens the best GPU and prepares for frames of `w`×`h`. Pixels of the
+    /// frame darker than `dark` come out black (0: none do).
+    pub fn new(w: usize, h: usize, dark: u32) -> Result<Gpu, String> {
         let spirv = ash::util::read_spv(&mut std::io::Cursor::new(SPIRV)).map_err(|e| format!("shader: {e}"))?;
         let entry = unsafe { Entry::load() }.map_err(|e| format!("no Vulkan loader: {e}"))?;
         let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 0, 0));
@@ -109,7 +111,7 @@ impl Gpu {
             (words, false),
             (4, true),
             (packed, true),
-            (8, true),
+            (16, true),
         ];
         let mut buffers = Vec::with_capacity(BUFFERS);
         for (size, host) in layout {
@@ -119,6 +121,7 @@ impl Gpu {
             let params = buffers[PARAMS].ptr as *mut u32;
             params.write(w as u32);
             params.add(1).write(h as u32);
+            params.add(2).write(dark);
         }
 
         let bindings: Vec<_> = (0..BUFFERS as u32)
@@ -250,6 +253,7 @@ impl Gpu {
                     1 => rounds(cb),
                     _ => {
                         run(cb, Stage::Place);
+                        run(cb, Stage::Dark);
                         run(cb, Stage::Pack);
                     }
                 }
@@ -270,7 +274,7 @@ impl Gpu {
     }
 
     /// The outline of `gray` (`w`×`h` as given to `new`): 0 on an outline
-    /// pixel, 255 elsewhere, as `edges::outline` makes it.
+    /// pixel (or a dark one), 255 elsewhere, as `edges::outline` makes it.
     pub fn outline(&mut self, gray: &[u8]) -> Result<Vec<u8>, String> {
         let px = self.size.0 * self.size.1;
         if gray.len() != px {
@@ -323,7 +327,7 @@ mod tests {
     #[test]
     fn matches_the_cpu() {
         let (w, h) = (203, 157);
-        let mut gpu = match Gpu::new(w, h) {
+        let mut gpu = match Gpu::new(w, h, crate::edges::DARK as u32) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("skipped, no GPU: {e}");
@@ -353,7 +357,8 @@ mod tests {
         for v in img.iter_mut() {
             *v = v.saturating_add((rand() % 5) as u8);
         }
-        let want = crate::edges::outline(&img, w, h);
+        let mut want = crate::edges::outline(&img, w, h);
+        crate::edges::threshold(&img, &mut want);
         let got = gpu.outline(&img).expect("gpu frame");
         let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
         assert_eq!(differing, 0, "{differing} of {} pixels differ on {}", w * h, gpu.name());

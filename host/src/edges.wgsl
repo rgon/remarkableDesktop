@@ -9,6 +9,9 @@
 struct Params {
     w: u32,
     h: u32,
+    // Pixels of the original darker than this turn black, whatever the
+    // outlines say (0: off).
+    dark: u32,
 }
 
 @group(0) @binding(0) var<storage, read> src_px: array<u32>;
@@ -214,6 +217,19 @@ fn place_line(@builtin(global_invocation_id) g: vec3<u32>) {
         k = -1;
     }
     buf_out[u32(y + k * s.y) * w + u32(x + k * s.x)] = 0u;
+}
+
+// The naive fill: dark pixels are black, with no regard for outlines.
+@compute @workgroup_size(16, 16)
+fn dark_px(@builtin(global_invocation_id) g: vec3<u32>) {
+    let w = prm.w;
+    if (g.x >= w || g.y >= prm.h || prm.dark == 0u) {
+        return;
+    }
+    let i = g.y * w + g.x;
+    if (gray(i) < prm.dark) {
+        buf_out[i] = 0u;
+    }
 }
 
 // Four outline pixels to one word, for the read-back.
