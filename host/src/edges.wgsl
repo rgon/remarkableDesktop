@@ -26,7 +26,9 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> buf_out: array<u32>;
 // Set by a hysteresis pass that promoted a pixel.
 @group(0) @binding(6) var<storage, read_write> buf_changed: atomic<u32>;
-@group(0) @binding(7) var<storage, read_write> buf_result: array<u32>;
+// The finished frame, one bit per pixel (set = white), MSB first, every row
+// padded to whole bytes: the wire format of `bits1` in the proto crate.
+@group(0) @binding(7) var<storage, read_write> buf_bits: array<u32>;
 @group(0) @binding(8) var<storage, read> prm: Params;
 // One flag per tile of the grid in tiles.rs: set when the outline differs
 // from the previous frame's anywhere in it.
@@ -254,23 +256,35 @@ fn diff_tiles(@builtin(global_invocation_id) g: vec3<u32>) {
     }
 }
 
-// Four outline pixels to one word, for the read-back.
+// The frame as bits. Each thread makes one output word (four bytes of the
+// packed stream), which may span rows, so rows are found from the byte index.
 @compute @workgroup_size(16, 16)
-fn pack_out(@builtin(global_invocation_id) g: vec3<u32>) {
+fn pack_bits(@builtin(global_invocation_id) g: vec3<u32>) {
     let w = prm.w;
     if (g.x >= w || g.y >= prm.h) {
         return;
     }
-    let i = g.y * w + g.x;
-    if ((i & 3u) != 0u) {
+    let row_bytes = (w + 7u) / 8u;
+    let total = row_bytes * prm.h;
+    let k = g.y * w + g.x;
+    if (k * 4u >= total) {
         return;
     }
-    let n = w * prm.h;
     var word = 0u;
     for (var j = 0u; j < 4u; j++) {
-        if (i + j < n) {
-            word |= (buf_out[i + j] & 255u) << (8u * j);
+        let b = k * 4u + j;
+        if (b < total) {
+            let row = b / row_bytes;
+            let col = b % row_bytes;
+            var byte = 0u;
+            for (var i = 0u; i < 8u; i++) {
+                let x = col * 8u + i;
+                if (x < w && (buf_out[row * w + x] & 255u) > 127u) {
+                    byte |= 0x80u >> i;
+                }
+            }
+            word |= byte << (8u * j);
         }
     }
-    buf_result[i >> 2u] = word;
+    buf_bits[k] = word;
 }
