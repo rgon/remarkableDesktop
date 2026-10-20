@@ -1,4 +1,4 @@
-//! The v1 screen: "remote controlling" and a hold-to-close X button.
+//! The v1 screen: a blank page with the buttons and the status box.
 
 use crate::epd::{Epd, Mode};
 use crate::gfx::{Canvas, Scaled};
@@ -298,9 +298,6 @@ impl<'a> Ui<'a> {
         let [w, h] = self.size;
         let mut t = self.target();
         let _ = t.fill_solid(&Rectangle::new(Point::zero(), Size::new(w as u32, h as u32)), Gray8::WHITE);
-        let big = MonoTextStyle::new(&FONT_10X20, Gray8::BLACK);
-        let _ = Text::with_alignment("remote controlling", Point::new(w / 12, h / 12), big, Alignment::Center)
-            .draw(&mut Scaled { target: &mut t, factor: 6 });
         drop(t);
         for b in Button::ALL {
             self.buttons[b as usize].drawn = None;
