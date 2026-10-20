@@ -5,6 +5,7 @@
 
 use crate::epd::{Epd, ImageInfo, Mode};
 use remdesktop_proto::{RECT_BITS1, RECT_SETTLE, bits1, gray4};
+use std::time::{Duration, Instant};
 
 /// Refresh modes for streamed content.
 #[derive(Debug, Clone, Copy)]
@@ -108,11 +109,20 @@ impl Decoder {
 pub struct Display {
     refresh: Refresh,
     pub frames: u32,
+    /// Time spent in the engine's refresh calls, logged every few seconds.
+    timing: Timing,
+}
+
+struct Timing {
+    since: Instant,
+    calls: u32,
+    total: Duration,
+    max: Duration,
 }
 
 impl Display {
     pub fn new(refresh: Refresh) -> Self {
-        Self { refresh, frames: 0 }
+        Self { refresh, frames: 0, timing: Timing { since: Instant::now(), calls: 0, total: Duration::ZERO, max: Duration::ZERO } }
     }
 
     /// The mode for updates that must show up at once.
@@ -128,9 +138,20 @@ impl Display {
     /// Refreshes freshly written pixels, in the quality mode if `flags` has `RECT_SETTLE`.
     pub fn show(&mut self, epd: &Epd, r: Rect, flags: u8) {
         let mode = if flags & RECT_SETTLE != 0 { self.refresh.settle } else { self.refresh.fast };
+        let started = Instant::now();
         epd.swap(r.x, r.y, r.w, r.h, mode, 0);
         epd.process_events(0);
         self.frames += 1;
+        // How long the engine keeps us in a refresh call (the panel's pace).
+        let took = started.elapsed();
+        let t = &mut self.timing;
+        t.calls += 1;
+        t.total += took;
+        t.max = t.max.max(took);
+        if t.since.elapsed() >= Duration::from_secs(2) {
+            log!("remdesktop: {} refreshes in {:?}: {:.0} ms each on average, {:.0} ms at most", t.calls, t.since.elapsed(), t.total.as_secs_f64() * 1000.0 / t.calls as f64, t.max.as_secs_f64() * 1000.0);
+            *t = Timing { since: Instant::now(), calls: 0, total: Duration::ZERO, max: Duration::ZERO };
+        }
     }
 }
 

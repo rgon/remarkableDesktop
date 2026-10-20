@@ -37,6 +37,8 @@ struct Shared {
     stop: bool,
     /// The update in flight: id, capture time, size in bytes.
     in_flight: Option<(u32, Instant, usize)>,
+    /// When the update in flight was sent, and how old its frame was then.
+    sent: Option<(Instant, Duration)>,
     stats: Option<DisplayStats>,
 }
 
@@ -108,27 +110,37 @@ struct Published {
 struct DisplayStats {
     since: Option<Instant>,
     latencies_ms: Vec<f64>,
+    /// Capture → sent, and sent → ack: where the latency goes.
+    ages_ms: Vec<f64>,
+    acks_ms: Vec<f64>,
     bytes: usize,
     pixels: usize,
 }
 
 impl DisplayStats {
-    fn record(&mut self, latency: Duration, bytes: usize) {
+    fn record(&mut self, latency: Duration, bytes: usize, age: Duration, ack: Duration) {
         let since = *self.since.get_or_insert_with(Instant::now);
         self.latencies_ms.push(latency.as_secs_f64() * 1000.0);
+        self.ages_ms.push(age.as_secs_f64() * 1000.0);
+        self.acks_ms.push(ack.as_secs_f64() * 1000.0);
         self.bytes += bytes;
         if since.elapsed() >= Duration::from_secs(2) {
             let n = self.latencies_ms.len();
-            self.latencies_ms.sort_by(|a, b| a.total_cmp(b));
-            let pct = |p: f64| self.latencies_ms[((n - 1) as f64 * p) as usize];
+            let pct = |v: &mut Vec<f64>, p: f64| {
+                v.sort_by(|a, b| a.total_cmp(b));
+                v[((n - 1) as f64 * p) as usize]
+            };
             eprintln!(
-                "remdesktop-host: display {:.1}/s, {:.0} KB/update ({:.0} kpx), capture→ack p50 {:.1} p99 {:.1} max {:.1} ms",
+                "remdesktop-host: display {:.1}/s, {:.0} KB/update ({:.0} kpx), capture→ack p50 {:.1} p99 {:.1} max {:.1} ms (capture→sent p50 {:.1}, sent→ack p50 {:.1} p99 {:.1})",
                 n as f64 / since.elapsed().as_secs_f64(),
                 self.bytes as f64 / n as f64 / 1024.0,
                 self.pixels as f64 / n as f64 / 1000.0,
-                pct(0.5),
-                pct(0.99),
-                pct(1.0)
+                pct(&mut self.latencies_ms, 0.5),
+                pct(&mut self.latencies_ms, 0.99),
+                pct(&mut self.latencies_ms, 1.0),
+                pct(&mut self.ages_ms, 0.5),
+                pct(&mut self.acks_ms, 0.5),
+                pct(&mut self.acks_ms, 0.99),
             );
             *self = DisplayStats::default();
         }
@@ -342,6 +354,8 @@ impl Streamer {
                     let mut s = lock.lock().unwrap();
                     s.acked = false;
                     s.in_flight = captured.map(|c| (id, c, bytes));
+                    // Before the first byte goes out, so a quick ack cannot beat it.
+                    s.sent = captured.map(|c| (Instant::now(), c.elapsed()));
                     if let (Some(st), Some(_)) = (&mut s.stats, captured) {
                         st.pixels += pixels;
                     }
@@ -458,10 +472,11 @@ impl Streamer {
     pub fn ack(&self, id: u32) {
         let (lock, cv) = &*self.shared;
         let mut s = lock.lock().unwrap();
+        let sent_at = s.sent.take();
         if let Some((sent, captured, bytes)) = s.in_flight.take() {
             if sent == id {
-                if let Some(st) = &mut s.stats {
-                    st.record(captured.elapsed(), bytes);
+                if let (Some(st), Some((at, age))) = (&mut s.stats, sent_at) {
+                    st.record(captured.elapsed(), bytes, age, at.elapsed());
                 }
             }
         }
