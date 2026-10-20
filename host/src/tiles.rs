@@ -43,6 +43,21 @@ impl Grid {
         out
     }
 
+    /// The same for two images of one bit per pixel, rows padded to bytes
+    /// (tiles start on byte boundaries, as `TILE` is a multiple of 8).
+    pub fn dirty_bits(&self, a: &[u8], b: &[u8]) -> Vec<bool> {
+        let rb = self.w.div_ceil(8);
+        let mut out = vec![false; self.tiles()];
+        for ty in 0..self.rows {
+            let (y0, y1) = (ty * TILE, ((ty + 1) * TILE).min(self.h));
+            for tx in 0..self.cols {
+                let (x0, x1) = (tx * TILE / 8, (((tx + 1) * TILE).min(self.w)).div_ceil(8));
+                out[ty * self.cols + tx] = (y0..y1).any(|y| a[y * rb + x0..y * rb + x1] != b[y * rb + x0..y * rb + x1]);
+            }
+        }
+        out
+    }
+
     /// Rectangles covering the marked tiles, smallest first (the smallest
     /// are likely a pen or cursor, which should reach the panel first).
     pub fn rects(&self, marked: &[bool]) -> Vec<Rect> {
@@ -103,6 +118,24 @@ fn union(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bit_images_are_compared_per_tile_like_byte_images() {
+        // 70 wide (last tile 6 px, 1 padded byte), 40 high: 3 × 2 tiles.
+        let (w, h) = (70usize, 40usize);
+        let g = Grid::new(w, h);
+        let rb = w.div_ceil(8);
+        let a = vec![0u8; rb * h];
+        let mut b = a.clone();
+        assert!(g.dirty_bits(&a, &b).iter().all(|&d| !d));
+        // A pixel in the last column of the last tile of the second row of tiles.
+        b[35 * rb + 8] ^= 0x80;
+        let d = g.dirty_bits(&a, &b);
+        assert_eq!(d, vec![false, false, false, false, false, true]);
+        // One in the middle tile of the first row.
+        b[3 * rb + 5] ^= 1;
+        assert_eq!(g.dirty_bits(&a, &b), vec![false, true, false, false, false, true]);
+    }
 
     #[test]
     fn marks_only_tiles_that_changed() {

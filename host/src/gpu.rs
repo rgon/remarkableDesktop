@@ -18,7 +18,7 @@ use std::ffi::CStr;
 const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/edges.spv"));
 
 /// Entry points of the shader, in `Stage` order.
-const STAGES: [&CStr; 9] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"diff_tiles", c"pack_out"];
+const STAGES: [&CStr; 9] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"diff_tiles", c"pack_bits"];
 
 #[derive(Clone, Copy)]
 enum Stage {
@@ -30,7 +30,7 @@ enum Stage {
     Place,
     Dark,
     Diff,
-    Pack,
+    PackBits,
 }
 
 /// Hysteresis rounds per submission, and submissions at most. A round
@@ -43,7 +43,7 @@ const MAX_BATCHES: usize = 64;
 const INPUT: usize = 0;
 const OUTLINE: usize = 5;
 const CHANGED: usize = 6;
-const RESULT: usize = 7;
+const BITS: usize = 7;
 const PARAMS: usize = 8;
 const TILES: usize = 9;
 const PREV: usize = 10;
@@ -83,8 +83,9 @@ pub struct Gpu {
 
 /// One frame's result.
 pub struct Outline {
-    /// 0 on an outline pixel (or a dark one), 255 elsewhere.
-    pub pixels: Vec<u8>,
+    /// The frame as `bits1` packs it: one bit per pixel, set where the
+    /// pixel is white (not on an outline and not dark), rows padded to bytes.
+    pub bits: Vec<u8>,
     /// The tiles of the grid that differ from the previous frame (None for the first).
     pub dirty: Option<Vec<bool>>,
 }
@@ -120,6 +121,7 @@ impl Gpu {
         let tiles = crate::tiles::Grid::new(w, h).tiles();
         let packed = px.div_ceil(4).max(1) * 4;
         let words = (px * 4).max(4);
+        let bits_bytes = ((w.div_ceil(8) * h) as u64).div_ceil(4).max(1) * 4;
         // (size, host access) per binding.
         let layout = [
             (packed, true),
@@ -129,7 +131,7 @@ impl Gpu {
             (words, false),
             (words, false),
             (4, true),
-            (packed, true),
+            (bits_bytes, true),
             (16, true),
             ((tiles as u64 * 4).max(4), true),
             (words, false),
@@ -282,7 +284,7 @@ impl Gpu {
                         let copy = [vk::BufferCopy::default().size(self.words)];
                         d.cmd_copy_buffer(cb, self.buffers[OUTLINE].buffer, self.buffers[PREV].buffer, &copy);
                         sync(cb);
-                        run(cb, Stage::Pack);
+                        run(cb, Stage::PackBits);
                     }
                 }
                 to_host(cb);
@@ -302,8 +304,8 @@ impl Gpu {
     }
 
     /// The outline of `gray` (`w`×`h` as given to `new`) as `edges::outline`
-    /// makes it, with dark pixels black, and the tiles that changed since
-    /// the previous call.
+    /// makes it, with dark pixels black, packed to bits, and the tiles that
+    /// changed since the previous call.
     pub fn outline(&mut self, gray: &[u8]) -> Result<Outline, String> {
         let px = self.size.0 * self.size.1;
         if gray.len() != px {
@@ -318,12 +320,12 @@ impl Gpu {
             batches += 1;
         }
         self.submit(2)?;
-        let mut pixels = vec![0u8; px];
-        unsafe { std::ptr::copy_nonoverlapping(self.buffers[RESULT].ptr, pixels.as_mut_ptr(), px) };
+        let mut bits = vec![0u8; self.size.0.div_ceil(8) * self.size.1];
+        unsafe { std::ptr::copy_nonoverlapping(self.buffers[BITS].ptr, bits.as_mut_ptr(), bits.len()) };
         let flags = unsafe { std::slice::from_raw_parts(self.buffers[TILES].ptr as *const u32, self.tiles) };
         let dirty = self.have_prev.then(|| flags.iter().map(|&f| f != 0).collect());
         self.have_prev = true;
-        Ok(Outline { pixels, dirty })
+        Ok(Outline { bits, dirty })
     }
 }
 
@@ -392,13 +394,15 @@ mod tests {
         let mut want = crate::edges::outline(&img, w, h);
         crate::edges::threshold(&img, &mut want);
         let first = gpu.outline(&img).expect("gpu frame");
-        let got = &first.pixels;
-        let differing = want.iter().zip(got).filter(|(a, b)| a != b).count();
-        assert_eq!(differing, 0, "{differing} of {} pixels differ on {}", w * h, gpu.name());
+        let got = &first.bits;
+        let want_bits = crate::edges::pack_bits(&want, w, h);
+        let differing = want_bits.iter().zip(got).filter(|(a, b)| a != b).count();
+        assert_eq!(got.len(), want_bits.len());
+        assert_eq!(differing, 0, "{differing} of {} bytes differ on {}", want_bits.len(), gpu.name());
         assert!(first.dirty.is_none(), "nothing to compare the first frame with");
         // The same frame again: nothing changed.
         let again = gpu.outline(&img).expect("second frame");
-        assert_eq!(&again.pixels, got);
+        assert_eq!(&again.bits, got);
         assert!(again.dirty.expect("flags").iter().all(|&d| !d));
         // A different one: the tiles the GPU flags are the ones the CPU finds.
         let mut other = img.clone();
@@ -409,6 +413,7 @@ mod tests {
         }
         let next = gpu.outline(&other).expect("third frame");
         let grid = crate::tiles::Grid::new(w, h);
-        assert_eq!(next.dirty.expect("flags"), grid.dirty(&again.pixels, &next.pixels));
+        let (a, b) = (crate::edges::unpack_bits(&again.bits, w, h), crate::edges::unpack_bits(&next.bits, w, h));
+        assert_eq!(next.dirty.expect("flags"), grid.dirty(&a, &b));
     }
 }

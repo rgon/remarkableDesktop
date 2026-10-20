@@ -46,10 +46,32 @@ pub(crate) fn threshold(gray: &[u8], out: &mut [u8]) {
     }
 }
 
+/// Packs a 0/255 image (as `outline` makes it) to one bit per pixel, set
+/// where it is white, rows padded to bytes: what `bits1::pack` makes of it.
+pub(crate) fn pack_bits(pixels: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let rb = w.div_ceil(8);
+    let mut out = vec![0u8; rb * h];
+    for y in 0..h {
+        let row = &pixels[y * w..][..w];
+        let dst = &mut out[y * rb..][..rb];
+        for (x, &v) in row.iter().enumerate() {
+            dst[x / 8] |= ((v > 127) as u8) << (7 - x % 8);
+        }
+    }
+    out
+}
+
+/// The inverse of `pack_bits`: 255 where a bit is set, else 0.
+#[cfg(test)]
+pub(crate) fn unpack_bits(bits: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let rb = w.div_ceil(8);
+    (0..w * h).map(|i| if bits[(i / w) * rb + (i % w) / 8] >> (7 - (i % w) % 8) & 1 != 0 { 255 } else { 0 }).collect()
+}
+
 /// One frame's outline.
 pub struct Detected {
-    /// 0 on an outline pixel or a dark one, 255 elsewhere.
-    pub pixels: Vec<u8>,
+    /// The frame as `pack_bits` makes it.
+    pub bits: Vec<u8>,
     /// Whether the GPU made it, so the previous such frame is what `dirty` is against.
     pub on_gpu: bool,
     /// Which tiles (the grid of `tiles.rs`) differ from the previous frame
@@ -95,7 +117,7 @@ impl Detector {
         };
         match gpu_result {
             // The GPU applied the threshold itself.
-            Some(Ok(o)) => Detected { pixels: o.pixels, on_gpu: true, dirty: o.dirty },
+            Some(Ok(o)) => Detected { bits: o.bits, on_gpu: true, dirty: o.dirty },
             Some(Err(e)) => {
                 eprintln!("remdesktop-host: the GPU failed ({e}); edge detection on the CPU from now on");
                 self.backend = Backend::Cpu;
@@ -110,7 +132,7 @@ impl Detector {
         if usable(gray, w, h) {
             threshold(gray, &mut pixels);
         }
-        Detected { pixels, on_gpu: false, dirty: None }
+        Detected { bits: pack_bits(&pixels, w, h), on_gpu: false, dirty: None }
     }
 }
 

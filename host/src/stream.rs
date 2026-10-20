@@ -40,13 +40,62 @@ struct Shared {
     stats: Option<DisplayStats>,
 }
 
+/// A rendered frame: gray levels (4 bits used, one per byte), or, for the
+/// edge view, one bit per pixel as the GPU packs it (`bits1`'s layout).
+#[derive(Clone)]
+enum Picture {
+    Gray(Vec<u8>),
+    Bits(Vec<u8>),
+}
+
+impl Picture {
+    /// Whether it has the size of a `w`×`h` frame.
+    fn fits(&self, w: usize, h: usize) -> bool {
+        match self {
+            Picture::Gray(v) => v.len() == w * h,
+            Picture::Bits(v) => v.len() == bits1::row_bytes(w) * h,
+        }
+    }
+
+    /// The tiles that differ from `prev` (all of them if it is another kind).
+    fn dirty(&self, prev: &Picture, grid: &Grid) -> Vec<bool> {
+        match (self, prev) {
+            (Picture::Gray(a), Picture::Gray(b)) => grid.dirty(b, a),
+            (Picture::Bits(a), Picture::Bits(b)) => grid.dirty_bits(b, a),
+            _ => vec![true; grid.tiles()],
+        }
+    }
+
+    /// The `rw`×`rh` window at (`x`, `y`) of a `w`-wide frame as it goes on
+    /// the wire, and whether that is 1-bit (`RECT_BITS1`). Rectangles start
+    /// on tile boundaries, so a bit window is whole bytes of the packed rows.
+    fn pack(&self, w: usize, x: usize, y: usize, rw: usize, rh: usize) -> (bool, Vec<u8>) {
+        match self {
+            Picture::Gray(v) => (false, gray4::pack(v, w, x, y, rw, rh)),
+            Picture::Bits(v) if x % 8 == 0 => {
+                let (rb, wb) = (bits1::row_bytes(w), bits1::row_bytes(rw));
+                let mut out = Vec::with_capacity(wb * rh);
+                for r in 0..rh {
+                    out.extend_from_slice(&v[(y + r) * rb + x / 8..][..wb]);
+                }
+                (true, out)
+            }
+            // Not on a byte boundary (never from the tile grid): the slow way.
+            Picture::Bits(v) => {
+                let rb = bits1::row_bytes(w);
+                let levels: Vec<u8> = (0..w * (y + rh)).map(|i| if v[(i / w) * rb + (i % w) / 8] >> (7 - (i % w) % 8) & 1 != 0 { 15 } else { 0 }).collect();
+                (true, bits1::pack(&levels, w, x, y, rw, rh))
+            }
+        }
+    }
+}
+
 /// A frame as the capture thread hands it over.
 #[derive(Clone)]
 struct Published {
     epoch: u64,
-    levels: Vec<u8>,
+    picture: Picture,
     captured: Instant,
-    mode: DisplayMode,
     /// Counts the frames made.
     seq: u64,
     /// The tiles that differ from frame number `.0`, as the GPU found out
@@ -204,12 +253,12 @@ impl Streamer {
                     }
                     raw_new = false;
                     let (pw, ph) = if rotation % 180 == 90 { (logical.1 as usize, logical.0 as usize) } else { (logical.0 as usize, logical.1 as usize) };
-                    let (levels, on_gpu, tiles_changed): (Vec<u8>, bool, Option<Vec<bool>>) = match mode {
+                    let (picture, on_gpu, tiles_changed) = match mode {
                         DisplayMode::Edge => {
                             let d = detector.detect(&raw, pw, ph);
-                            (d.pixels.iter().map(|&v| gray4::level(v)).collect(), d.on_gpu, d.dirty)
+                            (Picture::Bits(d.bits), d.on_gpu, d.dirty)
                         }
-                        _ => (raw.iter().map(|&v| gray4::level(v)).collect(), false, None),
+                        _ => (Picture::Gray(raw.iter().map(|&v| gray4::level(v)).collect()), false, None),
                     };
                     seq += 1;
                     let mut s = lock.lock().unwrap();
@@ -235,7 +284,7 @@ impl Streamer {
                         _ => acc_base = None,
                     }
                     gpu_seq = on_gpu.then_some(seq);
-                    s.frame = Some(Published { epoch, levels, captured: captured_at, mode, seq, dirty });
+                    s.frame = Some(Published { epoch, picture, captured: captured_at, seq, dirty });
                     s.fresh = true;
                     cv.notify_all();
                 }
@@ -249,7 +298,7 @@ impl Streamer {
             let (w, h) = (pw as usize, ph as usize);
             let grid = Grid::new(w, h);
             // The epoch, the content and the sequence number of the frame sent last.
-            let mut last: Option<(u64, Vec<u8>, u64)> = None;
+            let mut last: Option<(u64, Picture, u64)> = None;
             // When each tile last changed, until it got its quality refresh.
             let mut unsettled: Vec<Option<Instant>> = vec![None; grid.tiles()];
             let mut id = 0u32;
@@ -257,17 +306,14 @@ impl Streamer {
             // cursor reaches the panel before bulk changes); the last one is
             // acked. `captured` is when the frame was read, for the latency
             // stats (None: not reported). False if the link broke.
-            let mut send_rects = |rects: &[tiles::Rect], frame: &[u8], mode: DisplayMode, flags: u8, captured: Option<Instant>| -> bool {
+            let mut send_rects = |rects: &[tiles::Rect], frame: &Picture, flags: u8, captured: Option<Instant>| -> bool {
                 let (mut pixels, mut bytes) = (0, 0);
                 let msgs: Vec<Msg> = rects
                     .iter()
                     .enumerate()
                     .map(|(i, &(x, y, rw, rh))| {
-                        let (flags, packed) = if mode == DisplayMode::Edge {
-                            (flags | RECT_BITS1, bits1::pack(frame, w, x, y, rw, rh))
-                        } else {
-                            (flags, gray4::pack(frame, w, x, y, rw, rh))
-                        };
+                        let (bits, packed) = frame.pack(w, x, y, rw, rh);
+                        let flags = if bits { flags | RECT_BITS1 } else { flags };
                         let flags = if i + 1 == rects.len() { flags | RECT_LAST } else { flags };
                         let data = lz4_flex::block::compress_prepend_size(&packed);
                         id = id.wrapping_add(1);
@@ -319,15 +365,15 @@ impl Streamer {
                     }
                 };
                 match work {
-                    Work::Frame(Published { epoch: generation, levels: frame, captured, mode, seq, dirty: gpu_dirty }) => {
-                        if frame.len() != w * h {
+                    Work::Frame(Published { epoch: generation, picture: frame, captured, seq, dirty: gpu_dirty }) => {
+                        if !frame.fits(w, h) {
                             continue;
                         }
                         // A new source starts from a full frame. The GPU's
                         // answer is good when it is against the frame we sent last.
                         let dirty = match (&last, gpu_dirty) {
                             (Some((g, _, sent)), Some((base, d))) if *g == generation && *sent == base && d.len() == grid.tiles() => d,
-                            (Some((g, prev, _)), _) if *g == generation => grid.dirty(prev, &frame),
+                            (Some((g, prev, _)), _) if *g == generation => frame.dirty(prev, &grid),
                             _ => vec![true; grid.tiles()],
                         };
                         let rects = if dirty.iter().all(|&d| d) { vec![(0, 0, w, h)] } else { grid.rects(&dirty) };
@@ -338,7 +384,7 @@ impl Streamer {
                             }
                             continue;
                         }
-                        if !send_rects(&rects, &frame, mode, 0, Some(captured)) {
+                        if !send_rects(&rects, &frame, 0, Some(captured)) {
                             return;
                         }
                         let now = Instant::now();
@@ -359,7 +405,7 @@ impl Streamer {
                             continue;
                         }
                         let rects = grid.rects(&due);
-                        if !send_rects(&rects, frame, mode, RECT_SETTLE, None) {
+                        if !send_rects(&rects, frame, RECT_SETTLE, None) {
                             return;
                         }
                         for (t, _) in due.iter().enumerate().filter(|(_, d)| **d) {
