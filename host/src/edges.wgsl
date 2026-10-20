@@ -43,6 +43,13 @@ struct Params {
     g_deadband: u32,
     // 1 when the capture's bytes are R, G, B, x instead of B, G, R, x.
     swap: u32,
+    // The dirty rectangles: the frame's slot (0..31) in the history word of
+    // each cell, the slots of the frames since the one the sender has (a bit
+    // per slot), and 1 when the frame has nothing to be compared with (every
+    // cell counts as changed).
+    r_slot: u32,
+    r_mask: u32,
+    r_full: u32,
 }
 
 // The gray frame (made by `convert` from the raw capture), four pixels to a word.
@@ -74,13 +81,23 @@ struct Params {
 // The previous frame's outline (copied from buf_out when a frame is done).
 @group(0) @binding(10) var<storage, read> buf_prev: array<u32>;
 // The ghosting model's state per pixel, the picture last sent (written by
-// the host, packed as g_kind says), the tiles that update covered, and the
-// error sums per tile and per 8x8 cell.
+// the host, packed as g_kind says), the 8x8 cells that update covered, and
+// the error sums per tile and per 8x8 cell.
 @group(0) @binding(14) var<storage, read_write> buf_est: array<u32>;
 @group(0) @binding(15) var<storage, read> buf_sent: array<u32>;
 @group(0) @binding(16) var<storage, read> buf_gmask: array<u32>;
 @group(0) @binding(17) var<storage, read_write> buf_gerr: array<atomic<u32>>;
 @group(0) @binding(18) var<storage, read_write> buf_gcell: array<atomic<u32>>;
+
+// The history of changed cells: one word per 8x8 cell, bit k set when the
+// cell changed in the frame that used slot k (frame number mod 32).
+@group(0) @binding(19) var<storage, read_write> buf_cword: array<atomic<u32>>;
+// Working storage of the rectangle passes, a section per layer (0 the
+// changed cells, 1 the cells with ghosting error): see `map_at`.
+@group(0) @binding(20) var<storage, read_write> buf_rc: array<atomic<u32>>;
+// The result the CPU reads, a section per layer: a count, a counter for the
+// sub-boxes, then the boxes.
+@group(0) @binding(21) var<storage, read_write> buf_rlist: array<atomic<u32>>;
 
 // Must equal tiles::TILE.
 const TILE: u32 = 32u;
@@ -442,6 +459,7 @@ fn diff_tiles(@builtin(global_invocation_id) g: vec3<u32>) {
     if ((buf_out[i] & 255u) != (buf_prev[i] & 255u)) {
         let cols = (w + TILE - 1u) / TILE;
         atomicStore(&buf_tiles[(g.y / TILE) * cols + g.x / TILE], 1u);
+        atomicOr(&buf_cword[(g.y / CELL) * cw() + g.x / CELL], 1u << prm.r_slot);
     }
 }
 
@@ -534,6 +552,7 @@ fn diff_gray4(@builtin(global_invocation_id) g: vec3<u32>) {
     if (now != before) {
         let cols = (w + TILE - 1u) / TILE;
         atomicStore(&buf_tiles[(g.y / TILE) * cols + g.x / TILE], 1u);
+        atomicOr(&buf_cword[(g.y / CELL) * cw() + g.x / CELL], 1u << prm.r_slot);
     }
 }
 
@@ -574,7 +593,7 @@ fn packed_level(is_sent: bool, x: u32, y: u32) -> u32 {
 }
 
 // What an update that went to the tablet did to the pixels of the marked
-// tiles (buf_gmask): g_mode 1 fast, 2 settle, 3 reset, 4 redrive. The
+// cells (buf_gmask): g_mode 1 fast, 2 settle, 3 reset, 4 redrive. The
 // picture sent is in buf_sent.
 @compute @workgroup_size(16, 16)
 fn ghost_drive(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -582,8 +601,7 @@ fn ghost_drive(@builtin(global_invocation_id) g: vec3<u32>) {
     if (g.x >= w || g.y >= prm.h) {
         return;
     }
-    let cols = (w + TILE - 1u) / TILE;
-    if (buf_gmask[(g.y / TILE) * cols + g.x / TILE] == 0u) {
+    if (buf_gmask[(g.y / CELL) * cw() + g.x / CELL] == 0u) {
         return;
     }
     let i = g.y * w + g.x;
@@ -631,6 +649,396 @@ fn ghost_err(@builtin(global_invocation_id) g: vec3<u32>) {
     if (d > prm.g_deadband) {
         let e = (d - prm.g_deadband) >> 8u;
         atomicAdd(&buf_gerr[(g.y / TILE) * ((w + TILE - 1u) / TILE) + g.x / TILE], e);
-        atomicAdd(&buf_gcell[(g.y / 8u) * ((w + 7u) / 8u) + g.x / 8u], e);
+        atomicAdd(&buf_gcell[(g.y / CELL) * cw() + g.x / CELL], e);
+    }
+}
+
+// ---- Dirty rectangles, found on the GPU. The map of changed 8x8 cells (and,
+// as a second layer, of the cells whose ghosting error is at least CELL_ERR)
+// is cut into connected components, each with its bounding box; a component
+// whose box is mostly empty is cut into bands along its longer side, whose
+// boxes are joined again while they stay well filled. The boxes go to a list
+// the CPU reads with the frame. Set cells at most GAP empty cells apart are
+// one component; the boxes hold only cells that are set. tiles.rs has the
+// same algorithm on the CPU (`cell_boxes`), which the tests compare with.
+
+// Must equal tiles::CELL, GAP, BOXES, SPLIT_AREA, MAX_BANDS, MERGE_FILL and
+// ghost::CELL_ERR.
+const CELL: u32 = 8u;
+const GAP: i32 = 1;
+const RECTS: u32 = 64u;
+const SPLIT_AREA: u32 = 16u;
+const MAX_BANDS: u32 = 16u;
+const MERGE_FILL: u32 = 60u;
+const CELL_ERR: u32 = 64u;
+// Words of a layer's section in buf_rlist: a count, a sub-box counter, two
+// spare, then RECTS boxes of four.
+const RL: u32 = 260u;
+
+fn cw() -> u32 {
+    return (prm.w + 7u) / 8u;
+}
+
+fn ch() -> u32 {
+    return (prm.h + 7u) / 8u;
+}
+
+fn ncells() -> u32 {
+    return cw() * ch();
+}
+
+// A layer's section of buf_rc: the map (1 per set cell), the union-find
+// forest, a record per cell (the component's box if it is a root) and the
+// sub-boxes (as many as cells). A record: min x, min y, max x, max y, count,
+// first sub-box, number of sub-boxes, band height (+ 65536 for bands of columns).
+fn map_at(l: u32, c: u32) -> u32 {
+    return l * ncells() * 18u + c;
+}
+
+fn lab_at(l: u32, c: u32) -> u32 {
+    return l * ncells() * 18u + ncells() + c;
+}
+
+fn rec_at(l: u32, c: u32) -> u32 {
+    return l * ncells() * 18u + ncells() * 2u + c * 8u;
+}
+
+fn sub_at(l: u32, s: u32) -> u32 {
+    return l * ncells() * 18u + ncells() * 10u + s * 8u;
+}
+
+fn rec_clear(at: u32) {
+    atomicStore(&buf_rc[at], 0xffffu);
+    atomicStore(&buf_rc[at + 1u], 0xffffu);
+    for (var k = 2u; k < 8u; k++) {
+        atomicStore(&buf_rc[at + k], 0u);
+    }
+}
+
+fn rec_add(at: u32, x: u32, y: u32) {
+    atomicMin(&buf_rc[at], x);
+    atomicMin(&buf_rc[at + 1u], y);
+    atomicMax(&buf_rc[at + 2u], x);
+    atomicMax(&buf_rc[at + 3u], y);
+    atomicAdd(&buf_rc[at + 4u], 1u);
+}
+
+// A cell's history bit for this frame's slot, cleared (or, for a frame with
+// nothing to compare with, set), before the diff stages write to it.
+@compute @workgroup_size(16, 16)
+fn rc_slot(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= cw() || g.y >= ch()) {
+        return;
+    }
+    let c = g.y * cw() + g.x;
+    let bit = 1u << prm.r_slot;
+    if (prm.r_full != 0u) {
+        atomicOr(&buf_cword[c], bit);
+    } else {
+        atomicAnd(&buf_cword[c], ~bit);
+    }
+}
+
+// The map of a layer, and a fresh forest and fresh records (dispatched with
+// one z per layer).
+@compute @workgroup_size(16, 16)
+fn rc_init(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= cw() || g.y >= ch()) {
+        return;
+    }
+    let l = g.z;
+    let c = g.y * cw() + g.x;
+    var on = 0u;
+    if (l == 0u) {
+        if ((atomicLoad(&buf_cword[c]) & prm.r_mask) != 0u) {
+            on = 1u;
+        }
+    } else if (atomicLoad(&buf_gcell[c]) >= CELL_ERR) {
+        on = 1u;
+    }
+    atomicStore(&buf_rc[map_at(l, c)], on);
+    atomicStore(&buf_rc[lab_at(l, c)], c);
+    // Only the set cells can be roots, and sub-boxes are cleared when they are given out.
+    if (on != 0u) {
+        rec_clear(rec_at(l, c));
+    }
+    if (c == 0u) {
+        atomicStore(&buf_rlist[l * RL], 0u);
+        atomicStore(&buf_rlist[l * RL + 1u], 0u);
+        // The last box takes whatever does not fit: the union of the rest.
+        let last = l * RL + 4u + (RECTS - 1u) * 4u;
+        atomicStore(&buf_rlist[last], 0xffffu);
+        atomicStore(&buf_rlist[last + 1u], 0xffffu);
+        atomicStore(&buf_rlist[last + 2u], 0u);
+        atomicStore(&buf_rlist[last + 3u], 0u);
+    }
+}
+
+fn find_c(l: u32, start: u32) -> u32 {
+    var x = start;
+    loop {
+        let p = atomicLoad(&buf_rc[lab_at(l, x)]);
+        if (p == x) {
+            return x;
+        }
+        let gp = atomicLoad(&buf_rc[lab_at(l, p)]);
+        atomicStore(&buf_rc[lab_at(l, x)], gp);
+        x = gp;
+    }
+    return x;
+}
+
+fn join_c(l: u32, a0: u32, b0: u32) {
+    var a = find_c(l, a0);
+    var b = find_c(l, b0);
+    loop {
+        if (a == b) {
+            return;
+        }
+        let hi = max(a, b);
+        let lo = min(a, b);
+        if (atomicCompareExchangeWeak(&buf_rc[lab_at(l, hi)], hi, lo).exchanged) {
+            return;
+        }
+        a = find_c(l, hi);
+        b = find_c(l, lo);
+    }
+}
+
+// Each set cell joins the set cells before it (in rows) within GAP + 1 cells.
+@compute @workgroup_size(16, 16)
+fn rc_link(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= cw() || g.y >= ch()) {
+        return;
+    }
+    let l = g.z;
+    let cols = i32(cw());
+    let x = i32(g.x);
+    let y = i32(g.y);
+    let c = g.y * cw() + g.x;
+    if (atomicLoad(&buf_rc[map_at(l, c)]) == 0u) {
+        return;
+    }
+    for (var dy = 0; dy <= GAP + 1; dy++) {
+        for (var dx = -(GAP + 1); dx <= GAP + 1; dx++) {
+            if (dy == 0 && dx >= 0) {
+                continue;
+            }
+            let nx = x + dx;
+            let ny = y - dy;
+            if (nx < 0 || ny < 0 || nx >= cols) {
+                continue;
+            }
+            let n = u32(ny * cols + nx);
+            if (atomicLoad(&buf_rc[map_at(l, n)]) != 0u) {
+                join_c(l, c, n);
+            }
+        }
+    }
+}
+
+// Adds a run of set cells of one row (x, y, n cells) to the box at `at`.
+fn rec_add_run(at: u32, x: u32, y: u32, n: u32) {
+    atomicMin(&buf_rc[at], x);
+    atomicMin(&buf_rc[at + 1u], y);
+    atomicMax(&buf_rc[at + 2u], x + n - 1u);
+    atomicMax(&buf_rc[at + 3u], y);
+    atomicAdd(&buf_rc[at + 4u], n);
+}
+
+// Each run of set cells of a row (cells of one component, and with `band`
+// of one band of the component's sub-boxes) is added to its box by one
+// thread, so a big component does not make every cell wait for the same
+// few words. The band is 0 for the box of the component itself.
+fn run_end(l: u32, root: u32, x: u32, y: u32, bands: bool) -> u32 {
+    var e = x;
+    let first = band_of(l, root, x, y, bands);
+    while (e + 1u < cw()) {
+        let c = y * cw() + e + 1u;
+        if (atomicLoad(&buf_rc[map_at(l, c)]) == 0u || find_c(l, c) != root || band_of(l, root, e + 1u, y, bands) != first) {
+            break;
+        }
+        e++;
+    }
+    return e;
+}
+
+// The band a cell belongs to in the sub-boxes of its component's record (0 without sub-boxes).
+fn band_of(l: u32, root: u32, x: u32, y: u32, bands: bool) -> u32 {
+    if (!bands) {
+        return 0u;
+    }
+    let r = rec_at(l, root);
+    let info = atomicLoad(&buf_rc[r + 7u]);
+    let band = info & 65535u;
+    if (info >= 65536u) {
+        return (x - atomicLoad(&buf_rc[r])) / band;
+    }
+    return (y - atomicLoad(&buf_rc[r + 1u])) / band;
+}
+
+// Whether the cell before this one in the row is set, of the same
+// component and band: then another thread has the run it is in.
+fn run_start(l: u32, root: u32, x: u32, y: u32, bands: bool) -> bool {
+    if (x == 0u) {
+        return true;
+    }
+    let p = y * cw() + x - 1u;
+    return atomicLoad(&buf_rc[map_at(l, p)]) == 0u || find_c(l, p) != root || band_of(l, root, x - 1u, y, bands) != band_of(l, root, x, y, bands);
+}
+
+// Each run of set cells is added to the box of its component.
+@compute @workgroup_size(16, 16)
+fn rc_box(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= cw() || g.y >= ch()) {
+        return;
+    }
+    let l = g.z;
+    let c = g.y * cw() + g.x;
+    if (atomicLoad(&buf_rc[map_at(l, c)]) == 0u) {
+        return;
+    }
+    let root = find_c(l, c);
+    if (run_start(l, root, g.x, g.y, false)) {
+        rec_add_run(rec_at(l, root), g.x, g.y, run_end(l, root, g.x, g.y, false) - g.x + 1u);
+    }
+}
+
+// A component that fills less than half of its box, and is not small, gets
+// sub-boxes: bands (at most MAX_BANDS) along the longer side of the box.
+@compute @workgroup_size(16, 16)
+fn rc_split(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= cw() || g.y >= ch()) {
+        return;
+    }
+    let l = g.z;
+    let c = g.y * cw() + g.x;
+    if (atomicLoad(&buf_rc[map_at(l, c)]) == 0u || atomicLoad(&buf_rc[lab_at(l, c)]) != c) {
+        return;
+    }
+    let r = rec_at(l, c);
+    let bw = atomicLoad(&buf_rc[r + 2u]) - atomicLoad(&buf_rc[r]) + 1u;
+    let bh = atomicLoad(&buf_rc[r + 3u]) - atomicLoad(&buf_rc[r + 1u]) + 1u;
+    if (atomicLoad(&buf_rc[r + 4u]) * 2u >= bw * bh || bw * bh < SPLIT_AREA) {
+        return;
+    }
+    let by_col = bw > bh;
+    let len = select(bh, bw, by_col);
+    let band = (len + MAX_BANDS - 1u) / MAX_BANDS;
+    let n = (len + band - 1u) / band;
+    if (n < 2u) {
+        return;
+    }
+    let first = atomicAdd(&buf_rlist[l * RL + 1u], n);
+    if (first + n <= ncells()) {
+        for (var k = 0u; k < n; k++) {
+            rec_clear(sub_at(l, first + k));
+        }
+        atomicStore(&buf_rc[r + 5u], first);
+        atomicStore(&buf_rc[r + 6u], n);
+        atomicStore(&buf_rc[r + 7u], band + select(0u, 65536u, by_col));
+    }
+}
+
+// Each run of set cells of a split component, within one band, is added to
+// the sub-box of the band.
+@compute @workgroup_size(16, 16)
+fn rc_sub(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= cw() || g.y >= ch()) {
+        return;
+    }
+    let l = g.z;
+    let c = g.y * cw() + g.x;
+    if (atomicLoad(&buf_rc[map_at(l, c)]) == 0u) {
+        return;
+    }
+    let root = find_c(l, c);
+    let r = rec_at(l, root);
+    if (atomicLoad(&buf_rc[r + 6u]) == 0u) {
+        return;
+    }
+    if (run_start(l, root, g.x, g.y, true)) {
+        let k = band_of(l, root, g.x, g.y, true);
+        rec_add_run(sub_at(l, atomicLoad(&buf_rc[r + 5u]) + k), g.x, g.y, run_end(l, root, g.x, g.y, true) - g.x + 1u);
+    }
+}
+
+// Appends a box (cell corners, the far one exclusive) to the layer's list;
+// the last place of the list is the union of the boxes that do not fit.
+fn emit_box(l: u32, x0: u32, y0: u32, x1: u32, y1: u32) {
+    let idx = atomicAdd(&buf_rlist[l * RL], 1u);
+    let at = l * RL + 4u + min(idx, RECTS - 1u) * 4u;
+    if (idx < RECTS - 1u) {
+        atomicStore(&buf_rlist[at], x0);
+        atomicStore(&buf_rlist[at + 1u], y0);
+        atomicStore(&buf_rlist[at + 2u], x1);
+        atomicStore(&buf_rlist[at + 3u], y1);
+    } else {
+        atomicMin(&buf_rlist[at], x0);
+        atomicMin(&buf_rlist[at + 1u], y0);
+        atomicMax(&buf_rlist[at + 2u], x1);
+        atomicMax(&buf_rlist[at + 3u], y1);
+    }
+}
+
+// One box for a component, or for a split one its bands in order, joined
+// while the cells set fill at least MERGE_FILL percent of the joined box.
+@compute @workgroup_size(16, 16)
+fn rc_emit(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= cw() || g.y >= ch()) {
+        return;
+    }
+    let l = g.z;
+    let c = g.y * cw() + g.x;
+    if (atomicLoad(&buf_rc[map_at(l, c)]) == 0u || atomicLoad(&buf_rc[lab_at(l, c)]) != c) {
+        return;
+    }
+    let r = rec_at(l, c);
+    let n = atomicLoad(&buf_rc[r + 6u]);
+    if (n == 0u) {
+        emit_box(l, atomicLoad(&buf_rc[r]), atomicLoad(&buf_rc[r + 1u]), atomicLoad(&buf_rc[r + 2u]) + 1u, atomicLoad(&buf_rc[r + 3u]) + 1u);
+        return;
+    }
+    let first = atomicLoad(&buf_rc[r + 5u]);
+    var have = false;
+    var gx0 = 0u;
+    var gy0 = 0u;
+    var gx1 = 0u;
+    var gy1 = 0u;
+    var gn = 0u;
+    for (var k = 0u; k < n; k++) {
+        let s = sub_at(l, first + k);
+        let cnt = atomicLoad(&buf_rc[s + 4u]);
+        if (cnt == 0u) {
+            continue;
+        }
+        let x0 = atomicLoad(&buf_rc[s]);
+        let y0 = atomicLoad(&buf_rc[s + 1u]);
+        let x1 = atomicLoad(&buf_rc[s + 2u]) + 1u;
+        let y1 = atomicLoad(&buf_rc[s + 3u]) + 1u;
+        if (have) {
+            let ux0 = min(gx0, x0);
+            let uy0 = min(gy0, y0);
+            let ux1 = max(gx1, x1);
+            let uy1 = max(gy1, y1);
+            if ((gn + cnt) * 100u >= MERGE_FILL * (ux1 - ux0) * (uy1 - uy0)) {
+                gx0 = ux0;
+                gy0 = uy0;
+                gx1 = ux1;
+                gy1 = uy1;
+                gn += cnt;
+                continue;
+            }
+            emit_box(l, gx0, gy0, gx1, gy1);
+        }
+        gx0 = x0;
+        gy0 = y0;
+        gx1 = x1;
+        gy1 = y1;
+        gn = cnt;
+        have = true;
+    }
+    if (have) {
+        emit_box(l, gx0, gy0, gx1, gy1);
     }
 }

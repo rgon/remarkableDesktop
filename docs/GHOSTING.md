@@ -102,8 +102,18 @@ Error: `d = |est - level * 4369|`; if `d > DEAD_BAND`,
 grid) and to its 8x8 cell. Units: 256 is one pixel that is wholly wrong.
 The tile sums go to the CPU with the frame (one small read, same submit); the
 cell sums are in the GPU buffer `GCELL` (binding 18; `Gpu::ghost_cells`
-reads it back for tests) so a later step can run connected components on
-the cells with error, and box the ghosts tightly instead of 32 px tiles.
+reads it back for tests). The cells with error of at least `CELL_ERR` (64, a
+quarter pixel) go through the same GPU box passes as the changed cells of a
+frame (`rc_*` in `edges.wgsl`, layer 1; see `tiles.rs`) and come back as a
+short list of boxes (`Gpu::ghost_boxes`, same submit as the error sums).
+The streamer's settle uses them when `SETTLE_BY_BOXES` (stream.rs) is true:
+the tiles still decide which tiles are settled and when (error sums, quiet
+time, budget), but the refresh covers only the part of each box that lies in
+the chosen tiles (`Grid::rects_within`), so a one-pixel trail is refreshed by
+a thin box, not a 32x32 tile; chosen tiles no box reaches keep the tile
+rectangle. False gives whole tiles as before. What an update drives in the
+model is the 8x8 cells its rectangles cover (`GMASK` is per cell), so a
+rectangle smaller than a tile is not taken as having refreshed the whole tile.
 
 GPU structure: `ghost_err` is appended to the existing gray and edge command
 buffers (same submit as the frame); `ghost_drive` is its own small command

@@ -28,8 +28,15 @@ use std::time::Duration;
 pub const FULL: u32 = 65535;
 /// Units of one of the 15 gray steps (`FULL / 15`).
 pub const LEVEL: u32 = 4369;
-/// Edge of a cell of the per-cell error map, in pixels.
-pub const CELL: usize = 8;
+/// Edge of a cell of the per-cell error map, in pixels (also the grain of
+/// the cells an update drives, and of the GPU's rectangles).
+#[cfg(test)]
+pub const CELL: usize = crate::tiles::CELL;
+/// A cell whose error is at least this (1 unit = 1/256 of a pixel that is
+/// wholly wrong; a quarter of a pixel) is in the boxes the GPU draws around
+/// the ghosts (`ghost_boxes`). Must equal `CELL_ERR` in `edges.wgsl`. Guess.
+#[cfg(test)]
+pub const CELL_ERR: u32 = 64;
 
 // ---- Tunables: one place. "Guess" means no source gives the number; see
 // docs/GHOSTING.md for what each stands for and how to measure it. ----
@@ -156,13 +163,13 @@ impl Model {
         Model { w, h, p, kind, est: vec![FULL; w * h], shown: vec![15; w * h] }
     }
 
-    /// An update of the pixels in the marked tiles (`cols` tiles per row)
+    /// An update of the pixels in the marked cells (`cols` cells per row)
     /// whose content is `levels`.
     pub fn drive(&mut self, levels: &[u8], mode: Drive, marked: &[bool], cols: usize) {
         let (paint, erase) = self.p.fast_k(self.kind);
         for y in 0..self.h {
             for x in 0..self.w {
-                if !marked[(y / crate::tiles::TILE) * cols + x / crate::tiles::TILE] {
+                if !marked[(y / CELL) * cols + x / CELL] {
                     continue;
                 }
                 let i = y * self.w + x;
@@ -273,12 +280,12 @@ mod tests {
         let mut levels = vec![15u8; 32 * 32];
         levels[0] = 0; // white to black: driven
         levels[1] = 12; // white to light gray: same side, not driven
-        m.drive(&levels, Drive::Fast, &[true], 1);
+        m.drive(&levels, Drive::Fast, &[true; 16], 4);
         assert_eq!(m.est[0], approach(FULL, 0, p.k_paint));
         assert_eq!(m.est[1], FULL);
         // The way back is partial too, from where it was, and weaker.
         levels[0] = 15;
-        m.drive(&levels, Drive::Fast, &[true], 1);
+        m.drive(&levels, Drive::Fast, &[true; 16], 4);
         assert_eq!(m.est[0], approach(approach(FULL, 0, p.k_paint), FULL, p.k_erase));
         assert!(m.est[0] < FULL);
     }
@@ -287,11 +294,11 @@ mod tests {
     fn a_gray_drawn_fast_is_an_error_until_it_settles() {
         let mut m = Model::new(32, 32, Params::default(), Kind::Gray4);
         let gray = vec![7u8; 32 * 32]; // darker than the threshold: driven toward black
-        m.drive(&gray, Drive::Fast, &[true], 1);
+        m.drive(&gray, Drive::Fast, &[true; 16], 4);
         let before = m.errors(&gray, 1, 1)[0];
         assert!(before > TILE_ERR, "{before}");
-        m.drive(&gray, Drive::Settle, &[true], 1);
-        m.drive(&gray, Drive::Settle, &[true], 1);
+        m.drive(&gray, Drive::Settle, &[true; 16], 4);
+        m.drive(&gray, Drive::Settle, &[true; 16], 4);
         assert!(m.errors(&gray, 1, 1)[0] < TILE_ERR_WEAK, "settled");
     }
 
@@ -299,8 +306,8 @@ mod tests {
     fn a_moved_thin_line_leaves_a_trail_that_a_redrive_shrinks() {
         let mut m = Model::new(32, 32, Params::default(), Kind::Bits);
         let line = |x: usize| -> Vec<u8> { (0..32 * 32).map(|i| if i % 32 == x { 0 } else { 15 }).collect() };
-        m.drive(&line(10), Drive::Fast, &[true], 1);
-        m.drive(&line(11), Drive::Fast, &[true], 1);
+        m.drive(&line(10), Drive::Fast, &[true; 16], 4);
+        m.drive(&line(11), Drive::Fast, &[true; 16], 4);
         // Column 10 was erased once, incompletely; column 11 is painted.
         let (trail, painted) = (m.est[10], m.est[11]);
         assert!(trail < FULL - DEAD_BAND && painted < FULL / 4, "{trail} {painted}");
@@ -308,7 +315,7 @@ mod tests {
         let cells = m.cell_errors(&line(11));
         assert!(cells.iter().enumerate().all(|(i, &c)| (c > 0) == (i % 4 == 1)), "{cells:?}");
         let before = m.errors(&line(11), 1, 1)[0];
-        m.drive(&line(11), Drive::Redrive, &[true], 1);
+        m.drive(&line(11), Drive::Redrive, &[true; 16], 4);
         assert!(m.errors(&line(11), 1, 1)[0] < before);
         assert_eq!(m.est[11], painted, "black pixels are left alone");
     }
@@ -317,9 +324,11 @@ mod tests {
     fn unsent_tiles_keep_their_estimate() {
         let mut m = Model::new(64, 32, Params::default(), Kind::Gray4);
         let black = vec![0u8; 64 * 32];
-        m.drive(&black, Drive::Fast, &[true, false], 2);
+        // The left four cells of each row of cells (the first tile), not the right four.
+        let left: Vec<bool> = (0..32).map(|c| c % 8 < 4).collect();
+        m.drive(&black, Drive::Fast, &left, 8);
         assert!(m.est[0] < FULL && m.est[40] == FULL);
-        m.drive(&black, Drive::Reset, &[true, true], 2);
+        m.drive(&black, Drive::Reset, &[true; 32], 8);
         assert!(m.est.iter().all(|&e| e == FULL));
     }
 

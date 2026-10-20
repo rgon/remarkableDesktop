@@ -1,5 +1,6 @@
-//! Streams a captured screen to the tablet: only the changed tiles of the
-//! newest frame (as a few rectangles, smallest first). Every captured frame
+//! Streams a captured screen to the tablet: only the changed parts of the
+//! newest frame (as a few rectangles found on the GPU, smallest first, down
+//! to 8x8 cells; the 32x32 tile grid when the GPU has no answer). Every captured frame
 //! is rendered at once, so the newest picture is always ready, and it goes
 //! out the moment the tablet can take it: one update may be in flight and
 //! one more sent behind it while the tablet is quick to acknowledge, and
@@ -11,7 +12,7 @@
 
 use crate::capture::{Capture, Source};
 use crate::ghost::{self, Budget, Drive, Kind};
-use crate::gpu::{Convert, DARK, Gpu};
+use crate::gpu::{Convert, DARK, Frame, Gpu};
 use crate::tiles::{self, Grid};
 use remdesktop_proto::{DisplayMode, Msg, RECT_BITS1, RECT_LAST, RECT_SETTLE, bits1, gray4};
 use std::collections::VecDeque;
@@ -29,6 +30,12 @@ const PIPELINE_ACK_MAX: Duration = Duration::from_millis(40);
 /// A quality refresh that is due and has waited this much longer goes out
 /// even though a changed frame is waiting (while scrolling one always is).
 const SETTLE_GRACE: Duration = Duration::from_millis(300);
+/// Whether a quality refresh covers the boxes the GPU draws around the cells
+/// with ghosting error (a thin trail is refreshed by a thin box) instead of
+/// whole 32x32 tiles. The tiles still decide which tiles, when and how many
+/// (error sums, quiet time, budget); the boxes only tighten them
+/// (`Grid::rects_within`). False: whole tiles, as before.
+const SETTLE_BY_BOXES: bool = true;
 /// How often the sender looks again while the ghosting model has not yet
 /// taken in the updates sent (it normally notifies as soon as it has).
 const MODEL_WAIT: Duration = Duration::from_millis(30);
@@ -82,10 +89,12 @@ struct Shared {
     pushed: u64,
     applied: u64,
     ghost_err: Option<Vec<u32>>,
+    /// Boxes around the cells with ghosting error, from the same pass.
+    ghost_boxes: Option<Vec<tiles::Rect>>,
 }
 
 /// An update that went to the tablet, for the ghosting model: what it did
-/// to which tiles, and the picture it carried (None: the last one given).
+/// to which 8x8 cells, and the picture it carried (None: the last one given).
 struct Sent {
     drive: Drive,
     picture: Option<Picture>,
@@ -115,6 +124,11 @@ impl Shared {
         }
     }
 }
+
+/// What the GPU makes of a frame: the picture, whether it came from the GPU,
+/// the tiles and the boxes (8x8 cells) that changed, and the ghosting
+/// model's error per tile and its boxes.
+type Rendered = (Picture, bool, Option<Vec<bool>>, Option<Vec<tiles::Rect>>, Option<Vec<u32>>, Option<Vec<tiles::Rect>>);
 
 /// A rendered frame as the GPU packs it: 4-bit gray levels, two pixels a
 /// byte (`gray4`'s layout), or, for the edge view, one bit per pixel
@@ -165,7 +179,8 @@ impl Picture {
 
     /// The `rw`×`rh` window at (`x`, `y`) of a `w`-wide frame as it goes on
     /// the wire, and whether that is 1-bit (`RECT_BITS1`). Rectangles start
-    /// on tile boundaries, so a window is whole bytes of the packed rows.
+    /// on cell boundaries (a multiple of 8 pixels), so a window starts on a
+    /// byte of the packed rows; its width may be anything.
     /// It is written into `out`, which is reused.
     fn pack(&self, w: usize, x: usize, y: usize, rw: usize, rh: usize, out: &mut Vec<u8>) -> bool {
         let (bits, frame, per_byte) = match self {
@@ -193,6 +208,10 @@ struct Published {
     /// The tiles that differ from frame number `.0`, as the GPU found out
     /// (known only when frames came out of it one after the other).
     dirty: Option<(u64, Vec<bool>)>,
+    /// Boxes that cover what differs from frame number `.0`, found on the
+    /// GPU in 8x8 cells (see `Gpu::gray_frame`); the same frames as `dirty`
+    /// would be, and good for any frame sent at or after that one.
+    boxes: Option<(u64, Vec<tiles::Rect>)>,
 }
 
 /// Capture → tablet-ack latency of screen updates, reported every 2 s.
@@ -362,11 +381,12 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
     let mut unsettled = Unsettled::new(grid.tiles());
     let mut budget = Budget::new(Instant::now());
     // Tells the ghosting model what an update did, once it has been sent.
-    let push = |drive: Drive, picture: Option<Picture>, mask: Vec<bool>| {
+    // Updates that belong together (a reset and the frame after it) go in at once.
+    let push = |sent: Vec<Sent>| {
         if ghost {
             let mut s = lock.lock().unwrap();
-            s.drives.push_back(Sent { drive, picture, mask });
-            s.pushed += 1;
+            s.pushed += sent.len() as u64;
+            s.drives.extend(sent);
             cv.notify_all();
         }
     };
@@ -465,19 +485,35 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
             }
         };
         match work {
-            Work::Frame(Published { epoch: generation, picture: frame, captured, seq, dirty: gpu_dirty }) => {
+            Work::Frame(Published { epoch: generation, picture: frame, captured, seq, dirty: gpu_dirty, boxes: gpu_boxes }) => {
                 if !frame.fits(w, h) {
                     continue;
                 }
-                // A new source starts from a full frame. The GPU's
-                // answer is good when it is against the frame we sent last.
-                let dirty = match (&last, gpu_dirty) {
-                    (Some((g, _, sent)), Some((base, d))) if *g == generation && *sent == base && d.len() == grid.tiles() => d,
-                    (Some((g, prev, _)), _) if *g == generation => frame.dirty(prev, &grid),
-                    _ => vec![true; grid.tiles()],
+                // A new source starts from a full frame. The GPU's boxes
+                // are good when against a frame no newer than the one we
+                // sent last (older means more cells, never fewer).
+                let boxes = match (&last, gpu_boxes) {
+                    (Some((g, _, sent)), Some((base, b))) if *g == generation && *sent >= base => Some(b),
+                    _ => None,
+                };
+                // Else the GPU's tiles when against the frame sent last, else a comparison here.
+                let (rects, dirty) = match boxes {
+                    Some(b) => {
+                        let rects = tiles::finish(b);
+                        let dirty = grid.covered(&rects);
+                        (rects, dirty)
+                    }
+                    None => {
+                        let dirty = match (&last, gpu_dirty) {
+                            (Some((g, _, sent)), Some((base, d))) if *g == generation && *sent == base && d.len() == grid.tiles() => d,
+                            (Some((g, prev, _)), _) if *g == generation => frame.dirty(prev, &grid),
+                            _ => vec![true; grid.tiles()],
+                        };
+                        let rects = if dirty.iter().all(|&d| d) { vec![(0, 0, w, h)] } else { grid.rects(&dirty) };
+                        (rects, dirty)
+                    }
                 };
                 let fresh_start = !matches!(&last, Some((g, ..)) if *g == generation);
-                let rects = if dirty.iter().all(|&d| d) { vec![(0, 0, w, h)] } else { grid.rects(&dirty) };
                 if rects.is_empty() {
                     // Same picture as the one sent last: nothing to pack, compress or send.
                     if let Some(l) = &mut last {
@@ -491,10 +527,12 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
                 unsettled.touch(&dirty, Instant::now());
                 // The whole frame went out (a new source or mode): the panel's
                 // state before it is not known.
+                let mut told = vec![];
                 if fresh_start {
-                    push(Drive::Reset, None, vec![true; grid.tiles()]);
+                    told.push(Sent { drive: Drive::Reset, picture: None, mask: vec![true; grid.cells()] });
                 }
-                push(Drive::Fast, Some(frame.clone()), grid.covered(&rects));
+                told.push(Sent { drive: Drive::Fast, picture: Some(frame.clone()), mask: grid.covered_cells(&rects) });
+                push(told);
                 last = Some((generation, frame, seq));
             }
             Work::Settle(due) => {
@@ -502,16 +540,22 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
                     unsettled.clear();
                     continue;
                 };
-                let mode = lock.lock().unwrap().mode;
+                let (mode, boxes) = {
+                    let s = lock.lock().unwrap();
+                    (s.mode, s.ghost_boxes.clone())
+                };
                 if mode == DisplayMode::None {
                     unsettled.clear();
                     continue;
                 }
-                let rects = grid.rects(&due);
+                let rects = match boxes {
+                    Some(b) if SETTLE_BY_BOXES && ghost => grid.rects_within(&due, &b),
+                    _ => grid.rects(&due),
+                };
                 if !send_rects(&rects, frame, RECT_SETTLE, None) {
                     return;
                 }
-                push(Drive::Settle, Some(frame.clone()), grid.covered(&rects));
+                push(vec![Sent { drive: Drive::Settle, picture: Some(frame.clone()), mask: grid.covered_cells(&rects) }]);
                 unsettled.done(&due);
             }
         }
@@ -646,6 +690,7 @@ impl Streamer {
                             Ok(Some(err)) => {
                                 let mut s = lock.lock().unwrap();
                                 s.ghost_err = Some(err);
+                                s.ghost_boxes = g.ghost_boxes();
                                 s.applied += std::mem::take(&mut applied_pending);
                                 model_moved = false;
                                 cv.notify_all();
@@ -662,14 +707,17 @@ impl Streamer {
                     }
                     raw_new = false;
                     let raw = current.as_ref().map_or(&[][..], |(_, c)| c.frame());
-                    let rendered: Result<(Picture, bool, Option<Vec<bool>>, Option<Vec<u32>>), String> = match (&mut gpu, mode) {
+                    // The boxes of what changed are asked against the frame the
+                    // sender has now; one it takes meanwhile only makes them a few cells too many.
+                    let at = Frame { seq: seq + 1, base: Some(lock.lock().unwrap().sent_seq) };
+                    let rendered: Result<Rendered, String> = match (&mut gpu, mode) {
                         // Nothing is sent; the frame is never looked at.
-                        (_, DisplayMode::None) => Ok((Picture::Gray4(Arc::new(vec![])), false, None, None)),
-                        (Some(g), DisplayMode::Edge) => g.outline_bgrx(raw, shown).map(|o| (Picture::Bits(Arc::new(o.bits)), true, o.dirty, o.ghost)),
-                        (Some(g), _) => g.gray_bgrx(raw, shown).map(|o| (Picture::Gray4(Arc::new(o.bytes)), true, o.dirty, o.ghost)),
+                        (_, DisplayMode::None) => Ok((Picture::Gray4(Arc::new(vec![])), false, None, None, None, None)),
+                        (Some(g), DisplayMode::Edge) => g.outline_frame(raw, shown, Some(at)).map(|o| (Picture::Bits(Arc::new(o.bits)), true, o.dirty, o.boxes, o.ghost, o.ghost_boxes)),
+                        (Some(g), _) => g.gray_frame(raw, shown, Some(at)).map(|o| (Picture::Gray4(Arc::new(o.bytes)), true, o.dirty, o.boxes, o.ghost, o.ghost_boxes)),
                         (None, _) => Err("no GPU set up".to_string()),
                     };
-                    let (picture, on_gpu, tiles_changed, ghost_err) = match rendered {
+                    let (picture, on_gpu, tiles_changed, boxes_changed, ghost_err, ghost_boxes) = match rendered {
                         Ok(r) => r,
                         Err(e) => {
                             // Start over: a new capture and a new GPU setup.
@@ -707,10 +755,12 @@ impl Streamer {
                     gpu_seq = on_gpu.then_some(seq);
                     if let Some(err) = ghost_err {
                         s.ghost_err = Some(err);
+                        s.ghost_boxes = ghost_boxes;
                         s.applied += std::mem::take(&mut applied_pending);
                         model_moved = false;
                     }
-                    s.frame = Some(Published { epoch, picture, captured: captured_at, seq, dirty });
+                    let boxes = boxes_changed.zip(at.base);
+                    s.frame = Some(Published { epoch, picture, captured: captured_at, seq, dirty, boxes: boxes.map(|(b, base)| (base, b)) });
                     s.fresh = true;
                     cv.notify_all();
                 }
@@ -806,13 +856,22 @@ mod tests {
         /// Publishes frame `seq`, the content being `level` everywhere except
         /// the first tile, which is `tile`; `dirty` is the GPU's answer.
         fn publish(&self, seq: u64, level: u8, tile: u8, dirty: Option<(u64, Vec<bool>)>) {
+            self.publish_with(seq, level, tile, dirty, None);
+        }
+
+        /// As `publish`, with the GPU's boxes as the answer.
+        fn publish_boxes(&self, seq: u64, level: u8, tile: u8, boxes: (u64, Vec<tiles::Rect>)) {
+            self.publish_with(seq, level, tile, None, Some(boxes));
+        }
+
+        fn publish_with(&self, seq: u64, level: u8, tile: u8, dirty: Option<(u64, Vec<bool>)>, boxes: Option<(u64, Vec<tiles::Rect>)>) {
             let mut v = vec![level << 4 | level; gray4::row_bytes(SIZE) * SIZE];
             for y in 0..tiles::TILE {
                 v[y * gray4::row_bytes(SIZE)..][..tiles::TILE / 2].fill(tile << 4 | tile);
             }
             let (lock, cv) = &*self.shared;
             let mut s = lock.lock().unwrap();
-            s.frame = Some(Published { epoch: 1, picture: Picture::Gray4(Arc::new(v)), captured: Instant::now(), seq, dirty });
+            s.frame = Some(Published { epoch: 1, picture: Picture::Gray4(Arc::new(v)), captured: Instant::now(), seq, dirty, boxes });
             s.fresh = true;
             cv.notify_all();
         }
@@ -974,7 +1033,8 @@ mod tests {
         rig.publish(2, 15, 3, Some((1, first_tile())));
         let change = rig.update(SOON).unwrap();
         rig.ack(change[0].0);
-        assert_eq!(rig.model(0, 0).iter().map(|d| (d.drive, d.mask.iter().filter(|&&m| m).count())).collect::<Vec<_>>(), [(Drive::Fast, 1)]);
+        // The 32x32 tile is 16 cells.
+        assert_eq!(rig.model(0, 0).iter().map(|d| (d.drive, d.mask.iter().filter(|&&m| m).count())).collect::<Vec<_>>(), [(Drive::Fast, 16)]);
         let t = Instant::now();
         rig.error(ghost::TILE_ERR, 0);
         let settle = rig.update(SOON).unwrap();
@@ -1042,6 +1102,30 @@ mod tests {
         // And the one after it is compared with what the tablet has.
         rig.publish(3, 15, 4, Some((2, first_tile())));
         assert_eq!(rig.update(SOON).unwrap()[0].2, (0, 0, 32, 32));
+    }
+
+    #[test]
+    fn the_gpus_boxes_set_the_rectangles_when_they_are_against_a_frame_not_newer_than_the_one_sent() {
+        let rig = Rig::new(Duration::from_secs(3600));
+        rig.publish(1, 15, 15, None);
+        let first = rig.update(SOON).unwrap();
+        rig.ack(first[0].0);
+        // A small box (a cursor): the update is that box, not its 32x32 tile.
+        rig.publish_boxes(2, 15, 3, (1, vec![(8, 8, 16, 24)]));
+        let second = rig.update(SOON).unwrap();
+        assert_eq!(second.iter().map(|r| r.2).collect::<Vec<_>>(), [(8, 8, 16, 24)]);
+        rig.ack(second[0].0);
+        // Boxes against an older frame than the one sent are a superset: good.
+        rig.publish_boxes(3, 15, 5, (1, vec![(8, 8, 16, 24), (40, 40, 8, 8)]));
+        let third = rig.update(SOON).unwrap();
+        assert_eq!(third.iter().map(|r| r.2).collect::<Vec<_>>(), [(40, 40, 8, 8), (8, 8, 16, 24)]);
+        rig.ack(third.last().unwrap().0);
+        // Boxes against a frame newer than the one sent could miss changes: the tiles decide.
+        rig.publish_with(5, 15, 7, Some((3, first_tile())), Some((4, vec![(40, 40, 8, 8)])));
+        assert_eq!(rig.update(SOON).unwrap()[0].2, (0, 0, 32, 32));
+        // No boxes at all (an unchanged frame): nothing is sent.
+        rig.publish_boxes(6, 15, 7, (5, vec![]));
+        assert!(rig.update(NOT).is_none());
     }
 
     #[test]
