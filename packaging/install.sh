@@ -27,12 +27,14 @@ ensure_login() {
     err=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$target" true 2>&1) && return 0
     case $err in *"Permission denied"*) ;; *) return 0 ;; esac
     asked=yes
-    [ -t 0 ] || { echo "ssh key refused, and no terminal to ask for a password on" >&2; return 0; }
-    printf '%s refused our ssh key; password: ' "$target" >&2
-    stty -echo
-    read -r REMDESKTOP_SSH_PASSWORD
-    stty echo
-    echo >&2
+    if [ -z "${REMDESKTOP_SSH_PASSWORD:-}" ]; then
+        [ -t 0 ] || { echo "ssh key refused, and no terminal to ask for a password on" >&2; return 0; }
+        printf '%s refused our ssh key; password: ' "$target" >&2
+        stty -echo
+        read -r REMDESKTOP_SSH_PASSWORD
+        stty echo
+        echo >&2
+    fi
     export REMDESKTOP_SSH_PASSWORD
     askpass=$(mktemp)
     chmod 700 "$askpass"
