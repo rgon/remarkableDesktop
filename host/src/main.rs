@@ -3,6 +3,7 @@
 
 mod capture;
 mod displayconfig;
+mod ghost;
 mod gpu;
 mod gsettings;
 mod keymap;
@@ -39,7 +40,7 @@ const USAGE: &str = "usage: remdesktop-host [--ssh root@10.11.99.1] [--remote /h
                        [--no-display] [--no-udp]
                        [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
                        [--palm-major N] [--pen-grace-ms N] [--palm-rest-ms N] [--log-touch]
-                       [--fast-mode M] [--settle-mode M] [--settle-ms N]";
+                       [--fast-mode M] [--settle-mode M] [--settle-ms N] [--no-ghost-model]";
 
 struct Args {
     ssh: String,
@@ -52,11 +53,13 @@ struct Args {
     udp: bool,
     /// How long a screen area must be still before it gets a quality refresh.
     settle_ms: u64,
+    /// Decide quality refreshes from the ghosting model (ghost.rs), the timer being the upper bound.
+    ghost_model: bool,
     run_args: Vec<String>,
 }
 
 fn parse() -> Result<Args, String> {
-    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remdesktop".into(), deploy: None, stats: false, display: true, udp: true, settle_ms: 1000, run_args: vec![] };
+    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remdesktop".into(), deploy: None, stats: false, display: true, udp: true, settle_ms: 1000, ghost_model: true, run_args: vec![] };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value\n{USAGE}"));
@@ -67,6 +70,7 @@ fn parse() -> Result<Args, String> {
             "--stats" => a.stats = true,
             "--no-display" => a.display = false,
             "--no-udp" => a.udp = false,
+            "--no-ghost-model" => a.ghost_model = false,
             "--settle-ms" => a.settle_ms = value()?.parse().map_err(|_| "--settle-ms: a number")?,
             "--capture-test" => {
                 // remdesktop-host --capture-test virtual|<connector> <out.pgm>
@@ -74,16 +78,30 @@ fn parse() -> Result<Args, String> {
                 let path = it.next().ok_or("--capture-test needs an output path")?;
                 let source = if src == "virtual" { capture::Source::Virtual } else { capture::Source::Monitor(src) };
                 let mut cap = capture::Capture::start(&source, (1872, 1404))?;
-                let mut frame = vec![];
                 let t = std::time::Instant::now();
-                while !cap.next_frame(&mut frame, Duration::from_secs(5)).map_err(|e| format!("frame: {e}"))? {}
+                while !cap.next_frame(Duration::from_secs(5)).map_err(|e| format!("frame: {e}"))? {}
                 let first = t.elapsed();
                 println!("virtual monitor: {:?}", cap.virtual_name);
                 let (w, h) = cap.src_size;
-                // The raw BGRx frame as a gray picture.
+                // The raw frame as a gray picture (rows may be padded).
+                let frame = cap.frame();
+                let stride = frame.len() / h;
+                let (r, b) = if cap.swap_rb { (0, 2) } else { (2, 0) };
                 let mut pgm = format!("P5\n{w} {h}\n255\n").into_bytes();
-                pgm.extend(frame.chunks_exact(4).map(|p| ((77 * p[2] as u32 + 150 * p[1] as u32 + 29 * p[0] as u32) >> 8) as u8));
+                for row in frame.chunks_exact(stride) {
+                    pgm.extend(row[..w * 4].chunks_exact(4).map(|p| ((77 * p[r] as u32 + 150 * p[1] as u32 + 29 * p[b] as u32) >> 8) as u8));
+                }
                 std::fs::write(&path, pgm).map_err(|e| e.to_string())?;
+                // A few seconds of frames, to see how they arrive.
+                let (mut count, mut longest, end) = (0, Duration::ZERO, std::time::Instant::now() + Duration::from_secs(3));
+                while std::time::Instant::now() < end {
+                    let wait = std::time::Instant::now();
+                    if cap.next_frame(Duration::from_millis(500)).map_err(|e| format!("frame: {e}"))? {
+                        count += 1;
+                        longest = longest.max(wait.elapsed());
+                    }
+                }
+                println!("{count} more frames in 3 s (longest wait {longest:?}), stride {stride}, swap_rb {}", cap.swap_rb);
                 println!("{w}x{h} frame in {first:?}; outputs now:");
                 for o in outputs::list()? {
                     println!("  {} {}x{} at {},{}", o.name, o.w, o.h, o.x, o.y);
@@ -699,7 +717,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
                 }
                 if args.display {
                     let w = writer.clone();
-                    let s = stream::Streamer::start(logical, rotation, args.stats, Duration::from_millis(args.settle_ms), Box::new(move |m| send(&w, m)));
+                    let s = stream::Streamer::start(logical, rotation, args.stats, Duration::from_millis(args.settle_ms), args.ghost_model, Box::new(move |m| send(&w, m)));
                     if initial == 0 {
                         s.set_source(Some(capture::Source::Virtual), mapping::FULL);
                     }

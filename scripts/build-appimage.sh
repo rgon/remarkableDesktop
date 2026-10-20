@@ -3,8 +3,10 @@
 #   scripts/build-appimage.sh [--skip-build]
 # Bundles the tablet binaries (TABLET_DIR holding remdesktop-armv7 and
 # remdesktop-aarch64, else target/<triple>/release/remdesktop) for `install`.
-# Needs the libxkbcommon dev package (and its runtime libs) to build, and
-# downloads linuxdeploy to bundle the shared libraries.
+# Needs the libxkbcommon and libpipewire-0.3 dev packages (and libclang, for
+# the PipeWire bindings) to build, and downloads linuxdeploy to bundle the
+# shared libraries. libpipewire is not bundled: it has to match the PipeWire
+# daemon and its plugins that Mutter's screen cast runs on, so the host's is used.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -46,6 +48,7 @@ LINUXDEPLOY_OUTPUT_VERSION="$version" \
 "$linuxdeploy" \
     --appdir "$appdir" \
     --executable target/release/remdesktop-host \
+    --exclude-library 'libpipewire-0.3.so*' \
     --desktop-file packaging/es.rgon.remdesktop.desktop \
     --icon-file packaging/remdesktop.svg --icon-filename remdesktop \
     --custom-apprun packaging/AppRun \

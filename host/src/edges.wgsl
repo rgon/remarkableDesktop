@@ -1,6 +1,7 @@
 // The whole picture path on the GPU: the raw capture to the panel's gray
 // frame (scale, letterbox, rotate), then for the edge view blur, Sobel,
-// non-maximum suppression, hysteresis, the placement of the one-pixel line on
+// non-maximum suppression, hysteresis (as connected components, in a fixed
+// number of passes), the placement of the one-pixel line on
 // the darker side, dark pixels, the diff against the previous frame and the
 // packing to bits. build.rs turns this into SPIR-V (naga); gpu.rs runs it.
 //
@@ -26,6 +27,22 @@ struct Params {
     sc_y: u32,
     sc_w: u32,
     sc_h: u32,
+    // The ghosting model: what the pass does (1 fast, 2 settle, 3 reset, 4
+    // redrive), the picture's kind (0 gray4, 1 bits), the shares of a drive
+    // in 1/256 (paint = white to black, erase = black to white; gray view,
+    // then edge view; settle), the level that splits black from white and
+    // the dead band.
+    g_mode: u32,
+    g_kind: u32,
+    g_k_paint: u32,
+    g_k_erase: u32,
+    g_e_paint: u32,
+    g_e_erase: u32,
+    g_k_settle: u32,
+    g_thr: u32,
+    g_deadband: u32,
+    // 1 when the capture's bytes are R, G, B, x instead of B, G, R, x.
+    swap: u32,
 }
 
 // The gray frame (made by `convert` from the raw capture), four pixels to a word.
@@ -39,8 +56,9 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> buf_state: array<u32>;
 // 0 on an outline pixel, 255 elsewhere (filled with 255 before the stages run).
 @group(0) @binding(5) var<storage, read_write> buf_out: array<u32>;
-// Set by a hysteresis pass that promoted a pixel.
-@group(0) @binding(6) var<storage, read_write> buf_changed: atomic<u32>;
+// Union-find forest over the pixels for hysteresis: each pixel points to a
+// pixel of its component with a smaller index, roots point to themselves.
+@group(0) @binding(6) var<storage, read_write> buf_label: array<atomic<u32>>;
 // The finished frame, one bit per pixel (set = white), MSB first, every row
 // padded to whole bytes: the wire format of `bits1` in the proto crate.
 @group(0) @binding(7) var<storage, read_write> buf_bits: array<u32>;
@@ -55,6 +73,14 @@ struct Params {
 @group(0) @binding(9) var<storage, read_write> buf_tiles: array<atomic<u32>>;
 // The previous frame's outline (copied from buf_out when a frame is done).
 @group(0) @binding(10) var<storage, read> buf_prev: array<u32>;
+// The ghosting model's state per pixel, the picture last sent (written by
+// the host, packed as g_kind says), the tiles that update covered, and the
+// error sums per tile and per 8x8 cell.
+@group(0) @binding(14) var<storage, read_write> buf_est: array<u32>;
+@group(0) @binding(15) var<storage, read> buf_sent: array<u32>;
+@group(0) @binding(16) var<storage, read> buf_gmask: array<u32>;
+@group(0) @binding(17) var<storage, read_write> buf_gerr: array<atomic<u32>>;
+@group(0) @binding(18) var<storage, read_write> buf_gcell: array<atomic<u32>>;
 
 // Must equal tiles::TILE.
 const TILE: u32 = 32u;
@@ -70,7 +96,13 @@ fn gray(i: u32) -> u32 {
 
 fn src_luma(x: i32, y: i32) -> f32 {
     let p = buf_src[u32(y) * prm.src_w + u32(x)];
-    return 0.299 * f32((p >> 16u) & 255u) + 0.587 * f32((p >> 8u) & 255u) + 0.114 * f32(p & 255u);
+    var r = (p >> 16u) & 255u;
+    var b = p & 255u;
+    if (prm.swap != 0u) {
+        r = p & 255u;
+        b = (p >> 16u) & 255u;
+    }
+    return 0.299 * f32(r) + 0.587 * f32((p >> 8u) & 255u) + 0.114 * f32(b);
 }
 
 // The gray of one panel pixel from the raw capture: undo the rotation to
@@ -248,32 +280,101 @@ fn nms(@builtin(global_invocation_id) g: vec3<u32>) {
     buf_state[i] = s;
 }
 
-// One round of hysteresis: a weak pixel next to an edge becomes one. Run
-// until a round changes nothing.
+// Hysteresis as connected components of the candidates (weak or edge pixels,
+// 8-connected): a weak pixel becomes an edge when its component holds one,
+// which is what promoting weak pixels next to edges until nothing changes
+// gives. buf_tmp (free after the blur) flags the components with an edge.
 @compute @workgroup_size(16, 16)
-fn hyst(@builtin(global_invocation_id) g: vec3<u32>) {
+fn cc_init(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= prm.w || g.y >= prm.h) {
+        return;
+    }
+    let i = g.y * prm.w + g.x;
+    atomicStore(&buf_label[i], i);
+    buf_tmp[i] = 0u;
+}
+
+// The root of a pixel's component, shortening the path on the way.
+fn find(start: u32) -> u32 {
+    var x = start;
+    loop {
+        let p = atomicLoad(&buf_label[x]);
+        if (p == x) {
+            return x;
+        }
+        let gp = atomicLoad(&buf_label[p]);
+        atomicStore(&buf_label[x], gp);
+        x = gp;
+    }
+    return x;
+}
+
+// Joins two components, the larger root under the smaller.
+fn join(a0: u32, b0: u32) {
+    var a = find(a0);
+    var b = find(b0);
+    loop {
+        if (a == b) {
+            return;
+        }
+        let hi = max(a, b);
+        let lo = min(a, b);
+        if (atomicCompareExchangeWeak(&buf_label[hi], hi, lo).exchanged) {
+            return;
+        }
+        a = find(hi);
+        b = find(lo);
+    }
+}
+
+// Each candidate joins the candidates before it among its neighbors.
+@compute @workgroup_size(16, 16)
+fn cc_link(@builtin(global_invocation_id) g: vec3<u32>) {
     let w = prm.w;
     if (g.x >= w || g.y >= prm.h) {
         return;
     }
     let i = g.y * w + g.x;
-    if (buf_state[i] != 1u) {
+    if (buf_state[i] == 0u) {
         return;
     }
-    let wi = i32(w);
-    let hi = i32(prm.h);
-    let x = i32(g.x);
-    let y = i32(g.y);
-    for (var dy = -1; dy <= 1; dy++) {
-        for (var dx = -1; dx <= 1; dx++) {
-            let nx = x + dx;
-            let ny = y + dy;
-            if ((dx != 0 || dy != 0) && nx >= 0 && ny >= 0 && nx < wi && ny < hi && buf_state[u32(ny) * w + u32(nx)] == 2u) {
-                buf_state[i] = 2u;
-                atomicStore(&buf_changed, 1u);
-                return;
-            }
+    if (g.x > 0u && buf_state[i - 1u] != 0u) {
+        join(i, i - 1u);
+    }
+    if (g.y > 0u) {
+        if (buf_state[i - w] != 0u) {
+            join(i, i - w);
         }
+        if (g.x > 0u && buf_state[i - w - 1u] != 0u) {
+            join(i, i - w - 1u);
+        }
+        if (g.x + 1u < w && buf_state[i - w + 1u] != 0u) {
+            join(i, i - w + 1u);
+        }
+    }
+}
+
+// Flags the components that hold an edge.
+@compute @workgroup_size(16, 16)
+fn cc_flag(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= prm.w || g.y >= prm.h) {
+        return;
+    }
+    let i = g.y * prm.w + g.x;
+    if (buf_state[i] == 2u) {
+        buf_tmp[find(i)] = 1u;
+    }
+}
+
+// Weak pixels of a flagged component become edges.
+@compute @workgroup_size(16, 16)
+fn hyst(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= prm.w || g.y >= prm.h) {
+        return;
+    }
+    let i = g.y * prm.w + g.x;
+    if (buf_state[i] == 1u && buf_tmp[find(i)] == 1u) {
+        buf_state[i] = 2u;
     }
 }
 
@@ -433,5 +534,103 @@ fn diff_gray4(@builtin(global_invocation_id) g: vec3<u32>) {
     if (now != before) {
         let cols = (w + TILE - 1u) / TILE;
         atomicStore(&buf_tiles[(g.y / TILE) * cols + g.x / TILE], 1u);
+    }
+}
+
+// ---- The ghosting model (see ghost.rs, which has the same arithmetic on
+// the CPU, and docs/GHOSTING.md). One word per pixel in buf_est: the
+// estimated optical state in the low 16 bits (0 black .. 65535 white) and
+// the 4-bit level the tablet's framebuffer holds there above.
+
+const LV: u32 = 4369u;
+
+fn approach(est: u32, goal: u32, k: u32) -> u32 {
+    return u32(i32(est) + (i32(goal) - i32(est)) * i32(k) / 256);
+}
+
+// A 0..15 level out of a packed picture: gray4 nibbles, or bits (set =
+// white, so 15), as g_kind says.
+fn packed_level(is_sent: bool, x: u32, y: u32) -> u32 {
+    let w = prm.w;
+    if (prm.g_kind == 0u) {
+        let b = y * ((w + 1u) / 2u) + x / 2u;
+        var a = buf_sent[b >> 2u];
+        if (!is_sent) {
+            a = buf_gray4[b >> 2u];
+        }
+        let v = (a >> ((b & 3u) * 8u)) & 255u;
+        if ((x & 1u) == 0u) {
+            return v >> 4u;
+        }
+        return v & 15u;
+    }
+    let b = y * ((w + 7u) / 8u) + x / 8u;
+    var a = buf_sent[b >> 2u];
+    if (!is_sent) {
+        a = buf_bits[b >> 2u];
+    }
+    let v = (a >> ((b & 3u) * 8u)) & 255u;
+    return select(0u, 15u, ((v >> (7u - (x & 7u))) & 1u) != 0u);
+}
+
+// What an update that went to the tablet did to the pixels of the marked
+// tiles (buf_gmask): g_mode 1 fast, 2 settle, 3 reset, 4 redrive. The
+// picture sent is in buf_sent.
+@compute @workgroup_size(16, 16)
+fn ghost_drive(@builtin(global_invocation_id) g: vec3<u32>) {
+    let w = prm.w;
+    if (g.x >= w || g.y >= prm.h) {
+        return;
+    }
+    let cols = (w + TILE - 1u) / TILE;
+    if (buf_gmask[(g.y / TILE) * cols + g.x / TILE] == 0u) {
+        return;
+    }
+    let i = g.y * w + g.x;
+    if (prm.g_mode == 3u) {
+        buf_est[i] = 0xffffu | (15u << 16u);
+        return;
+    }
+    var est = buf_est[i] & 0xffffu;
+    let shown = buf_est[i] >> 16u;
+    let tl = packed_level(true, g.x, g.y);
+    let to_white = tl >= prm.g_thr;
+    var paint = prm.g_k_paint;
+    var erase = prm.g_k_erase;
+    if (prm.g_kind == 1u) {
+        paint = prm.g_e_paint;
+        erase = prm.g_e_erase;
+    }
+    if (prm.g_mode == 2u) {
+        est = approach(est, tl * LV, prm.g_k_settle);
+    } else if (prm.g_mode == 4u) {
+        if (to_white && est + prm.g_deadband < 65535u) {
+            buf_est[i] = approach(est, 65535u, erase) | (shown << 16u);
+        }
+        return;
+    } else if (to_white != (shown >= prm.g_thr)) {
+        if (to_white) {
+            est = approach(est, 65535u, erase);
+        } else {
+            est = approach(est, 0u, paint);
+        }
+    }
+    buf_est[i] = est | (tl << 16u);
+}
+
+// The error of the estimate against the newest frame, summed per tile and
+// per 8x8 cell (units of 1/256 of a wholly wrong pixel, dead band off).
+@compute @workgroup_size(16, 16)
+fn ghost_err(@builtin(global_invocation_id) g: vec3<u32>) {
+    let w = prm.w;
+    if (g.x >= w || g.y >= prm.h) {
+        return;
+    }
+    let est = i32(buf_est[g.y * w + g.x] & 0xffffu);
+    let d = u32(abs(est - i32(packed_level(false, g.x, g.y) * LV)));
+    if (d > prm.g_deadband) {
+        let e = (d - prm.g_deadband) >> 8u;
+        atomicAdd(&buf_gerr[(g.y / TILE) * ((w + TILE - 1u) / TILE) + g.x / TILE], e);
+        atomicAdd(&buf_gcell[(g.y / 8u) * ((w + 7u) / 8u) + g.x / 8u], e);
     }
 }

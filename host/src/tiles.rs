@@ -91,6 +91,20 @@ impl Grid {
         runs.sort_by_key(|&r| (area(r), r.1, r.0));
         runs
     }
+
+    /// The tiles the rectangles (from `rects`) cover, which may be more
+    /// than the marked ones: what an update actually puts on the panel.
+    pub fn covered(&self, rects: &[Rect]) -> Vec<bool> {
+        let mut out = vec![false; self.tiles()];
+        for &(x, y, w, h) in rects {
+            for ty in y / TILE..(y + h).div_ceil(TILE).min(self.rows) {
+                for tx in x / TILE..(x + w).div_ceil(TILE).min(self.cols) {
+                    out[ty * self.cols + tx] = true;
+                }
+            }
+        }
+        out
+    }
 }
 
 fn area(r: Rect) -> usize {
@@ -106,6 +120,14 @@ fn union(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rectangles_cover_the_tiles_they_span() {
+        let g = Grid::new(100, 70); // 4 × 3 tiles
+        let c = g.covered(&[(32, 0, 64, 32), (96, 64, 4, 6)]);
+        let want: Vec<bool> = (0..12).map(|t| matches!(t, 1 | 2 | 11)).collect();
+        assert_eq!(c, want);
+    }
 
     #[test]
     fn bit_images_are_compared_per_tile_like_byte_images() {

@@ -66,12 +66,22 @@ fn clear_ink(ink: &mut Ink, epd: &Epd, display: &Display) {
     }
 }
 
-/// The CLR button: puts back what the ink covered, then refreshes the whole
-/// panel in the flashing full-quality mode, which clears every ghost, not
-/// just the ink's.
+/// The CLR button: puts back what the ink covered, then runs the full
+/// de-ghosting cycle: the whole panel flashes white, then black, then the
+/// frame is redrawn, each step in the flashing full-quality mode.
 fn clear_screen(ink: &mut Ink, epd: &Epd) {
     ink.restore(&epd.fb);
-    epd.swap(0, 0, epd.width(), epd.height(), Mode::Content, 0);
+    let (w, h) = (epd.width(), epd.height());
+    // Keep the frame so it can be redrawn after the flashes.
+    let mut frame = vec![0u8; epd.fb.len()];
+    unsafe { std::ptr::copy_nonoverlapping(epd.fb.pixels, frame.as_mut_ptr(), frame.len()) };
+    for gray in [255, 0] {
+        unsafe { epd.fb.fill_gray(0, 0, w, h, gray) };
+        epd.swap(0, 0, w, h, Mode::Content, 0);
+        epd.process_events(0);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(frame.as_ptr(), epd.fb.pixels, frame.len()) };
+    epd.swap(0, 0, w, h, Mode::Content, 0);
     epd.process_events(0);
 }
 

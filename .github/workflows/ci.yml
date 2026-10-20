@@ -17,7 +17,7 @@ concurrency:
 jobs:
   # Tablet binaries: glibc-linked against 2.31 with zig, like run.sh does.
   build-tablet:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
@@ -37,7 +37,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install cargo-zigbuild
-        run: pip3 install cargo-zigbuild
+        run: pipx install cargo-zigbuild
 
       - name: Build tablet binary
         run: |
@@ -50,9 +50,11 @@ jobs:
           path: remdesktop-${{ matrix.arch }}
           if-no-files-found: error
 
+  # Built on 24.04 (libpipewire 1.0, glibc 2.39): that is the oldest glibc the
+  # AppImage runs on, and the PipeWire the bindings are built against.
   build:
     needs: [build-tablet]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -63,7 +65,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y libxkbcommon-dev pkg-config
+          sudo apt-get install -y libxkbcommon-dev libpipewire-0.3-dev libclang-dev pkg-config
 
       - name: Run tests
         run: cargo test --release -p remdesktop-proto -p remdesktop-host

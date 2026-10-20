@@ -94,8 +94,9 @@ logs to the journal.
   compute queue (`libvulkan` is loaded at run time, nothing is linked; the
   first discrete or integrated GPU is used) and has no CPU path for it. If
   setting the GPU up or a frame fails, the capture and the GPU setup are
-  rebuilt and tried again, with the reason in the log. GStreamer only copies
-  the raw BGRx capture into a pipe; the GPU scales it (bilinear, white
+  rebuilt and tried again, with the reason in the log. The host takes the raw
+  capture (BGRx or a variant) from PipeWire in-process, as shared memory it
+  copies once into the GPU; the GPU scales it (bilinear, white
   letterbox bars), rotates it and, in the edge view, finds the outlines. A real
   monitor's size comes from its stream parameters.
 - **Edge detection limits:** a weak edge chain longer than about 500 pixels is

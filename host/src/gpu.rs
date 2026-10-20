@@ -7,11 +7,13 @@
 //! `libvulkan` is loaded at run time; without a Vulkan GPU `Gpu::new` fails.
 //!
 //! One compute pipeline per stage of `edges.wgsl`, all sharing one
-//! descriptor set of storage buffers. The work is recorded once into four
-//! command buffers (setup and the first hysteresis rounds; more hysteresis
-//! rounds; placement and read-back; just the conversion) and submitted for
-//! each frame. Must be created and used on one thread.
+//! descriptor set of storage buffers. The work is recorded once into two
+//! command buffers (the edge view; the gray view) and each frame is one
+//! submit and one fence wait. Hysteresis is connected-component labeling
+//! (union-find) in a fixed number of dispatches, so nothing is read back
+//! to the CPU in between. Must be created and used on one thread.
 
+use crate::ghost::{self, Drive, Kind};
 use ash::{Device, Entry, Instance, vk};
 use std::ffi::CStr;
 
@@ -19,7 +21,7 @@ use std::ffi::CStr;
 const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/edges.spv"));
 
 /// Entry points of the shader, in `Stage` order.
-const STAGES: [&CStr; 12] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"diff_tiles", c"pack_bits", c"convert", c"pack_gray4", c"diff_gray4"];
+const STAGES: [&CStr; 17] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"diff_tiles", c"pack_bits", c"convert", c"pack_gray4", c"diff_gray4", c"cc_init", c"cc_link", c"cc_flag", c"ghost_drive", c"ghost_err"];
 
 #[derive(Clone, Copy)]
 enum Stage {
@@ -35,21 +37,19 @@ enum Stage {
     Convert,
     PackGray4,
     DiffGray4,
+    CcInit,
+    CcLink,
+    CcFlag,
+    GhostDrive,
+    GhostErr,
 }
 
 /// Gray (0..=255) under which a pixel is drawn black, outline or not.
 pub const DARK: u32 = 100;
 
-/// Hysteresis rounds per submission, and submissions at most. A round
-/// extends edges by one pixel, so this covers weak edge chains of 512 pixels
-/// (a longer one just stays shorter than on the CPU).
-const ROUNDS_PER_BATCH: usize = 8;
-const MAX_BATCHES: usize = 64;
-
 /// Storage buffer bindings of `edges.wgsl`.
 const INPUT: usize = 0;
 const OUTLINE: usize = 5;
-const CHANGED: usize = 6;
 const BITS: usize = 7;
 const PARAMS: usize = 8;
 const TILES: usize = 9;
@@ -57,7 +57,17 @@ const PREV: usize = 10;
 const SRC: usize = 11;
 const GRAY4: usize = 12;
 const PREV4: usize = 13;
-const BUFFERS: usize = 14;
+// The ghosting model (ghost.rs): the estimate per pixel (a word each, like
+// the other per-pixel buffers), the picture an update sent, the tiles it
+// covered, and the error per tile and per 8x8 cell. Without the model they
+// are four bytes each.
+#[allow(dead_code)] // only the shader reads it
+const EST: usize = 14;
+const SENT: usize = 15;
+const GMASK: usize = 16;
+const GERR: usize = 17;
+const GCELL: usize = 18;
+const BUFFERS: usize = 19;
 
 struct Buf {
     buffer: vk::Buffer,
@@ -75,6 +85,8 @@ pub struct Convert {
     pub logical: (usize, usize),
     /// Degrees from the logical screen to the panel: 0, 90, 180 or 270.
     pub rotation: u16,
+    /// The capture's bytes are R, G, B, x (not B, G, R, x).
+    pub swap_rb: bool,
 }
 
 pub struct Gpu {
@@ -89,8 +101,16 @@ pub struct Gpu {
     module: vk::ShaderModule,
     pipelines: Vec<vk::Pipeline>,
     buffers: Vec<Buf>,
-    /// Setup, more hysteresis, placement, conversion only.
-    cmds: [vk::CommandBuffer; 4],
+    /// The edge view, the gray view; with the ghosting model also the
+    /// drive of an update that was sent, and the error against the newest frame.
+    cmds: Vec<vk::CommandBuffer>,
+    /// The ghosting model's parameters (None: no model).
+    ghost: Option<ghost::Params>,
+    /// The kind of the newest frame (what the error is measured against).
+    desired: Option<Kind>,
+    /// Cells of 8x8 pixels in the error map.
+    #[allow(dead_code)]
+    cells: usize,
     fence: vk::Fence,
     size: (usize, usize),
     /// Tiles in the grid of `tiles.rs`.
@@ -113,6 +133,8 @@ pub struct Gray4 {
     pub bytes: Vec<u8>,
     /// The tiles of the grid that differ from the previous frame (None for the first).
     pub dirty: Option<Vec<bool>>,
+    /// The ghosting model's error per tile against this frame (None without the model).
+    pub ghost: Option<Vec<u32>>,
 }
 
 /// One frame's result (the edge view).
@@ -122,6 +144,7 @@ pub struct Outline {
     pub bits: Vec<u8>,
     /// The tiles of the grid that differ from the previous frame (None for the first).
     pub dirty: Option<Vec<bool>>,
+    pub ghost: Option<Vec<u32>>,
 }
 
 fn ve<T>(what: &str, r: Result<T, vk::Result>) -> Result<T, String> {
@@ -137,6 +160,19 @@ impl Gpu {
     /// raw captures as `convert` says. Pixels darker than `dark` come out
     /// black in the edge view (0: none do).
     pub fn new(w: usize, h: usize, dark: u32, convert: Convert) -> Result<Gpu, String> {
+        Self::build(w, h, dark, convert, None)
+    }
+
+    /// As `new`, with the ghosting model (ghost.rs) on: the panel is assumed
+    /// white to begin with.
+    pub fn with_ghost(w: usize, h: usize, dark: u32, convert: Convert, params: ghost::Params) -> Result<Gpu, String> {
+        let mut gpu = Self::build(w, h, dark, convert, Some(params))?;
+        let all = vec![true; gpu.tiles];
+        gpu.ghost_drive(None, Kind::Gray4, Drive::Reset, &all)?;
+        Ok(gpu)
+    }
+
+    fn build(w: usize, h: usize, dark: u32, convert: Convert, ghost: Option<ghost::Params>) -> Result<Gpu, String> {
         let spirv = ash::util::read_spv(&mut std::io::Cursor::new(SPIRV)).map_err(|e| format!("shader: {e}"))?;
         let entry = unsafe { Entry::load() }.map_err(|e| format!("no Vulkan loader: {e}"))?;
         let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 0, 0));
@@ -158,6 +194,9 @@ impl Gpu {
         let words = (px * 4).max(4);
         let bits_bytes = ((w.div_ceil(8) * h) as u64).div_ceil(4).max(1) * 4;
         let gray4_bytes = ((w.div_ceil(2) * h) as u64).div_ceil(4).max(1) * 4;
+        let cells = w.div_ceil(ghost::CELL) * h.div_ceil(ghost::CELL);
+        let on = ghost.is_some();
+        let small = |bytes: u64| if on { bytes.max(4) } else { 4 };
         // (size, host access) per binding.
         let layout = [
             (packed, true),
@@ -166,14 +205,19 @@ impl Gpu {
             (words, false),
             (words, false),
             (words, false),
-            (4, true),
+            (words, false),
             (bits_bytes, true),
-            (64, true),
+            (128, true),
             ((tiles as u64 * 4).max(4), true),
             (words, false),
             ((convert.src.0 * convert.src.1 * 4) as u64, true),
             (gray4_bytes, true),
             (gray4_bytes, false),
+            (small(words), false),
+            (small(gray4_bytes), true),
+            (small(tiles as u64 * 4), true),
+            (small(tiles as u64 * 4), true),
+            (small(cells as u64 * 4), true),
         ];
         let mut buffers = Vec::with_capacity(BUFFERS);
         for (size, host) in layout {
@@ -205,11 +249,11 @@ impl Gpu {
         let pipelines = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &pipeline_infos, None) }.map_err(|(_, e)| format!("vulkan pipelines: {e}"))?;
 
         let pool = ve("command pool", unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None) })?;
-        let cmds = ve("command buffers", unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(4)) })?;
+        let cmds = ve("command buffers", unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(if on { 4 } else { 2 })) })?;
         let fence = ve("fence", unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) })?;
 
-        let gpu = Gpu { _entry: entry, instance, device, queue, pool, set_layout, desc_pool, pipe_layout, module, pipelines, buffers, cmds: [cmds[0], cmds[1], cmds[2], cmds[3]], fence, size: (w, h), tiles, words, have_prev: false, have_prev4: false, gray4_bytes, dark, convert, name };
-        gpu.write_params([0.0, 1.0, 0.0, 1.0]);
+        let gpu = Gpu { _entry: entry, instance, device, queue, pool, set_layout, desc_pool, pipe_layout, module, pipelines, buffers, cmds, ghost, desired: None, cells, fence, size: (w, h), tiles, words, have_prev: false, have_prev4: false, gray4_bytes, dark, convert, name };
+        gpu.write_params([0.0, 1.0, 0.0, 1.0], 0, Kind::Gray4);
         gpu.record(set)?;
         Ok(gpu)
     }
@@ -217,7 +261,8 @@ impl Gpu {
     /// What the stages need to know about the frame, for the shader's `Params`.
     /// `shown` is where the capture sits in the tablet's logical frame
     /// (x0, x1, y0, y1 as fractions): the rest is letterbox, drawn white.
-    fn write_params(&self, shown: [f64; 4]) {
+    /// `mode` and `kind` are the ghosting model's pass and picture kind.
+    fn write_params(&self, shown: [f64; 4], mode: u32, kind: Kind) {
         let (w, h) = self.size;
         let c = self.convert;
         let (lw, lh) = c.logical;
@@ -229,7 +274,8 @@ impl Gpu {
             270 => 3,
             _ => 0,
         };
-        let words: [u32; 12] = [
+        let g = self.ghost.unwrap_or_default();
+        let words: [u32; 22] = [
             w as u32,
             h as u32,
             self.dark,
@@ -242,6 +288,16 @@ impl Gpu {
             at(shown[2], lh),
             len(shown[0], shown[1], lw),
             len(shown[2], shown[3], lh),
+            mode,
+            kind as u32,
+            g.k_paint,
+            g.k_erase,
+            g.k_paint_edge,
+            g.k_erase_edge,
+            g.k_settle,
+            g.threshold,
+            g.dead_band,
+            c.swap_rb as u32,
         ];
         unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), self.buffers[PARAMS].ptr as *mut u32, words.len()) };
     }
@@ -308,18 +364,14 @@ impl Gpu {
             let b = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             d.cmd_pipeline_barrier(cb, shader | transfer, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[b], &[], &[]);
         };
+        let clear_err = |cb: vk::CommandBuffer| unsafe {
+            d.cmd_fill_buffer(cb, self.buffers[GERR].buffer, 0, vk::WHOLE_SIZE, 0);
+            d.cmd_fill_buffer(cb, self.buffers[GCELL].buffer, 0, vk::WHOLE_SIZE, 0);
+        };
         let run = |cb: vk::CommandBuffer, stage: Stage| unsafe {
             d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.pipelines[stage as usize]);
             d.cmd_dispatch(cb, groups.0, groups.1, 1);
             sync(cb);
-        };
-        // Rounds of hysteresis, each reporting in `changed` only whether it changed something.
-        let rounds = |cb: vk::CommandBuffer| unsafe {
-            for _ in 0..ROUNDS_PER_BATCH {
-                d.cmd_fill_buffer(cb, self.buffers[CHANGED].buffer, 0, vk::WHOLE_SIZE, 0);
-                sync(cb);
-                run(cb, Stage::Hyst);
-            }
         };
         for (i, &cb) in self.cmds.iter().enumerate() {
             unsafe {
@@ -328,15 +380,28 @@ impl Gpu {
                 match i {
                     0 => {
                         d.cmd_fill_buffer(cb, self.buffers[OUTLINE].buffer, 0, vk::WHOLE_SIZE, 0xffff_ffff);
+                        d.cmd_fill_buffer(cb, self.buffers[TILES].buffer, 0, vk::WHOLE_SIZE, 0);
+                        if self.ghost.is_some() {
+                            clear_err(cb);
+                        }
                         sync(cb);
-                        for stage in [Stage::Convert, Stage::BlurH, Stage::BlurV, Stage::Sobel, Stage::Nms] {
+                        for stage in [Stage::Convert, Stage::BlurH, Stage::BlurV, Stage::Sobel, Stage::Nms, Stage::CcInit, Stage::CcLink, Stage::CcFlag, Stage::Hyst, Stage::Place, Stage::Dark, Stage::Diff] {
                             run(cb, stage);
                         }
-                        rounds(cb);
+                        // This frame is the next one's reference.
+                        let copy = [vk::BufferCopy::default().size(self.words)];
+                        d.cmd_copy_buffer(cb, self.buffers[OUTLINE].buffer, self.buffers[PREV].buffer, &copy);
+                        sync(cb);
+                        run(cb, Stage::PackBits);
+                        if self.ghost.is_some() {
+                            run(cb, Stage::GhostErr);
+                        }
                     }
-                    1 => rounds(cb),
-                    3 => {
+                    1 => {
                         d.cmd_fill_buffer(cb, self.buffers[TILES].buffer, 0, vk::WHOLE_SIZE, 0);
+                        if self.ghost.is_some() {
+                            clear_err(cb);
+                        }
                         sync(cb);
                         run(cb, Stage::Convert);
                         run(cb, Stage::PackGray4);
@@ -345,18 +410,17 @@ impl Gpu {
                         let copy = [vk::BufferCopy::default().size(self.gray4_bytes)];
                         d.cmd_copy_buffer(cb, self.buffers[GRAY4].buffer, self.buffers[PREV4].buffer, &copy);
                         sync(cb);
+                        if self.ghost.is_some() {
+                            run(cb, Stage::GhostErr);
+                        }
                     }
+                    // An update that was sent, applied to the estimate.
+                    2 => run(cb, Stage::GhostDrive),
+                    // The error of the estimate against the newest frame, between frames.
                     _ => {
-                        d.cmd_fill_buffer(cb, self.buffers[TILES].buffer, 0, vk::WHOLE_SIZE, 0);
+                        clear_err(cb);
                         sync(cb);
-                        run(cb, Stage::Place);
-                        run(cb, Stage::Dark);
-                        run(cb, Stage::Diff);
-                        // This frame is the next one's reference.
-                        let copy = [vk::BufferCopy::default().size(self.words)];
-                        d.cmd_copy_buffer(cb, self.buffers[OUTLINE].buffer, self.buffers[PREV].buffer, &copy);
-                        sync(cb);
-                        run(cb, Stage::PackBits);
+                        run(cb, Stage::GhostErr);
                     }
                 }
                 to_host(cb);
@@ -380,7 +444,7 @@ impl Gpu {
     /// the panel frame packed to bits (set = white), and the tiles that
     /// changed since the previous call.
     pub fn outline_bgrx(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<Outline, String> {
-        self.upload(raw, shown)?;
+        self.upload(raw, shown, Kind::Bits)?;
         self.frame()
     }
 
@@ -388,42 +452,98 @@ impl Gpu {
     /// (packed as `gray4` does), and the tiles that changed since the
     /// previous call.
     pub fn gray_bgrx(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<Gray4, String> {
-        self.upload(raw, shown)?;
-        self.submit(3)?;
+        self.upload(raw, shown, Kind::Gray4)?;
+        self.submit(1)?;
         let mut bytes = vec![0u8; self.size.0.div_ceil(2) * self.size.1];
         unsafe { std::ptr::copy_nonoverlapping(self.buffers[GRAY4].ptr, bytes.as_mut_ptr(), bytes.len()) };
         let flags = unsafe { std::slice::from_raw_parts(self.buffers[TILES].ptr as *const u32, self.tiles) };
         let dirty = self.have_prev4.then(|| flags.iter().map(|&f| f != 0).collect());
         self.have_prev4 = true;
-        Ok(Gray4 { bytes, dirty })
+        Ok(Gray4 { bytes, dirty, ghost: self.read_ghost() })
     }
 
-    fn upload(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<(), String> {
+    /// The one copy of a frame on its way to the GPU: from `raw` (rows of
+    /// `raw.len() / height` bytes, at least a row of pixels each) into the
+    /// source buffer, which is the host-visible memory the shader reads.
+    fn upload(&mut self, raw: &[u8], shown: [f64; 4], kind: Kind) -> Result<(), String> {
         let c = self.convert;
-        if raw.len() != c.src.0 * c.src.1 * 4 {
+        let (w, h) = c.src;
+        let row = w * 4;
+        if raw.len() < row * h || raw.len() % h != 0 {
             return Err("capture size changed".into());
         }
-        self.write_params(shown);
-        unsafe { std::ptr::copy_nonoverlapping(raw.as_ptr(), self.buffers[SRC].ptr, raw.len()) };
+        let stride = raw.len() / h;
+        self.write_params(shown, 0, kind);
+        self.desired = Some(kind);
+        let dst = self.buffers[SRC].ptr;
+        unsafe {
+            if stride == row {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), dst, row * h);
+            } else {
+                for y in 0..h {
+                    std::ptr::copy_nonoverlapping(raw.as_ptr().add(y * stride), dst.add(y * row), row);
+                }
+            }
+        }
         Ok(())
     }
 
     /// Runs the stages on the capture in the source buffer.
     fn frame(&mut self) -> Result<Outline, String> {
         self.submit(0)?;
-        let changed = || unsafe { (self.buffers[CHANGED].ptr as *const u32).read_volatile() };
-        let mut batches = 1;
-        while changed() != 0 && batches < MAX_BATCHES {
-            self.submit(1)?;
-            batches += 1;
-        }
-        self.submit(2)?;
         let mut bits = vec![0u8; self.size.0.div_ceil(8) * self.size.1];
         unsafe { std::ptr::copy_nonoverlapping(self.buffers[BITS].ptr, bits.as_mut_ptr(), bits.len()) };
         let flags = unsafe { std::slice::from_raw_parts(self.buffers[TILES].ptr as *const u32, self.tiles) };
         let dirty = self.have_prev.then(|| flags.iter().map(|&f| f != 0).collect());
         self.have_prev = true;
-        Ok(Outline { bits, dirty })
+        Ok(Outline { bits, dirty, ghost: self.read_ghost() })
+    }
+
+    /// The model's error per tile after the last pass that made it.
+    fn read_ghost(&self) -> Option<Vec<u32>> {
+        self.ghost?;
+        Some(unsafe { std::slice::from_raw_parts(self.buffers[GERR].ptr as *const u32, self.tiles) }.to_vec())
+    }
+
+    /// The model's error per 8x8 cell (`ghost::CELL`), row by row, after the
+    /// last pass that made it: the map a step that boxes ghosts starts from.
+    /// It stays in `GCELL` on the GPU for such a step to read.
+    #[allow(dead_code)] // for the step that boxes ghosts
+    pub fn ghost_cells(&self) -> Option<Vec<u32>> {
+        self.ghost?;
+        Some(unsafe { std::slice::from_raw_parts(self.buffers[GCELL].ptr as *const u32, self.cells) }.to_vec())
+    }
+
+    /// An update that was sent: its pixels in the marked tiles are driven as
+    /// `mode` says. `picture` is what was sent (packed as `kind`), or None
+    /// for the one given last (and for `Reset`).
+    pub fn ghost_drive(&mut self, picture: Option<&[u8]>, kind: Kind, mode: Drive, marked: &[bool]) -> Result<(), String> {
+        if self.ghost.is_none() {
+            return Err("no ghosting model".into());
+        }
+        if let Some(p) = picture {
+            let want = match kind {
+                Kind::Gray4 => self.size.0.div_ceil(2) * self.size.1,
+                Kind::Bits => self.size.0.div_ceil(8) * self.size.1,
+            };
+            if p.len() != want {
+                return Err("the picture sent has the wrong size".into());
+            }
+            unsafe { std::ptr::copy_nonoverlapping(p.as_ptr(), self.buffers[SENT].ptr, p.len()) };
+        }
+        let mask = unsafe { std::slice::from_raw_parts_mut(self.buffers[GMASK].ptr as *mut u32, self.tiles) };
+        mask.iter_mut().zip(marked).for_each(|(m, &b)| *m = b as u32);
+        self.write_params([0.0, 1.0, 0.0, 1.0], mode as u32, kind);
+        self.submit(2)
+    }
+
+    /// The error against the newest frame again, after drives and no new
+    /// frame (None until one has been rendered).
+    pub fn ghost_tick(&mut self) -> Result<Option<Vec<u32>>, String> {
+        let Some(kind) = self.desired.filter(|_| self.ghost.is_some()) else { return Ok(None) };
+        self.write_params([0.0, 1.0, 0.0, 1.0], 0, kind);
+        self.submit(3)?;
+        Ok(self.read_ghost())
     }
 }
 
@@ -453,13 +573,14 @@ impl Drop for Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ghost::{Drive, Kind};
 
     const FULL: [f64; 4] = [0.0, 1.0, 0.0, 1.0];
 
     /// A GPU taking frames as they are (no scaling, no rotation), or None
     /// where there is no GPU (a CI runner, say): the tests then skip.
     fn gpu(w: usize, h: usize) -> Option<Gpu> {
-        match Gpu::new(w, h, DARK, Convert { src: (w, h), logical: (w, h), rotation: 0 }) {
+        match Gpu::new(w, h, DARK, Convert { src: (w, h), logical: (w, h), rotation: 0, swap_rb: false }) {
             Ok(g) => Some(g),
             Err(e) => {
                 eprintln!("skipped, no GPU: {e}");
@@ -651,7 +772,7 @@ mod tests {
         // below), rotated a quarter turn onto a 180x240 panel.
         let (src_size, logical, panel) = ((320usize, 180usize), (240usize, 180usize), (180usize, 240usize));
         let shown = [0.0, 1.0, 0.125, 0.875];
-        let mut gpu = match Gpu::new(panel.0, panel.1, 0, Convert { src: src_size, logical, rotation: 90 }) {
+        let mut gpu = match Gpu::new(panel.0, panel.1, 0, Convert { src: src_size, logical, rotation: 90, swap_rb: false }) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("skipped, no GPU: {e}");
@@ -675,5 +796,181 @@ mod tests {
         assert!(worst <= 1, "differs by {worst} levels somewhere on {}", gpu.name());
         // The bars are white: the panel's first and last columns are the logical frame's top and bottom rows.
         assert!(got.chunks(panel.0).all(|row| row[0] == 15 && row[panel.0 - 1] == 15));
+    }
+
+    /// A pseudo-random image of blocks, as 8-bit grays that are exactly a
+    /// 4-bit level each (17 a level), and the levels.
+    fn blocks(w: usize, h: usize, seed: u32) -> (Vec<u8>, Vec<u8>) {
+        let mut s = seed;
+        let mut rand = move || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            s >> 8
+        };
+        let mut levels = vec![15u8; w * h];
+        for _ in 0..40 {
+            let (bw, bh, x0, y0, v) = (1 + rand() as usize % 20, 1 + rand() as usize % 20, rand() as usize % (w - 1), rand() as usize % (h - 1), (rand() % 16) as u8);
+            for y in y0..(y0 + bh).min(h) {
+                for x in x0..(x0 + bw).min(w) {
+                    levels[y * w + x] = v;
+                }
+            }
+        }
+        (levels.iter().map(|&l| l * 17).collect(), levels)
+    }
+
+    /// The model on the GPU against the one on the CPU: the same drives, the
+    /// same errors per tile and per cell, to the unit.
+    #[test]
+    fn the_ghost_model_matches_the_cpu_reference_in_the_gray_view() {
+        let (w, h) = (70, 45);
+        let convert = Convert { src: (w, h), logical: (w, h), rotation: 0, swap_rb: false };
+        let Ok(mut gpu) = Gpu::with_ghost(w, h, DARK, convert, ghost::Params::default()) else {
+            eprintln!("skipped, no GPU");
+            return;
+        };
+        let grid = crate::tiles::Grid::new(w, h);
+        let (cols, rows) = (w.div_ceil(crate::tiles::TILE), h.div_ceil(crate::tiles::TILE));
+        let mut cpu = ghost::Model::new(w, h, ghost::Params::default(), Kind::Gray4);
+        let mask = |m: usize| -> Vec<bool> { (0..grid.tiles()).map(|t| t % m != 1).collect() };
+        let (a_gray, a) = blocks(w, h, 3);
+        let (b_gray, b) = blocks(w, h, 4);
+        let ga = gpu.gray_bgrx(&bgrx(&a_gray), FULL).expect("frame a");
+        assert_eq!(nibbles(&ga.bytes, w, h), a);
+        assert_eq!(ga.ghost.expect("errors"), cpu.errors(&a, cols, rows), "against the assumed white panel");
+        // A was sent everywhere, fast; B is then rendered and measured against what the panel got.
+        let all = vec![true; grid.tiles()];
+        gpu.ghost_drive(Some(&ga.bytes), Kind::Gray4, Drive::Fast, &all).unwrap();
+        cpu.drive(&a, Drive::Fast, &all, cols);
+        let gb = gpu.gray_bgrx(&bgrx(&b_gray), FULL).expect("frame b");
+        assert_eq!(gb.ghost.expect("errors"), cpu.errors(&b, cols, rows));
+        // B goes out in some tiles fast, then a settle in others; measured between frames.
+        gpu.ghost_drive(Some(&gb.bytes), Kind::Gray4, Drive::Fast, &mask(2)).unwrap();
+        cpu.drive(&b, Drive::Fast, &mask(2), cols);
+        gpu.ghost_drive(None, Kind::Gray4, Drive::Settle, &mask(3)).unwrap();
+        cpu.drive(&b, Drive::Settle, &mask(3), cols);
+        assert_eq!(gpu.ghost_tick().unwrap().expect("errors"), cpu.errors(&b, cols, rows));
+        assert_eq!(gpu.ghost_cells().expect("cells"), cpu.cell_errors(&b));
+        // A reset forgets it all.
+        gpu.ghost_drive(None, Kind::Gray4, Drive::Reset, &all).unwrap();
+        cpu.drive(&b, Drive::Reset, &all, cols);
+        assert_eq!(gpu.ghost_tick().unwrap().expect("errors"), cpu.errors(&b, cols, rows));
+    }
+
+    /// The same in the edge view, whose frames are bits: a bar moved leaves
+    /// a trail in the estimate, and a redrive takes it down.
+    #[test]
+    fn the_ghost_model_matches_the_cpu_reference_in_the_edge_view() {
+        let (w, h) = (70, 45);
+        let convert = Convert { src: (w, h), logical: (w, h), rotation: 0, swap_rb: false };
+        let Ok(mut gpu) = Gpu::with_ghost(w, h, DARK, convert, ghost::Params::default()) else {
+            eprintln!("skipped, no GPU");
+            return;
+        };
+        let grid = crate::tiles::Grid::new(w, h);
+        let (cols, rows) = (w.div_ceil(crate::tiles::TILE), h.div_ceil(crate::tiles::TILE));
+        let mut cpu = ghost::Model::new(w, h, ghost::Params::default(), Kind::Bits);
+        let all = vec![true; grid.tiles()];
+        // A dark bar, moved a column at a time: its outline moves with it.
+        let bar = |x0: usize| -> Vec<u8> { (0..w * h).map(|i| if (x0..x0 + 20).contains(&(i % w)) && (10..30).contains(&(i / w)) { 20 } else { 255 }).collect() };
+        let levels = |o: &Outline| -> Vec<u8> { unpack(&o.bits, w, h).iter().map(|&v| if v == 255 { 15 } else { 0 }).collect() };
+        let mut last = vec![];
+        for x0 in [10, 11, 12] {
+            let o = gpu.outline_bgrx(&bgrx(&bar(x0)), FULL).expect("frame");
+            let l = levels(&o);
+            assert_eq!(o.ghost.expect("errors"), cpu.errors(&l, cols, rows));
+            gpu.ghost_drive(Some(&o.bits), Kind::Bits, Drive::Fast, &all).unwrap();
+            cpu.drive(&l, Drive::Fast, &all, cols);
+            last = l;
+        }
+        let errs = gpu.ghost_tick().unwrap().expect("errors");
+        assert_eq!(errs, cpu.errors(&last, cols, rows));
+        assert!(errs.iter().any(|&e| e > 0), "a moved outline leaves residue");
+        assert_eq!(gpu.ghost_cells().expect("cells"), cpu.cell_errors(&last));
+        gpu.ghost_drive(None, Kind::Bits, Drive::Redrive, &all).unwrap();
+        cpu.drive(&last, Drive::Redrive, &all, cols);
+        let after = gpu.ghost_tick().unwrap().expect("errors");
+        assert_eq!(after, cpu.errors(&last, cols, rows));
+        assert!(after.iter().sum::<u32>() < errs.iter().sum::<u32>());
+    }
+
+    /// Text-like busy frame with long edges that fade from strong to weak.
+    fn busy(w: usize, h: usize) -> Vec<u8> {
+        let mut seed = 11u32;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed >> 8
+        };
+        let mut img = vec![245u8; w * h];
+        // Glyph-like strokes: short bars and boxes.
+        for _ in 0..(w * h / 400) {
+            let (bw, bh, x0, y0, v) = (1 + rand() as usize % 9, 1 + rand() as usize % 9, rand() as usize % (w - 10), rand() as usize % (h - 10), (rand() % 140) as u8);
+            for y in y0..y0 + bh {
+                for x in x0..x0 + bw {
+                    img[y * w + x] = v;
+                }
+            }
+        }
+        // Long rules whose contrast fades along their length.
+        for k in 0..40 {
+            let y0 = 20 + k * (h - 40) / 40;
+            for x in 0..w {
+                let c = 110 - (x * 80 / w) as i32;
+                img[y0 * w + x] = (245 - c) as u8;
+                img[(y0 + 1) * w + x] = (245 - c) as u8;
+            }
+        }
+        for k in 0..30 {
+            let x0 = 20 + k * (w - 40) / 30;
+            for y in 0..h {
+                let c = 30 + (y * 80 / h) as i32;
+                img[y * w + x0] = (245 - c) as u8;
+            }
+        }
+        img
+    }
+
+    /// Time of `outline_bgrx` on a busy full-size frame (`cargo test --release -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn times_the_edge_view_on_a_busy_frame() {
+        let (w, h) = (1872, 1404);
+        let Some(mut gpu) = gpu(w, h) else { return };
+        let raw = bgrx(&busy(w, h));
+        let first = gpu.outline_bgrx(&raw, FULL).expect("frame");
+        let n = 30;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            gpu.outline_bgrx(&raw, FULL).expect("frame");
+        }
+        let per = t.elapsed() / n;
+        let black = first.bits.iter().map(|b| 8 - b.count_ones() as usize).sum::<usize>();
+        let sum = first.bits.iter().fold(0u64, |a, &b| a.wrapping_mul(131).wrapping_add(b as u64));
+        eprintln!("outline_bgrx: {per:?} per frame on {}, {black} black bits, checksum {sum}", gpu.name());
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            gpu.gray_bgrx(&raw, FULL).expect("frame");
+        }
+        eprintln!("gray_bgrx: {:?} per frame", t.elapsed() / n);
+    }
+
+    /// A capture whose rows are padded and whose bytes come R first gives
+    /// the frame of the same picture in tight BGRx.
+    #[test]
+    fn takes_padded_rows_and_rgb_order() {
+        let (w, h) = (40usize, 24usize);
+        let pixel = |x: usize, y: usize| [(x * 6) as u8, (y * 10) as u8, ((x * y) % 256) as u8];
+        let tight: Vec<u8> = (0..w * h).flat_map(|i| { let [r, g, b] = pixel(i % w, i / w); [b, g, r, 0] }).collect();
+        let pad = 16;
+        let mut padded = vec![0xAAu8; (w * 4 + pad) * h];
+        for y in 0..h {
+            for x in 0..w {
+                let [r, g, b] = pixel(x, y);
+                padded[y * (w * 4 + pad) + x * 4..][..4].copy_from_slice(&[r, g, b, 0]);
+            }
+        }
+        let Some(mut plain) = gpu(w, h) else { return };
+        let Ok(mut other) = Gpu::new(w, h, DARK, Convert { src: (w, h), logical: (w, h), rotation: 0, swap_rb: true }) else { return };
+        let want = plain.gray_bgrx(&tight, FULL).expect("gpu frame").bytes;
+        assert_eq!(other.gray_bgrx(&padded, FULL).expect("gpu frame").bytes, want);
     }
 }
