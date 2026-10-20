@@ -131,7 +131,8 @@ impl Capture {
         // at most, as frames keep coming while the screen changes).
         for _ in 0..4 {
             let mut more = libc::pollfd { fd: self.out.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-            if unsafe { libc::poll(&mut more, 1, 0) } <= 0 {
+            // A few ms, not 0: GStreamer may not have handed its next frame to the pipe yet.
+            if unsafe { libc::poll(&mut more, 1, 3) } <= 0 {
                 break;
             }
             self.out.read_exact(buf)?;

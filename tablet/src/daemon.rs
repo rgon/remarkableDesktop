@@ -512,12 +512,6 @@ pub fn run(args: Args) -> Result<(), String> {
                     }
                     Incoming::Msg(_) => {}
                     Incoming::Decoded { id, flags, rect } => {
-                        // Ack first: the host prepares the next update while we refresh.
-                        // Only the last rectangle of an update is acked.
-                        if flags & remdesktop_proto::RECT_LAST != 0 {
-                            h.send(&Msg::Ack { id });
-                            h.flush();
-                        }
                         match rect {
                             // An update that was already on its way when the screen was switched off.
                             Ok(_) if state.display == DisplayMode::None => {
@@ -530,6 +524,14 @@ pub fn run(args: Args) -> Result<(), String> {
                                 ink.overwritten(&epd.fb, r);
                             }
                             Err(e) => log!("remdesktop: {e}"),
+                        }
+                        // Acked once the panel has been told, and only for the last
+                        // rectangle of an update: the host then sends what is newest
+                        // by then, instead of an update that would wait, already
+                        // stale, behind the refresh we just started.
+                        if flags & remdesktop_proto::RECT_LAST != 0 {
+                            h.send(&Msg::Ack { id });
+                            h.flush();
                         }
                     }
                     Incoming::Closed => host_gone = true,
