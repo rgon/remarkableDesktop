@@ -92,10 +92,13 @@ logs to the journal.
 
 - **Edge mode on the GPU:** the host runs edge detection through Vulkan
   (`libvulkan` is loaded at run time, nothing is linked) on the first
-  discrete or integrated GPU with a compute queue, and the dark-region fill
-  on the CPU. Without a Vulkan driver, or with `REMDESKTOP_NO_GPU` set, the
-  whole thing runs on the CPU. A weak edge chain longer than about 500 pixels
-  is cut short on the GPU.
+  discrete or integrated GPU with a compute queue. Without a Vulkan driver,
+  or with `REMDESKTOP_NO_GPU` set, it runs on the CPU. A weak edge chain
+  longer than about 500 pixels is cut short on the GPU.
+- **Dark areas in edge mode:** every pixel darker than gray 100 is drawn
+  black (a threshold, on the GPU, so no CPU load). Dark regions with lighter
+  pixels inside come out speckled; `REMDESKTOP_EDGE_FILL=region` fills
+  enclosed dark regions instead, on the CPU, which costs more per frame.
 
 ## Input
 - **Monitor targeting:** pen and touchscreen are mapped through GNOME's
