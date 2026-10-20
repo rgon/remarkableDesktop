@@ -79,6 +79,34 @@ pub const QUIET: Duration = Duration::from_millis(150);
 pub const TILES_PER_S: f64 = 500.0;
 pub const BURST_TILES: f64 = 300.0;
 
+// ---- Clearing stuck zones (stream.rs `Debt`, `plan_clear`). The model cannot
+// see these (a settle pulls its estimate to clean), so the streamer counts
+// fast drives per tile instead. All guesses: see docs/ANTIGHOST.md; the panel
+// has to say what is enough. ----
+
+/// Fast-drive debt (changes of the tile, an edge-view change counting
+/// double) at which a tile is a candidate for a flashing clear. A settle
+/// halves the debt, so this is about a second of scrolling or a few dozen
+/// strokes, not a typed line.
+pub const CLEAR_DEBT: u32 = 24;
+/// What one change of a tile adds to its debt in the edge view, whose thin
+/// 1-bit lines are painted and erased with incomplete pulses (the gray view
+/// adds 1).
+pub const CLEAR_EDGE_WEIGHT: u32 = 2;
+/// A candidate is cleared once it has not changed for this long: much longer
+/// than `QUIET`, so scrolling and typing are never flashed.
+pub const CLEAR_QUIET: Duration = Duration::from_millis(2000);
+/// At most one clear per this long (the user finds flashing intrusive).
+pub const CLEAR_MIN_INTERVAL: Duration = Duration::from_secs(15);
+/// Tiles of margin around the tiles chosen (a tile is 32 px: covers the halo).
+pub const CLEAR_MARGIN_TILES: usize = 1;
+/// A clear covers at most this share of the panel's tiles (worst debt first,
+/// the rest waits for the next one) ...
+pub const CLEAR_MAX_SHARE: f64 = 0.10;
+/// ... unless the zones with the margin cover more than this share, when one
+/// full-panel clear is sent instead of many rectangles.
+pub const CLEAR_FULL_SHARE: f64 = 1.0 / 3.0;
+
 /// What the shader needs, as `Params` words.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Params {
@@ -138,6 +166,9 @@ pub enum Drive {
     /// docs/GHOSTING.md): an erase drive whether or not their level changed.
     #[allow(dead_code)] // the edge view's targeted correction is not sent yet
     Redrive = 4,
+    /// The tablet flashed the rectangle black and white and redrew it in the
+    /// flashing full-quality mode: every pixel is as it should be, exactly.
+    Clear = 5,
 }
 
 #[cfg(test)]
@@ -182,6 +213,7 @@ impl Model {
                         continue;
                     }
                     Drive::Settle => self.est[i] = approach(self.est[i], tl * LEVEL, self.p.k_settle),
+                    Drive::Clear => self.est[i] = tl * LEVEL,
                     Drive::Fast => {
                         if to_white != (self.shown[i] >= self.p.threshold) {
                             self.est[i] = if to_white { approach(self.est[i], FULL, erase) } else { approach(self.est[i], 0, paint) };

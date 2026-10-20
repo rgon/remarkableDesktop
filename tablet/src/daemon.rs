@@ -69,8 +69,9 @@ fn clear_ink(ink: &mut Ink, epd: &Epd, display: &Display) {
 /// The CLR button: puts back what the ink covered, then runs the full
 /// de-ghosting cycle: the whole panel flashes black, then white, then the
 /// frame is redrawn, each step in the flashing full-quality mode. Black goes
-/// first: the engine may leave alone pixels whose value does not change, so a
-/// white flash over stuck areas that are stored as white could do nothing.
+/// first: the engine drives only pixels that change, so a white fill over a
+/// white area would do nothing. The host is told afterwards (see the caller)
+/// so it forgets what it knew about the panel.
 fn clear_screen(ink: &mut Ink, epd: &Epd) {
     ink.restore(&epd.fb);
     let (w, h) = (epd.width(), epd.height());
@@ -776,7 +777,9 @@ pub fn run(args: Args) -> Result<(), String> {
                         state.save();
                     } else {
                         clear_screen(&mut ink, &epd);
-                        // Updates that arrived meanwhile were drawn over by the redraw: have the host send the whole screen again.
+                        // The panel is clean and holds the frame: the host drops its ghosting
+                        // model and clear counters for it and sends the whole screen again
+                        // (updates that arrived meanwhile were drawn over by the redraw).
                         if let Some(h) = host.as_mut() {
                             h.send(&Msg::Display { mode: state.display });
                             h.flush();

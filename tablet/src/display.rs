@@ -3,8 +3,8 @@
 //! them, in the quality mode that clears the fast mode's ghosting. The host
 //! decides which and when; it knows what changed and what has been still.
 
-use crate::epd::{Epd, ImageInfo, Mode};
-use remdesktop_proto::{RECT_BITS1, RECT_SETTLE, bits1, gray4};
+use crate::epd::{Epd, FORMAT_GRAYSCALE8, FORMAT_RGB16, ImageInfo, Mode};
+use remdesktop_proto::{RECT_BITS1, RECT_CLEAR, RECT_SETTLE, bits1, gray4};
 use std::time::{Duration, Instant};
 
 /// Refresh modes for streamed content.
@@ -104,6 +104,84 @@ impl Decoder {
     }
 }
 
+/// What the clear sequence needs of the panel: the framebuffer and the
+/// refresh call. A trait so the order of the steps can be tested.
+trait Panel {
+    /// The pixels of `r`, as bytes of the framebuffer.
+    fn save(&mut self, r: Rect) -> Vec<u8>;
+    fn fill(&mut self, r: Rect, gray: u8);
+    fn restore(&mut self, r: Rect, saved: &[u8]);
+    /// Refreshes `r` and waits for the engine to take it.
+    fn swap(&mut self, r: Rect, mode: Mode);
+}
+
+/// Flashes a rectangle black, then white, then draws it again, each step in
+/// the flashing full-quality mode, which drives every pixel that differs
+/// from the step before: black first, because a white fill over white is
+/// not a drive. The rectangle already holds the frame (the host sent it with
+/// the clear), which is put back after the flashes. Nothing else writes the
+/// framebuffer meanwhile: the host sends no other update until this one is
+/// acked, so the saved pixels are still the newest ones at the end.
+fn clear_rect(p: &mut impl Panel, r: Rect) {
+    let saved = p.save(r);
+    for gray in [0, 255] {
+        p.fill(r, gray);
+        p.swap(r, Mode::Content);
+    }
+    p.restore(r, &saved);
+    p.swap(r, Mode::Content);
+}
+
+fn bytes_per_pixel(fb: &ImageInfo) -> usize {
+    match fb.format {
+        FORMAT_GRAYSCALE8 => 1,
+        FORMAT_RGB16 => 2,
+        _ => 4,
+    }
+}
+
+/// The real panel: the framebuffer and the engine's refresh.
+struct EpdPanel<'a>(&'a Epd);
+
+impl Panel for EpdPanel<'_> {
+    fn save(&mut self, r: Rect) -> Vec<u8> {
+        save_rect(&self.0.fb, r)
+    }
+
+    fn fill(&mut self, r: Rect, gray: u8) {
+        unsafe { self.0.fb.fill_gray(r.x, r.y, r.x + r.w, r.y + r.h, gray) };
+    }
+
+    fn restore(&mut self, r: Rect, saved: &[u8]) {
+        restore_rect(&self.0.fb, r, saved);
+    }
+
+    fn swap(&mut self, r: Rect, mode: Mode) {
+        self.0.swap(r.x, r.y, r.w, r.h, mode, 0);
+        self.0.process_events(0);
+    }
+}
+
+/// Copies the rows of `r` out of the framebuffer (`r` is inside it: the
+/// decoder checked).
+fn save_rect(fb: &ImageInfo, r: Rect) -> Vec<u8> {
+    let (bpp, row) = (bytes_per_pixel(fb), r.w as usize * bytes_per_pixel(fb));
+    let mut out = Vec::with_capacity(row * r.h as usize);
+    for y in r.y..r.y + r.h {
+        let line = unsafe { fb.pixels.add(y as usize * fb.stride as usize + r.x as usize * bpp) };
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(line, row) });
+    }
+    out
+}
+
+fn restore_rect(fb: &ImageInfo, r: Rect, saved: &[u8]) {
+    let (bpp, row) = (bytes_per_pixel(fb), r.w as usize * bytes_per_pixel(fb));
+    for (i, y) in (r.y..r.y + r.h).enumerate() {
+        let line = unsafe { fb.pixels.add(y as usize * fb.stride as usize + r.x as usize * bpp) };
+        unsafe { std::ptr::copy_nonoverlapping(saved[i * row..][..row].as_ptr(), line, row) };
+    }
+}
+
 /// Refreshes screen updates in the mode the host asked for. Runs on the
 /// input thread.
 pub struct Display {
@@ -135,12 +213,17 @@ impl Display {
         self.refresh.settle
     }
 
-    /// Refreshes freshly written pixels, in the quality mode if `flags` has `RECT_SETTLE`.
+    /// Refreshes freshly written pixels, in the quality mode if `flags` has
+    /// `RECT_SETTLE`; with `RECT_CLEAR` the rectangle is flashed clean first.
     pub fn show(&mut self, epd: &Epd, r: Rect, flags: u8) {
-        let mode = if flags & RECT_SETTLE != 0 { self.refresh.settle } else { self.refresh.fast };
         let started = Instant::now();
-        epd.swap(r.x, r.y, r.w, r.h, mode, 0);
-        epd.process_events(0);
+        if flags & RECT_CLEAR != 0 {
+            clear_rect(&mut EpdPanel(epd), r);
+        } else {
+            let mode = if flags & RECT_SETTLE != 0 { self.refresh.settle } else { self.refresh.fast };
+            epd.swap(r.x, r.y, r.w, r.h, mode, 0);
+            epd.process_events(0);
+        }
         self.frames += 1;
         // How long the engine keeps us in a refresh call (the panel's pace).
         let took = started.elapsed();
@@ -181,6 +264,61 @@ mod tests {
         let wrong = Rect { w: 4, ..r };
         assert!(d.write(&fb, wrong, 0, &lz4).is_err());
         assert!(d.write(&fb, r, 0, &[1, 2]).is_err());
+    }
+
+    /// Records what the clear sequence does.
+    struct Fake {
+        fb: Vec<u8>,
+        log: Vec<String>,
+    }
+
+    impl Panel for Fake {
+        fn save(&mut self, r: Rect) -> Vec<u8> {
+            self.log.push("save".into());
+            vec![self.fb[(r.y * 4 + r.x) as usize]]
+        }
+        fn fill(&mut self, r: Rect, gray: u8) {
+            self.log.push(format!("fill {gray}"));
+            self.fb[(r.y * 4 + r.x) as usize] = gray;
+        }
+        fn restore(&mut self, r: Rect, saved: &[u8]) {
+            self.log.push("restore".into());
+            self.fb[(r.y * 4 + r.x) as usize] = saved[0];
+        }
+        fn swap(&mut self, _: Rect, mode: Mode) {
+            self.log.push(format!("swap {mode:?} {}", self.fb[0]));
+        }
+    }
+
+    #[test]
+    fn a_clear_flashes_black_then_white_and_puts_the_frame_back() {
+        let mut p = Fake { fb: vec![77; 16], log: vec![] };
+        clear_rect(&mut p, Rect { x: 0, y: 0, w: 1, h: 1 });
+        assert_eq!(p.log, ["save", "fill 0", "swap Content 0", "fill 255", "swap Content 255", "restore", "swap Content 77"]);
+        assert_eq!(p.fb[0], 77);
+    }
+
+    #[test]
+    fn a_rect_is_saved_and_restored_with_its_stride() {
+        // 6 × 3 RGB32 pixels with a padded stride; a 2 × 2 window at (3, 1).
+        let (w, h, stride) = (6usize, 3usize, 6 * 4 + 8);
+        let mut mem: Vec<u8> = (0..stride * h).map(|i| i as u8).collect();
+        let fb = ImageInfo { pixels: mem.as_mut_ptr(), width: w as i32, height: h as i32, stride: stride as i32, format: crate::epd::FORMAT_RGB32 };
+        let r = Rect { x: 3, y: 1, w: 2, h: 2 };
+        let saved = save_rect(&fb, r);
+        assert_eq!(saved.len(), 2 * 2 * 4);
+        assert_eq!(saved[0], (stride + 12) as u8);
+        assert_eq!(saved[8], (2 * stride + 12) as u8);
+        unsafe { fb.fill_gray(3, 1, 5, 3, 0) };
+        assert_eq!(mem[stride + 12], 0);
+        let neighbour = mem[stride + 20];
+        restore_rect(&fb, r, &saved);
+        assert_eq!(mem[stride + 12], (stride + 12) as u8);
+        assert_eq!(mem[stride + 20], neighbour);
+        // 16-bit and 8-bit buffers are told apart.
+        let mut g = vec![0u8; 4];
+        let fb8 = ImageInfo { pixels: g.as_mut_ptr(), width: 4, height: 1, stride: 4, format: FORMAT_GRAYSCALE8 };
+        assert_eq!(save_rect(&fb8, Rect { x: 1, y: 0, w: 2, h: 1 }).len(), 2);
     }
 
     #[test]

@@ -619,8 +619,9 @@ fn ghost_drive(@builtin(global_invocation_id) g: vec3<u32>) {
         paint = prm.g_e_paint;
         erase = prm.g_e_erase;
     }
-    if (prm.g_mode == 2u) {
-        est = approach(est, tl * LV, prm.g_k_settle);
+    if (prm.g_mode == 2u || prm.g_mode == 5u) {
+        // 5 is a clear: a settle that lands exactly.
+        est = approach(est, tl * LV, select(prm.g_k_settle, 256u, prm.g_mode == 5u));
     } else if (prm.g_mode == 4u) {
         if (to_white && est + prm.g_deadband < 65535u) {
             buf_est[i] = approach(est, 65535u, erase) | (shown << 16u);

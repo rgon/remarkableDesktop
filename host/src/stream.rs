@@ -8,13 +8,15 @@
 //! side. Tiles that then stay still are sent again for the tablet's quality
 //! refresh, which clears the fast mode's ghosting; the host decides which
 //! tiles and when, as it knows what changed. A refresh like that never goes
-//! in front of a changed frame.
+//! in front of a changed frame. Tiles that were driven fast a lot (scrolling,
+//! thin lines), which a settle does not get clean, are flashed black and
+//! white by the tablet once they have been still for a while.
 
 use crate::capture::{Capture, Source};
 use crate::ghost::{self, Budget, Drive, Kind};
 use crate::gpu::{Convert, DARK, Frame, Gpu};
 use crate::tiles::{self, Grid};
-use remdesktop_proto::{DisplayMode, Msg, RECT_BITS1, RECT_LAST, RECT_SETTLE, bits1, gray4};
+use remdesktop_proto::{DisplayMode, Msg, RECT_BITS1, RECT_CLEAR, RECT_LAST, RECT_SETTLE, bits1, gray4};
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -46,6 +48,9 @@ struct Flight {
     id: u32,
     sent: Instant,
     settle: bool,
+    /// A clear, which keeps the tablet busy and takes the panel's rectangle:
+    /// no other update goes out until it is acked.
+    clear: bool,
     /// For the latency stats (None for a settle): when its frame was
     /// captured, how old the frame was when sent, and its size in bytes.
     report: Option<(Instant, Duration, usize)>,
@@ -91,6 +96,9 @@ struct Shared {
     ghost_err: Option<Vec<u32>>,
     /// Boxes around the cells with ghosting error, from the same pass.
     ghost_boxes: Option<Vec<tiles::Rect>>,
+    /// The tablet cleared its whole panel (the CLR button) and told us: the
+    /// sender forgets what it knew about the panel.
+    cleared: bool,
 }
 
 /// An update that went to the tablet, for the ghosting model: what it did
@@ -104,6 +112,9 @@ struct Sent {
 impl Shared {
     /// Whether another update may go out now.
     fn may_send(&self) -> bool {
+        if self.in_flight.iter().any(|f| f.clear) {
+            return false;
+        }
         match self.in_flight.len() {
             0 => true,
             n if n < MAX_IN_FLIGHT => self.last_ack <= PIPELINE_ACK_MAX || self.in_flight.iter().any(|f| f.settle),
@@ -308,6 +319,154 @@ impl Unsettled {
     }
 }
 
+/// The knobs of the clearing of stuck zones (`--no-clear` and friends).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClearCfg {
+    pub enabled: bool,
+    /// Debt at which a tile is a candidate.
+    pub debt: u32,
+    /// How long a candidate must not change.
+    pub quiet: Duration,
+    /// Least time between two clears.
+    pub interval: Duration,
+}
+
+impl Default for ClearCfg {
+    fn default() -> Self {
+        ClearCfg { enabled: true, debt: ghost::CLEAR_DEBT, quiet: ghost::CLEAR_QUIET, interval: ghost::CLEAR_MIN_INTERVAL }
+    }
+}
+
+/// Charge debt per tile, with no model: how many fast drives (sent frames
+/// that changed the tile, an edge-view one counting `CLEAR_EDGE_WEIGHT`)
+/// it has had since its last clear. The only change information the sender
+/// has is which tiles differ, per frame, so that is what is counted: a
+/// pixel count would take a per-pixel pass on the CPU, and the number of
+/// drives is what scrolling and stroke-by-stroke drawing pile up. The ghost
+/// model cannot find these zones, as a settle pulls its estimate to clean
+/// whatever the panel really holds. A settle halves the debt (it does
+/// something, no one knows how much); a clear zeroes it.
+struct Debt {
+    debt: Vec<u32>,
+    /// When each tile changed last.
+    last: Vec<Option<Instant>>,
+}
+
+impl Debt {
+    fn new(tiles: usize) -> Self {
+        Debt { debt: vec![0; tiles], last: vec![None; tiles] }
+    }
+
+    /// The marked tiles changed (and were sent) at `now`, `weight` each.
+    fn add(&mut self, changed: &[bool], weight: u32, now: Instant) {
+        for (t, _) in changed.iter().enumerate().filter(|(_, c)| **c) {
+            self.debt[t] = self.debt[t].saturating_add(weight);
+            self.last[t] = Some(now);
+        }
+    }
+
+    /// The marked tiles got their settle.
+    fn settled(&mut self, tiles: &[bool]) {
+        for (t, _) in tiles.iter().enumerate().filter(|(_, c)| **c) {
+            self.debt[t] /= 2;
+        }
+    }
+
+    /// The marked tiles were cleared.
+    fn cleared(&mut self, tiles: &[bool]) {
+        for (t, _) in tiles.iter().enumerate().filter(|(_, c)| **c) {
+            self.debt[t] = 0;
+            self.last[t] = None;
+        }
+    }
+
+    fn reset(&mut self) {
+        self.debt.fill(0);
+        self.last.fill(None);
+    }
+}
+
+/// What the sender does about clearing next.
+#[derive(Debug, PartialEq)]
+enum ClearPlan {
+    /// Flash these tiles now (margin and area limit included).
+    Send(Vec<bool>),
+    /// Nothing yet; look again then (None: when something changes).
+    Wait(Option<Instant>),
+}
+
+/// The tiles to clear for the candidates `cand`: they and a margin of
+/// `ghost::CLEAR_MARGIN_TILES`, merged into rectangles by the caller. Over
+/// `CLEAR_FULL_SHARE` of the panel the whole panel goes (one flash instead of
+/// many); over `CLEAR_MAX_SHARE` only the highest debts that fit. This is the
+/// part that depends on the 32×32 grid: boxes can replace it.
+fn clear_region(grid: &Grid, cand: &[bool], debt: &[u32]) -> Vec<bool> {
+    let tiles = grid.tiles();
+    let with_margin = grid.dilate(cand, ghost::CLEAR_MARGIN_TILES);
+    let count = |m: &[bool]| m.iter().filter(|&&t| t).count();
+    if count(&with_margin) as f64 > tiles as f64 * ghost::CLEAR_FULL_SHARE {
+        return vec![true; tiles];
+    }
+    // At least one tile with its margin, however small the panel.
+    let cap = ((tiles as f64 * ghost::CLEAR_MAX_SHARE) as usize).max((2 * ghost::CLEAR_MARGIN_TILES + 1).pow(2));
+    if count(&with_margin) <= cap {
+        return with_margin;
+    }
+    let mut order: Vec<usize> = (0..tiles).filter(|&t| cand[t]).collect();
+    order.sort_by(|&a, &b| debt[b].cmp(&debt[a]).then(a.cmp(&b)));
+    // The most tiles (worst first) whose margins fit: the area only grows with the count.
+    let region = |k: usize| {
+        let mut m = vec![false; tiles];
+        order[..k].iter().for_each(|&t| m[t] = true);
+        grid.dilate(&m, ghost::CLEAR_MARGIN_TILES)
+    };
+    let (mut lo, mut hi) = (1, order.len());
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if count(&region(mid)) <= cap { lo = mid } else { hi = mid - 1 }
+    }
+    region(lo)
+}
+
+/// Whether tiles are due a clear: those with debt at `cfg.debt` that are
+/// settled (a normal settle goes first) and have not changed for
+/// `cfg.quiet`, at most once per `cfg.interval` (`last_clear`, which this
+/// does not set: the caller does when it sends).
+fn plan_clear(debt: &Debt, u: &Unsettled, grid: &Grid, last_clear: Option<Instant>, now: Instant, cfg: &ClearCfg) -> ClearPlan {
+    if !cfg.enabled {
+        return ClearPlan::Wait(None);
+    }
+    let mut cand = vec![false; debt.debt.len()];
+    let mut wake: Option<Instant> = None;
+    for t in 0..cand.len() {
+        if debt.debt[t] < cfg.debt || u.first[t].is_some() {
+            continue;
+        }
+        let Some(last) = debt.last[t] else { continue };
+        let ready = last + cfg.quiet;
+        if now < ready {
+            wake = Some(wake.map_or(ready, |w| w.min(ready)));
+            continue;
+        }
+        cand[t] = true;
+    }
+    if !cand.iter().any(|&c| c) {
+        return ClearPlan::Wait(wake);
+    }
+    if let Some(next) = last_clear.map(|l| l + cfg.interval).filter(|&n| now < n) {
+        return ClearPlan::Wait(Some(wake.map_or(next, |w| w.min(next))));
+    }
+    ClearPlan::Send(clear_region(grid, &cand, &debt.debt))
+}
+
+/// The earlier of two optional instants.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// What the sender does about quality refreshes next.
 #[derive(Debug, PartialEq)]
 enum Plan {
@@ -371,7 +530,7 @@ fn plan_ghost(u: &mut Unsettled, budget: &mut Budget, err: &[u32], strong: u32, 
 /// another update, and sends the tiles that changed since the frame the
 /// tablet got last; when nothing newer is waiting, it sends the quality
 /// refresh of tiles that have been still for `settle_after`.
-fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotation: u16, settle_after: Duration, ghost: bool, mut send: Send) {
+fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotation: u16, settle_after: Duration, ghost: bool, clear: ClearCfg, mut send: Send) {
     let (lock, cv) = &*shared;
     let (pw, ph) = if rotation % 180 == 90 { (logical.1, logical.0) } else { logical };
     let (w, h) = (pw as usize, ph as usize);
@@ -380,6 +539,9 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
     let mut last: Option<(u64, Picture, u64)> = None;
     let mut unsettled = Unsettled::new(grid.tiles());
     let mut budget = Budget::new(Instant::now());
+    // Charge debt per tile, and when the last clear went out.
+    let mut debt = Debt::new(grid.tiles());
+    let mut last_clear: Option<Instant> = None;
     // Tells the ghosting model what an update did, once it has been sent.
     // Updates that belong together (a reset and the frame after it) go in at once.
     let push = |sent: Vec<Sent>| {
@@ -420,7 +582,7 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
         {
             let mut s = lock.lock().unwrap();
             // Before the first byte goes out, so a quick ack cannot beat it.
-            s.in_flight.push_back(Flight { id, sent: Instant::now(), settle: flags & RECT_SETTLE != 0, report: captured.map(|c| (c, c.elapsed(), bytes)) });
+            s.in_flight.push_back(Flight { id, sent: Instant::now(), settle: flags & RECT_SETTLE != 0, clear: flags & RECT_CLEAR != 0, report: captured.map(|c| (c, c.elapsed(), bytes)) });
             if let (Some(st), Some(_)) = (&mut s.stats, captured) {
                 st.pixels += pixels;
             }
@@ -431,12 +593,18 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
         enum Work {
             Frame(Published),
             Settle(Vec<bool>),
+            Clear(Vec<bool>),
+            /// The tablet cleared its panel: forget what we knew of it.
+            Forget,
         }
         let work = {
             let mut s = lock.lock().unwrap();
             loop {
                 if s.stop {
                     return;
+                }
+                if std::mem::take(&mut s.cleared) {
+                    break Work::Forget;
                 }
                 // A refresh that is overdue goes first, or a constantly
                 // changing screen (scrolling) would never get one.
@@ -452,6 +620,7 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
                         // Nothing is sent; whatever comes after starts from a whole frame.
                         last = None;
                         unsettled.clear();
+                        debt.reset();
                         continue;
                     }
                     let frame = s.frame.clone().unwrap();
@@ -477,10 +646,19 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
                     _ if ghost => Plan::Wait(unsettled.any().then(|| now + MODEL_WAIT)),
                     _ => plan_timer(&unsettled, now, settle_after),
                 };
-                match plan {
+                let wake = match plan {
                     Plan::Send(tiles) => break Work::Settle(tiles),
-                    Plan::Wait(Some(t)) => s = cv.wait_timeout(s, t.saturating_duration_since(now)).unwrap().0,
-                    Plan::Wait(None) => s = cv.wait(s).unwrap(),
+                    Plan::Wait(w) => w,
+                };
+                // Nothing to settle: tiles that a settle does not get clean are flashed.
+                let wake = match plan_clear(&debt, &unsettled, &grid, last_clear, now, &clear) {
+                    ClearPlan::Send(tiles) if last.is_some() && s.mode != DisplayMode::None => break Work::Clear(tiles),
+                    ClearPlan::Send(_) => wake,
+                    ClearPlan::Wait(w) => earliest(wake, w),
+                };
+                match wake {
+                    Some(t) => s = cv.wait_timeout(s, t.saturating_duration_since(now)).unwrap().0,
+                    None => s = cv.wait(s).unwrap(),
                 }
             }
         };
@@ -529,7 +707,10 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
                 // state before it is not known.
                 let mut told = vec![];
                 if fresh_start {
+                    debt.reset();
                     told.push(Sent { drive: Drive::Reset, picture: None, mask: vec![true; grid.cells()] });
+                } else {
+                    debt.add(&dirty, if frame.kind() == Kind::Bits { ghost::CLEAR_EDGE_WEIGHT } else { 1 }, Instant::now());
                 }
                 told.push(Sent { drive: Drive::Fast, picture: Some(frame.clone()), mask: grid.covered_cells(&rects) });
                 push(told);
@@ -555,8 +736,33 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
                 if !send_rects(&rects, frame, RECT_SETTLE, None) {
                     return;
                 }
+                let covered = grid.covered(&rects);
                 push(vec![Sent { drive: Drive::Settle, picture: Some(frame.clone()), mask: grid.covered_cells(&rects) }]);
                 unsettled.done(&due);
+                debt.settled(&covered);
+            }
+            Work::Clear(tiles) => {
+                let Some((_, frame, _)) = &last else { continue };
+                let whole = tiles.iter().all(|&t| t);
+                let rects = if whole { vec![(0, 0, w, h)] } else { grid.rects(&tiles) };
+                // The rectangles carry the frame's pixels, which the tablet puts back after the flashes.
+                if !send_rects(&rects, frame, RECT_CLEAR, None) {
+                    return;
+                }
+                let covered = grid.covered(&rects);
+                push(vec![Sent { drive: Drive::Clear, picture: Some(frame.clone()), mask: grid.covered_cells(&rects) }]);
+                // A clear does more than a settle: nothing is left to settle there.
+                unsettled.done(&covered);
+                debt.cleared(&covered);
+                last_clear = Some(Instant::now());
+            }
+            Work::Forget => {
+                unsettled.clear();
+                debt.reset();
+                if let Some((_, frame, _)) = &last {
+                    // The panel is clean and shows the frame we sent last.
+                    push(vec![Sent { drive: Drive::Clear, picture: Some(frame.clone()), mask: vec![true; grid.cells()] }]);
+                }
             }
         }
     }
@@ -572,7 +778,7 @@ pub type Send = Box<dyn FnMut(&Msg) -> std::io::Result<()> + std::marker::Send>;
 impl Streamer {
     /// `logical` is the tablet's screen as the user sees it; frames are
     /// produced in panel portrait for `rotation`.
-    pub fn start(logical: (u32, u32), rotation: u16, stats: bool, settle_after: Duration, ghost: bool, send: Send) -> Streamer {
+    pub fn start(logical: (u32, u32), rotation: u16, stats: bool, settle_after: Duration, ghost: bool, clear: ClearCfg, send: Send) -> Streamer {
         let stats = stats.then(DisplayStats::default);
         let shared = Arc::new((Mutex::new(Shared { stats, ..Default::default() }), Condvar::new()));
 
@@ -768,7 +974,7 @@ impl Streamer {
         });
 
         let send_shared = shared.clone();
-        let sender = std::thread::spawn(move || run_sender(send_shared, logical, rotation, settle_after, ghost, send));
+        let sender = std::thread::spawn(move || run_sender(send_shared, logical, rotation, settle_after, ghost, clear, send));
         Streamer { shared, threads: vec![capture, sender] }
     }
 
@@ -792,6 +998,9 @@ impl Streamer {
         // Asking again for the same mode sends the whole frame again (the
         // tablet's CLR button does, after it flashed the panel).
         s.look += 1;
+        // The tablet sends this after its CLR button too: either way what the
+        // sender knew about the panel's charge is moot.
+        s.cleared = true;
         s.in_flight.clear();
         cv.notify_all();
     }
@@ -842,6 +1051,10 @@ mod tests {
         }
 
         fn with_model(settle_after: Duration, ghost: bool) -> Rig {
+            Rig::with_clear(settle_after, ghost, ClearCfg { enabled: false, ..ClearCfg::default() })
+        }
+
+        fn with_clear(settle_after: Duration, ghost: bool, clear: ClearCfg) -> Rig {
             let shared = Arc::new((Mutex::new(Shared { mode: DisplayMode::Normal, ..Default::default() }), Condvar::new()));
             let (tx, sent) = mpsc::channel();
             let s = shared.clone();
@@ -849,7 +1062,7 @@ mod tests {
                 tx.send(m.clone()).unwrap();
                 Ok(())
             });
-            let thread = Some(std::thread::spawn(move || run_sender(s, (SIZE as u32, SIZE as u32), 0, settle_after, ghost, send)));
+            let thread = Some(std::thread::spawn(move || run_sender(s, (SIZE as u32, SIZE as u32), 0, settle_after, ghost, clear, send)));
             Rig { shared, sent, thread }
         }
 
@@ -1151,7 +1364,7 @@ mod tests {
     #[test]
     fn acks_match_updates_in_order_and_late_ones_are_ignored() {
         let mut s = Shared::default();
-        let flight = |id| Flight { id, sent: Instant::now(), settle: false, report: None };
+        let flight = |id| Flight { id, sent: Instant::now(), settle: false, clear: false, report: None };
         s.in_flight.extend([flight(3), flight(5)]);
         s.acked(4);
         assert_eq!(s.in_flight.len(), 2);
@@ -1159,5 +1372,202 @@ mod tests {
         assert_eq!(s.in_flight.iter().map(|f| f.id).collect::<Vec<_>>(), [5]);
         s.acked(5);
         assert!(s.in_flight.is_empty() && s.may_send());
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// The tiles at (x, y) of a 20 × 20 tile grid, marked.
+    fn marked(g: &Grid, at: &[(usize, usize)]) -> Vec<bool> {
+        let mut m = vec![false; g.tiles()];
+        at.iter().for_each(|&(x, y)| m[y * 20 + x] = true);
+        m
+    }
+
+    #[test]
+    fn debt_grows_with_changes_halves_on_a_settle_and_clears() {
+        let t0 = Instant::now();
+        let mut d = Debt::new(3);
+        d.add(&[true, true, false], 1, t0);
+        d.add(&[true, false, false], 2, t0 + ms(10));
+        assert_eq!(d.debt, [3, 1, 0]);
+        assert_eq!(d.last, [Some(t0 + ms(10)), Some(t0), None]);
+        d.settled(&[true, false, false]);
+        assert_eq!(d.debt, [1, 1, 0]);
+        d.cleared(&[true, true, false]);
+        assert_eq!(d.debt, [0, 0, 0]);
+        assert_eq!(d.last, [None; 3]);
+        d.add(&[true, true, true], 1, t0);
+        d.reset();
+        assert!(d.debt.iter().all(|&x| x == 0) && d.last.iter().all(|l| l.is_none()));
+    }
+
+    #[test]
+    fn scrolling_is_not_cleared_while_it_changes_but_after_the_quiet_period() {
+        let cfg = ClearCfg::default();
+        let g = Grid::new(32 * 20, 32 * 20);
+        let u = Unsettled::new(g.tiles());
+        let t0 = Instant::now();
+        let mut d = Debt::new(g.tiles());
+        let tile = marked(&g, &[(5, 5)]);
+        // 60 frames a second for two seconds: far over the threshold, never still.
+        let mut now = t0;
+        for _ in 0..120 {
+            now += ms(16);
+            d.add(&tile, 1, now);
+            assert!(matches!(plan_clear(&d, &u, &g, None, now, &cfg), ClearPlan::Wait(_)), "no clear while it changes");
+        }
+        assert!(d.debt[5 * 20 + 5] >= cfg.debt);
+        // Still for a little less than the quiet period: it says when.
+        assert_eq!(plan_clear(&d, &u, &g, None, now + cfg.quiet - ms(1), &cfg), ClearPlan::Wait(Some(now + cfg.quiet)));
+        // Then the tile and its margin are cleared.
+        let ClearPlan::Send(region) = plan_clear(&d, &u, &g, None, now + cfg.quiet, &cfg) else { panic!("should clear") };
+        assert_eq!(g.rects(&region), vec![(4 * 32, 4 * 32, 3 * 32, 3 * 32)]);
+    }
+
+    #[test]
+    fn a_little_activity_is_never_cleared_and_a_disabled_clear_neither() {
+        let g = Grid::new(32 * 20, 32 * 20);
+        let u = Unsettled::new(g.tiles());
+        let t0 = Instant::now();
+        let mut d = Debt::new(g.tiles());
+        let cfg = ClearCfg::default();
+        // Typing: a few changes per tile.
+        for i in 0..(cfg.debt - 1) {
+            d.add(&marked(&g, &[(2, 2)]), 1, t0 + ms(i as u64));
+        }
+        assert_eq!(plan_clear(&d, &u, &g, None, t0 + Duration::from_secs(60), &cfg), ClearPlan::Wait(None));
+        d.add(&marked(&g, &[(2, 2)]), 1, t0);
+        let off = ClearCfg { enabled: false, ..cfg };
+        assert_eq!(plan_clear(&d, &u, &g, None, t0 + Duration::from_secs(60), &off), ClearPlan::Wait(None));
+        assert!(matches!(plan_clear(&d, &u, &g, None, t0 + Duration::from_secs(60), &cfg), ClearPlan::Send(_)));
+    }
+
+    #[test]
+    fn the_edge_view_reaches_the_threshold_in_half_the_changes() {
+        let cfg = ClearCfg::default();
+        let frames = |weight: u32| {
+            let mut d = Debt::new(1);
+            let mut n = 0;
+            while d.debt[0] < cfg.debt {
+                d.add(&[true], weight, Instant::now());
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(frames(1), cfg.debt);
+        assert_eq!(frames(ghost::CLEAR_EDGE_WEIGHT), cfg.debt.div_ceil(ghost::CLEAR_EDGE_WEIGHT));
+        assert!(frames(ghost::CLEAR_EDGE_WEIGHT) < frames(1));
+    }
+
+    #[test]
+    fn a_tile_waiting_for_its_settle_is_not_cleared_yet() {
+        let g = Grid::new(32 * 20, 32 * 20);
+        let t0 = Instant::now();
+        let mut u = Unsettled::new(g.tiles());
+        let mut d = Debt::new(g.tiles());
+        let cfg = ClearCfg::default();
+        let tile = marked(&g, &[(1, 1)]);
+        d.add(&tile, cfg.debt, t0);
+        u.touch(&tile, t0);
+        let later = t0 + cfg.quiet + ms(1);
+        assert_eq!(plan_clear(&d, &u, &g, None, later, &cfg), ClearPlan::Wait(None));
+        u.done(&tile);
+        assert!(matches!(plan_clear(&d, &u, &g, None, later, &cfg), ClearPlan::Send(_)));
+    }
+
+    #[test]
+    fn clears_are_rate_limited() {
+        let g = Grid::new(32 * 20, 32 * 20);
+        let u = Unsettled::new(g.tiles());
+        let cfg = ClearCfg::default();
+        let t0 = Instant::now();
+        let mut d = Debt::new(g.tiles());
+        d.add(&marked(&g, &[(5, 5)]), cfg.debt, t0);
+        let now = t0 + cfg.quiet + ms(1);
+        // The last clear was a moment ago: wait for its interval to pass.
+        assert_eq!(plan_clear(&d, &u, &g, Some(now - ms(10)), now, &cfg), ClearPlan::Wait(Some(now - ms(10) + cfg.interval)));
+        assert!(matches!(plan_clear(&d, &u, &g, Some(now - cfg.interval), now, &cfg), ClearPlan::Send(_)));
+    }
+
+    #[test]
+    fn a_clear_covers_a_tenth_of_the_panel_at_most_the_worst_tiles_first() {
+        let g = Grid::new(32 * 20, 32 * 20); // 400 tiles: room for 40 with margins
+        // Twelve zones three tiles apart, so their margins do not overlap: 108 tiles, over a tenth, under a third.
+        let at: Vec<(usize, usize)> = (0..12).map(|i| (i % 4 * 3, i / 4 * 3 + 6)).collect();
+        let cand = marked(&g, &at);
+        let mut debt = vec![0u32; g.tiles()];
+        for (i, &(x, y)) in at.iter().enumerate() {
+            debt[y * 20 + x] = 100 + i as u32;
+        }
+        let region = clear_region(&g, &cand, &debt);
+        // The four worst (the last ones, in the bottom row of zones, one at the left edge) with their margins.
+        assert_eq!(region.iter().filter(|&&t| t).count(), 33);
+        for &(x, y) in &at[8..] {
+            assert!(region[y * 20 + x]);
+        }
+        assert!(!region[at[0].1 * 20 + at[0].0]);
+    }
+
+    #[test]
+    fn over_a_third_of_the_panel_the_whole_panel_is_cleared() {
+        let g = Grid::new(32 * 20, 32 * 20);
+        // Sixteen separate zones: 144 tiles with margins, over 133.
+        let at: Vec<(usize, usize)> = (0..16).map(|i| (i % 4 * 3 + 1, i / 4 * 3 + 1)).collect();
+        let region = clear_region(&g, &marked(&g, &at), &vec![50; g.tiles()]);
+        assert!(region.iter().all(|&t| t));
+        // Two zones with one tile between them are one rectangle with their margins.
+        let two = clear_region(&g, &marked(&g, &[(5, 5), (7, 5)]), &vec![50; g.tiles()]);
+        assert_eq!(g.rects(&two), vec![(4 * 32, 4 * 32, 5 * 32, 3 * 32)]);
+    }
+
+    #[test]
+    fn stuck_tiles_are_settled_then_cleared_after_the_quiet_period_and_nothing_goes_meanwhile() {
+        let cfg = ClearCfg { enabled: true, debt: 3, quiet: ms(200), interval: Duration::from_secs(60) };
+        let rig = Rig::with_clear(ms(300), false, cfg);
+        rig.publish(1, 15, 15, None);
+        let first = rig.update(SOON).unwrap();
+        rig.ack(first[0].0);
+        // A burst of changes in one tile: updates, all fast, no clear.
+        for seq in 2..8u64 {
+            rig.publish(seq, 15, (seq as u8) % 15, Some((seq - 1, first_tile())));
+            let u = rig.update(SOON).unwrap();
+            assert_eq!(u[0].1 & (RECT_CLEAR | RECT_SETTLE), 0);
+            rig.ack(u.last().unwrap().0);
+        }
+        // Its settle goes first (`settle_after` from the first change) ...
+        let settle = rig.update(SOON).unwrap();
+        assert_eq!(settle[0].1 & RECT_SETTLE, RECT_SETTLE);
+        rig.ack(settle.last().unwrap().0);
+        // ... then the clear: the whole panel, as the tile with its margin is most of this small one.
+        let clear = rig.update(SOON).unwrap();
+        assert_eq!(clear, vec![(clear[0].0, RECT_CLEAR | RECT_LAST, (0, 0, SIZE as u16, SIZE as u16))]);
+        // A new frame waits until the tablet has finished flashing.
+        rig.publish(8, 15, 2, Some((7, first_tile())));
+        assert!(rig.update(NOT).is_none());
+        rig.ack(clear[0].0);
+        assert!(rig.update(SOON).unwrap()[0].1 & RECT_CLEAR == 0);
+    }
+
+    #[test]
+    fn the_tablets_own_clear_resets_the_counters() {
+        let cfg = ClearCfg { enabled: true, debt: 3, quiet: ms(200), interval: Duration::from_secs(60) };
+        let rig = Rig::with_clear(ms(300), false, cfg);
+        rig.publish(1, 15, 15, None);
+        let first = rig.update(SOON).unwrap();
+        rig.ack(first[0].0);
+        for seq in 2..8u64 {
+            rig.publish(seq, 15, (seq as u8) % 15, Some((seq - 1, first_tile())));
+            let u = rig.update(SOON).unwrap();
+            rig.ack(u.last().unwrap().0);
+        }
+        // The CLR button: the tablet says so before the settle or the clear is due.
+        {
+            let (lock, cv) = &*rig.shared;
+            lock.lock().unwrap().cleared = true;
+            cv.notify_all();
+        }
+        assert!(rig.update(ms(900)).is_none(), "no settle and no clear after it");
     }
 }

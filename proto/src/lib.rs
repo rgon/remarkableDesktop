@@ -137,6 +137,12 @@ pub const RECT_SETTLE: u8 = 1;
 pub const RECT_BITS1: u8 = 2;
 /// `Rect` flag: the last rectangle of an update; only this one is acked.
 pub const RECT_LAST: u8 = 4;
+/// `Rect` flag: the rectangle (which carries the frame's pixels, as a
+/// settle does) is cleared of stuck charge on the panel: flashed black, then
+/// white, then drawn again, all in the flashing full-quality mode. The
+/// tablet is busy for the length of the flashes, so the host sends nothing
+/// else until it is acked.
+pub const RECT_CLEAR: u8 = 8;
 
 const HELLO: u8 = 1;
 const DEVICE: u8 = 2;
@@ -569,6 +575,14 @@ mod tests {
     }
 
     #[test]
+    fn rect_flags_are_distinct_bits() {
+        let all = [RECT_SETTLE, RECT_BITS1, RECT_LAST, RECT_CLEAR];
+        assert_eq!(RECT_CLEAR, 8);
+        assert_eq!(all.iter().fold(0, |a, f| a | f), 15);
+        assert!(all.iter().all(|f| f.count_ones() == 1));
+    }
+
+    #[test]
     fn round_trip() {
         let msgs = vec![
             Msg::Hello { version: VERSION, width: 1872, height: 1404, rotation: 90, view: "2".into() },
@@ -599,6 +613,7 @@ mod tests {
             Msg::Screens { names: vec!["DP-6".into(), "HDMI-2".into()] },
             Msg::Target { index: 2 },
             Msg::Rect { id: 3, x: 8, y: 16, w: 3, h: 2, flags: RECT_SETTLE | RECT_LAST, data: vec![1, 2, 3] },
+            Msg::Rect { id: 4, x: 0, y: 0, w: 2, h: 2, flags: RECT_CLEAR | RECT_BITS1 | RECT_LAST, data: vec![4] },
             Msg::Ack { id: 3 },
             Msg::Mapping { device: 1, shown: [0, 65535, 100, 65000], to: [1, 2, 3, 4] },
             Msg::Status { usb_hid: true, pen_mouse: false, touchpad: true },

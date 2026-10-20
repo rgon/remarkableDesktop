@@ -40,7 +40,8 @@ const USAGE: &str = "usage: remdesktop-host [--ssh root@10.11.99.1] [--remote /h
                        [--no-display] [--no-udp]
                        [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
                        [--palm-major N] [--pen-grace-ms N] [--palm-rest-ms N] [--log-touch]
-                       [--fast-mode M] [--settle-mode M] [--settle-ms N] [--no-ghost-model]";
+                       [--fast-mode M] [--settle-mode M] [--settle-ms N] [--no-ghost-model]
+                       [--no-clear] [--clear-debt N] [--clear-quiet-ms N] [--clear-interval-s N]";
 
 struct Args {
     ssh: String,
@@ -55,11 +56,13 @@ struct Args {
     settle_ms: u64,
     /// Decide quality refreshes from the ghosting model (ghost.rs), the timer being the upper bound.
     ghost_model: bool,
+    /// Clearing of stuck zones (flashed black and white by the tablet).
+    clear: stream::ClearCfg,
     run_args: Vec<String>,
 }
 
 fn parse() -> Result<Args, String> {
-    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remdesktop".into(), deploy: None, stats: false, display: true, udp: true, settle_ms: 1000, ghost_model: true, run_args: vec![] };
+    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remdesktop".into(), deploy: None, stats: false, display: true, udp: true, settle_ms: 1000, ghost_model: true, clear: stream::ClearCfg::default(), run_args: vec![] };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value\n{USAGE}"));
@@ -71,6 +74,10 @@ fn parse() -> Result<Args, String> {
             "--no-display" => a.display = false,
             "--no-udp" => a.udp = false,
             "--no-ghost-model" => a.ghost_model = false,
+            "--no-clear" => a.clear.enabled = false,
+            "--clear-debt" => a.clear.debt = value()?.parse().map_err(|_| "--clear-debt: a number")?,
+            "--clear-quiet-ms" => a.clear.quiet = Duration::from_millis(value()?.parse().map_err(|_| "--clear-quiet-ms: a number")?),
+            "--clear-interval-s" => a.clear.interval = Duration::from_secs(value()?.parse().map_err(|_| "--clear-interval-s: a number")?),
             "--settle-ms" => a.settle_ms = value()?.parse().map_err(|_| "--settle-ms: a number")?,
             "--capture-test" => {
                 // remdesktop-host --capture-test virtual|<connector> <out.pgm>
@@ -717,7 +724,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
                 }
                 if args.display {
                     let w = writer.clone();
-                    let s = stream::Streamer::start(logical, rotation, args.stats, Duration::from_millis(args.settle_ms), args.ghost_model, Box::new(move |m| send(&w, m)));
+                    let s = stream::Streamer::start(logical, rotation, args.stats, Duration::from_millis(args.settle_ms), args.ghost_model, args.clear, Box::new(move |m| send(&w, m)));
                     if initial == 0 {
                         s.set_source(Some(capture::Source::Virtual), mapping::FULL);
                     }

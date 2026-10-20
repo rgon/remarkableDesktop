@@ -183,6 +183,24 @@ impl Grid {
         out
     }
 
+    /// The marked tiles and the `n` tiles around each of them.
+    pub fn dilate(&self, marked: &[bool], n: usize) -> Vec<bool> {
+        let mut out = vec![false; self.tiles()];
+        for ty in 0..self.rows {
+            for tx in 0..self.cols {
+                if !marked[ty * self.cols + tx] {
+                    continue;
+                }
+                for y in ty.saturating_sub(n)..(ty + n + 1).min(self.rows) {
+                    for x in tx.saturating_sub(n)..(tx + n + 1).min(self.cols) {
+                        out[y * self.cols + x] = true;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The tiles the rectangles (from `rects`) cover, which may be more
     /// than the marked ones: what an update actually puts on the panel.
     pub fn covered(&self, rects: &[Rect]) -> Vec<bool> {
@@ -309,6 +327,23 @@ fn union(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dilating_adds_a_margin_clamped_to_the_grid() {
+        let g = Grid::new(32 * 5, 32 * 4); // 5 × 4 tiles
+        let mut marked = vec![false; g.tiles()];
+        marked[0] = true; // the corner
+        let d = g.dilate(&marked, 1);
+        assert_eq!(d.iter().filter(|&&t| t).count(), 4);
+        assert!(d[0] && d[1] && d[5] && d[6]);
+        marked[0] = false;
+        marked[2 * 5 + 2] = true; // in the middle
+        assert_eq!(g.dilate(&marked, 1).iter().filter(|&&t| t).count(), 9);
+        assert_eq!(g.dilate(&marked, 0), marked);
+        // Two tiles two apart join into one block.
+        marked[2 * 5 + 4] = true;
+        assert_eq!(g.rects(&g.dilate(&marked, 1)), vec![(32, 32, 32 * 4, 32 * 3)]);
+    }
 
     #[test]
     fn rectangles_cover_the_tiles_they_span() {

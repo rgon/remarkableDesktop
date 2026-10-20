@@ -28,7 +28,7 @@ impl QRect {
 /// `EPScreenMode`. Names come from the library's `EPScreenModeItem::Mode`
 /// metadata; the numeric order is assumed to match its declaration order.
 #[repr(i32)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
     Pen = 0,
     Mono = 1,
