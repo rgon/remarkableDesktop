@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.11.8](https://github.com/rgon/remarkableDesktop/compare/v0.11.7...v0.11.8) (2026-10-20)
+
+
+### Features
+
+* raise the edge thresholds a touch and make CLR flash the whole screen ([f52c358](https://github.com/rgon/remarkableDesktop/commit/f52c358600cd2c4a969aa66f72a3f37333f03c63))
+* show the USB network next to HID input on the tablet's USB line ([bd13c3d](https://github.com/rgon/remarkableDesktop/commit/bd13c3d930a07fa02b1ab9872a690e81d6558a26))
+
+
+### Performance Improvements
+
+* convert, scale and rotate the capture on the GPU instead of in GStreamer ([3f56979](https://github.com/rgon/remarkableDesktop/commit/3f5697978cad5dbf6767d29f2ed0d68391adbf55))
+* make the 4-bit gray frame and its changed tiles on the GPU ([5c5e413](https://github.com/rgon/remarkableDesktop/commit/5c5e413bcca7b0af10eed759dfcae3ae313c0ec4))
+
 ## [0.11.7](https://github.com/rgon/remarkableDesktop/compare/v0.11.6...v0.11.7) (2026-10-20)
 
 
