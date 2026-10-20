@@ -7,14 +7,31 @@
 // (four pixels per word), so no stage needs 8-bit storage access.
 
 struct Params {
+    // The frame the stages work on: the panel's portrait size.
     w: u32,
     h: u32,
     // Pixels of the original darker than this turn black, whatever the
     // outlines say (0: off).
     dark: u32,
+    // 1: `convert` makes the gray frame from the raw capture (below);
+    // 0: the CPU has put it in src_px already.
+    convert: u32,
+    // The raw capture's size, the tablet's logical (unrotated) size, the
+    // rotation to the panel (0 none, 1 counterclockwise, 2 half turn, 3
+    // clockwise) and where the scaled capture sits in the logical frame.
+    src_w: u32,
+    src_h: u32,
+    log_w: u32,
+    log_h: u32,
+    rot: u32,
+    sc_x: u32,
+    sc_y: u32,
+    sc_w: u32,
+    sc_h: u32,
 }
 
-@group(0) @binding(0) var<storage, read> src_px: array<u32>;
+// The gray frame, four pixels to a word.
+@group(0) @binding(0) var<storage, read_write> src_px: array<u32>;
 @group(0) @binding(1) var<storage, read_write> buf_tmp: array<u32>;
 @group(0) @binding(2) var<storage, read_write> buf_blur: array<u32>;
 // Gradient magnitude in the low 16 bits, direction (0 x, 1 y, 2 diagonal,
@@ -30,6 +47,8 @@ struct Params {
 // padded to whole bytes: the wire format of `bits1` in the proto crate.
 @group(0) @binding(7) var<storage, read_write> buf_bits: array<u32>;
 @group(0) @binding(8) var<storage, read> prm: Params;
+// The raw capture: one BGRx pixel per word.
+@group(0) @binding(11) var<storage, read> buf_src: array<u32>;
 // One flag per tile of the grid in tiles.rs: set when the outline differs
 // from the previous frame's anywhere in it.
 @group(0) @binding(9) var<storage, read_write> buf_tiles: array<atomic<u32>>;
@@ -45,6 +64,72 @@ const HIGH: i32 = 280;
 
 fn gray(i: u32) -> u32 {
     return (src_px[i >> 2u] >> ((i & 3u) * 8u)) & 255u;
+}
+
+fn src_luma(x: i32, y: i32) -> f32 {
+    let p = buf_src[u32(y) * prm.src_w + u32(x)];
+    return 0.299 * f32((p >> 16u) & 255u) + 0.587 * f32((p >> 8u) & 255u) + 0.114 * f32(p & 255u);
+}
+
+// The gray of one panel pixel from the raw capture: undo the rotation to
+// find the logical pixel, leave the bars white, else scale bilinearly.
+fn converted(ox: u32, oy: u32) -> u32 {
+    let lw = i32(prm.log_w);
+    let lh = i32(prm.log_h);
+    var lx = i32(ox);
+    var ly = i32(oy);
+    if (prm.rot == 1u) {
+        lx = lw - 1 - i32(oy);
+        ly = i32(ox);
+    } else if (prm.rot == 2u) {
+        lx = lw - 1 - i32(ox);
+        ly = lh - 1 - i32(oy);
+    } else if (prm.rot == 3u) {
+        lx = i32(oy);
+        ly = lh - 1 - i32(ox);
+    }
+    let rx = lx - i32(prm.sc_x);
+    let ry = ly - i32(prm.sc_y);
+    if (rx < 0 || ry < 0 || rx >= i32(prm.sc_w) || ry >= i32(prm.sc_h)) {
+        return 255u;
+    }
+    let fx = (f32(rx) + 0.5) * f32(prm.src_w) / f32(prm.sc_w) - 0.5;
+    let fy = (f32(ry) + 0.5) * f32(prm.src_h) / f32(prm.sc_h) - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let maxx = i32(prm.src_w) - 1;
+    let maxy = i32(prm.src_h) - 1;
+    let xa = clamp(x0, 0, maxx);
+    let xb = clamp(x0 + 1, 0, maxx);
+    let ya = clamp(y0, 0, maxy);
+    let yb = clamp(y0 + 1, 0, maxy);
+    let top = mix(src_luma(xa, ya), src_luma(xb, ya), tx);
+    let bottom = mix(src_luma(xa, yb), src_luma(xb, yb), tx);
+    return u32(clamp(mix(top, bottom, ty) + 0.5, 0.0, 255.0));
+}
+
+// Raw capture to the gray frame, four panel pixels per thread.
+@compute @workgroup_size(16, 16)
+fn convert(@builtin(global_invocation_id) g: vec3<u32>) {
+    let w = prm.w;
+    if (prm.convert == 0u || g.x >= w || g.y >= prm.h) {
+        return;
+    }
+    let n = w * prm.h;
+    let k = g.y * w + g.x;
+    if (k * 4u >= n) {
+        return;
+    }
+    var word = 0u;
+    for (var j = 0u; j < 4u; j++) {
+        let i = k * 4u + j;
+        if (i < n) {
+            word |= converted(i % w, i / w) << (8u * j);
+        }
+    }
+    src_px[k] = word;
 }
 
 fn gray_x(row: u32, x: i32, wi: i32) -> u32 {

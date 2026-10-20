@@ -35,7 +35,12 @@ fn usable(gray: &[u8], w: usize, h: usize) -> bool {
 /// otherwise. The frame size may change between calls.
 pub struct Detector {
     backend: Backend,
+    /// Whether a GPU can be had, once checked.
+    gpu_ok: Option<bool>,
 }
+
+/// The geometry of a raw BGRx capture (see `gpu::Convert`).
+pub use crate::gpu::Convert;
 
 /// Dark areas: pixels of `gray` darker than `DARK` turn black in `out`.
 pub(crate) fn threshold(gray: &[u8], out: &mut [u8]) {
@@ -88,7 +93,59 @@ enum Backend {
 
 impl Detector {
     pub fn new() -> Detector {
-        Detector { backend: Backend::Untried }
+        Detector { backend: Backend::Untried, gpu_ok: None }
+    }
+
+    /// Whether a GPU is there to take raw captures (found out once, and
+    /// logged). `REMDESKTOP_NO_GPU` says no.
+    pub fn gpu_ready(&mut self) -> bool {
+        if self.gpu_ok.is_none() {
+            let found = if std::env::var_os("REMDESKTOP_NO_GPU").is_some() { Err("REMDESKTOP_NO_GPU is set".to_string()) } else { crate::gpu::Gpu::available() };
+            match &found {
+                Ok(name) => eprintln!("remdesktop-host: converting and detecting edges on the GPU ({name})"),
+                Err(e) => eprintln!("remdesktop-host: converting and detecting edges on the CPU ({e})"),
+            }
+            self.gpu_ok = Some(found.is_ok());
+        }
+        self.gpu_ok == Some(true)
+    }
+
+    /// Sets the GPU up for raw captures of the geometry `c`, producing
+    /// `w`×`h` panel frames. False if that fails.
+    pub fn use_raw(&mut self, c: Convert, w: usize, h: usize) -> bool {
+        match crate::gpu::Gpu::new(w, h, DARK as u32, Some(c)) {
+            Ok(g) => {
+                self.backend = Backend::Gpu(g);
+                true
+            }
+            Err(e) => {
+                eprintln!("remdesktop-host: the GPU cannot take raw frames ({e})");
+                self.gpu_ok = Some(false);
+                self.backend = Backend::Untried;
+                false
+            }
+        }
+    }
+
+    /// Forgets the GPU setup, for a change of how frames come in.
+    pub fn reset(&mut self) {
+        self.backend = Backend::Untried;
+    }
+
+    /// The outline of a raw capture (see `Gpu::outline_bgrx`).
+    pub fn detect_raw(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<Detected, String> {
+        match &mut self.backend {
+            Backend::Gpu(g) => g.outline_bgrx(raw, shown).map(|o| Detected { bits: o.bits, on_gpu: true, dirty: o.dirty }),
+            _ => Err("no GPU set up for raw frames".into()),
+        }
+    }
+
+    /// The gray panel frame of a raw capture.
+    pub fn gray_raw(&mut self, raw: &[u8], shown: [f64; 4]) -> Result<Vec<u8>, String> {
+        match &mut self.backend {
+            Backend::Gpu(g) => g.gray_bgrx(raw, shown),
+            _ => Err("no GPU set up for raw frames".into()),
+        }
     }
 
     pub fn detect(&mut self, gray: &[u8], w: usize, h: usize) -> Detected {
@@ -99,7 +156,7 @@ impl Detector {
             self.backend = if std::env::var_os("REMDESKTOP_NO_GPU").is_some() || !usable(gray, w, h) {
                 Backend::Cpu
             } else {
-                match crate::gpu::Gpu::new(w, h, DARK as u32) {
+                match crate::gpu::Gpu::new(w, h, DARK as u32, None) {
                     Ok(g) => {
                         eprintln!("remdesktop-host: edge detection on the GPU ({})", g.name());
                         Backend::Gpu(g)
