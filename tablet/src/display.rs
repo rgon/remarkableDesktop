@@ -146,3 +146,32 @@ impl Display {
         self.unsettled.map(|_| self.refresh.settle_after.saturating_sub(self.last_update.elapsed()).as_millis() as i32 + 1)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_writes_odd_widths_and_rejects_bad_sizes() {
+        let (w, h) = (5usize, 3usize);
+        let levels: Vec<u8> = (0..w * h).map(|i| (i % 16) as u8).collect();
+        let packed = gray4::pack(&levels, w, 0, 0, w, h);
+        let lz4 = lz4_flex::block::compress_prepend_size(&packed);
+        let mut px = vec![0u32; 8 * 4];
+        let fb = ImageInfo { pixels: px.as_mut_ptr().cast(), width: 8, height: 4, stride: 8 * 4, format: crate::epd::FORMAT_RGB32 };
+        let mut d = Decoder::new();
+        let r = Rect { x: 2, y: 1, w: w as i32, h: h as i32 };
+        assert_eq!(d.write(&fb, r, &lz4), Ok(r));
+        for y in 0..h {
+            for x in 0..w {
+                let g = gray4::gray(levels[y * w + x]) as u32;
+                assert_eq!(px[(y + 1) * 8 + x + 2], 0xff00_0000 | g << 16 | g << 8 | g);
+            }
+            // The pixel after the row's last one is untouched.
+            assert_eq!(px[(y + 1) * 8 + 2 + w], 0);
+        }
+        let wrong = Rect { w: 4, ..r };
+        assert!(d.write(&fb, wrong, &lz4).is_err());
+        assert!(d.write(&fb, r, &[1, 2]).is_err());
+    }
+}
