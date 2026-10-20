@@ -1,7 +1,8 @@
 //! Edge detection's per-pixel stages (blur, Sobel, suppression, hysteresis,
-//! line placement) on the GPU through Vulkan, so a frame costs the CPU only
-//! a copy in and a copy out (see `edges.rs`, which also has the
-//! CPU version of everything here). `libvulkan` is loaded at run time: where
+//! line placement, dark pixels) and the comparison with the previous frame
+//! (which tiles changed) on the GPU through Vulkan, so a frame costs the CPU
+//! only a copy in and a copy out (see `edges.rs`, which also has the CPU
+//! version of the outline). `libvulkan` is loaded at run time: where
 //! there is no Vulkan driver, `Gpu::new` fails and the CPU does the work.
 //!
 //! One compute pipeline per stage of `edges.wgsl`, all sharing one
@@ -17,7 +18,7 @@ use std::ffi::CStr;
 const SPIRV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/edges.spv"));
 
 /// Entry points of the shader, in `Stage` order.
-const STAGES: [&CStr; 8] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"pack_out"];
+const STAGES: [&CStr; 9] = [c"blur_h", c"blur_v", c"sobel", c"nms", c"hyst", c"place_line", c"dark_px", c"diff_tiles", c"pack_out"];
 
 #[derive(Clone, Copy)]
 enum Stage {
@@ -28,6 +29,7 @@ enum Stage {
     Hyst,
     Place,
     Dark,
+    Diff,
     Pack,
 }
 
@@ -43,7 +45,9 @@ const OUTLINE: usize = 5;
 const CHANGED: usize = 6;
 const RESULT: usize = 7;
 const PARAMS: usize = 8;
-const BUFFERS: usize = 9;
+const TILES: usize = 9;
+const PREV: usize = 10;
+const BUFFERS: usize = 11;
 
 struct Buf {
     buffer: vk::Buffer,
@@ -68,7 +72,21 @@ pub struct Gpu {
     cmds: [vk::CommandBuffer; 3],
     fence: vk::Fence,
     size: (usize, usize),
+    /// Tiles in the grid of `tiles.rs`.
+    tiles: usize,
+    /// Bytes of a one-word-per-pixel buffer.
+    words: u64,
+    /// A frame has been through, so `PREV` holds something to compare with.
+    have_prev: bool,
     name: String,
+}
+
+/// One frame's result.
+pub struct Outline {
+    /// 0 on an outline pixel (or a dark one), 255 elsewhere.
+    pub pixels: Vec<u8>,
+    /// The tiles of the grid that differ from the previous frame (None for the first).
+    pub dirty: Option<Vec<bool>>,
 }
 
 fn ve<T>(what: &str, r: Result<T, vk::Result>) -> Result<T, String> {
@@ -99,6 +117,7 @@ impl Gpu {
 
         // Buffers: the frame in, the outline out, the rest stays on the GPU.
         let px = (w * h) as u64;
+        let tiles = crate::tiles::Grid::new(w, h).tiles();
         let packed = px.div_ceil(4).max(1) * 4;
         let words = (px * 4).max(4);
         // (size, host access) per binding.
@@ -112,6 +131,8 @@ impl Gpu {
             (4, true),
             (packed, true),
             (16, true),
+            ((tiles as u64 * 4).max(4), true),
+            (words, false),
         ];
         let mut buffers = Vec::with_capacity(BUFFERS);
         for (size, host) in layout {
@@ -152,7 +173,7 @@ impl Gpu {
         let cmds = ve("command buffers", unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(3)) })?;
         let fence = ve("fence", unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) })?;
 
-        let gpu = Gpu { _entry: entry, instance, device, queue, pool, set_layout, desc_pool, pipe_layout, module, pipelines, buffers, cmds: [cmds[0], cmds[1], cmds[2]], fence, size: (w, h), name };
+        let gpu = Gpu { _entry: entry, instance, device, queue, pool, set_layout, desc_pool, pipe_layout, module, pipelines, buffers, cmds: [cmds[0], cmds[1], cmds[2]], fence, size: (w, h), tiles, words, have_prev: false, name };
         gpu.record(set)?;
         Ok(gpu)
     }
@@ -190,7 +211,7 @@ impl Gpu {
 
     /// A storage buffer; `host`: visible to the CPU (mapped), else GPU-local.
     fn buffer(device: &Device, mem_props: &vk::PhysicalDeviceMemoryProperties, size: u64, host: bool) -> Result<Buf, String> {
-        let info = vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let info = vk::BufferCreateInfo::default().size(size).usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = ve("buffer", unsafe { device.create_buffer(&info, None) })?;
         let req = unsafe { device.get_buffer_memory_requirements(buffer) };
         let coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
@@ -217,7 +238,7 @@ impl Gpu {
         let sync = |cb: vk::CommandBuffer| unsafe {
             let b = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE);
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
             d.cmd_pipeline_barrier(cb, shader | transfer, shader | transfer, vk::DependencyFlags::empty(), &[b], &[], &[]);
         };
         let to_host = |cb: vk::CommandBuffer| unsafe {
@@ -252,8 +273,15 @@ impl Gpu {
                     }
                     1 => rounds(cb),
                     _ => {
+                        d.cmd_fill_buffer(cb, self.buffers[TILES].buffer, 0, vk::WHOLE_SIZE, 0);
+                        sync(cb);
                         run(cb, Stage::Place);
                         run(cb, Stage::Dark);
+                        run(cb, Stage::Diff);
+                        // This frame is the next one's reference.
+                        let copy = [vk::BufferCopy::default().size(self.words)];
+                        d.cmd_copy_buffer(cb, self.buffers[OUTLINE].buffer, self.buffers[PREV].buffer, &copy);
+                        sync(cb);
                         run(cb, Stage::Pack);
                     }
                 }
@@ -273,9 +301,10 @@ impl Gpu {
         }
     }
 
-    /// The outline of `gray` (`w`×`h` as given to `new`): 0 on an outline
-    /// pixel (or a dark one), 255 elsewhere, as `edges::outline` makes it.
-    pub fn outline(&mut self, gray: &[u8]) -> Result<Vec<u8>, String> {
+    /// The outline of `gray` (`w`×`h` as given to `new`) as `edges::outline`
+    /// makes it, with dark pixels black, and the tiles that changed since
+    /// the previous call.
+    pub fn outline(&mut self, gray: &[u8]) -> Result<Outline, String> {
         let px = self.size.0 * self.size.1;
         if gray.len() != px {
             return Err("frame size changed".into());
@@ -289,9 +318,12 @@ impl Gpu {
             batches += 1;
         }
         self.submit(2)?;
-        let mut out = vec![0u8; px];
-        unsafe { std::ptr::copy_nonoverlapping(self.buffers[RESULT].ptr, out.as_mut_ptr(), px) };
-        Ok(out)
+        let mut pixels = vec![0u8; px];
+        unsafe { std::ptr::copy_nonoverlapping(self.buffers[RESULT].ptr, pixels.as_mut_ptr(), px) };
+        let flags = unsafe { std::slice::from_raw_parts(self.buffers[TILES].ptr as *const u32, self.tiles) };
+        let dirty = self.have_prev.then(|| flags.iter().map(|&f| f != 0).collect());
+        self.have_prev = true;
+        Ok(Outline { pixels, dirty })
     }
 }
 
@@ -359,10 +391,24 @@ mod tests {
         }
         let mut want = crate::edges::outline(&img, w, h);
         crate::edges::threshold(&img, &mut want);
-        let got = gpu.outline(&img).expect("gpu frame");
-        let differing = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+        let first = gpu.outline(&img).expect("gpu frame");
+        let got = &first.pixels;
+        let differing = want.iter().zip(got).filter(|(a, b)| a != b).count();
         assert_eq!(differing, 0, "{differing} of {} pixels differ on {}", w * h, gpu.name());
-        // Frames can follow one another.
-        assert_eq!(gpu.outline(&img).expect("second frame"), got);
+        assert!(first.dirty.is_none(), "nothing to compare the first frame with");
+        // The same frame again: nothing changed.
+        let again = gpu.outline(&img).expect("second frame");
+        assert_eq!(&again.pixels, got);
+        assert!(again.dirty.expect("flags").iter().all(|&d| !d));
+        // A different one: the tiles the GPU flags are the ones the CPU finds.
+        let mut other = img.clone();
+        for y in 40..70 {
+            for x in 90..140 {
+                other[y * w + x] = 255 - other[y * w + x];
+            }
+        }
+        let next = gpu.outline(&other).expect("third frame");
+        let grid = crate::tiles::Grid::new(w, h);
+        assert_eq!(next.dirty.expect("flags"), grid.dirty(&again.pixels, &next.pixels));
     }
 }
