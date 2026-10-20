@@ -247,7 +247,6 @@ pub fn run(args: Args) -> Result<(), String> {
     ui.set_label(Button::Display, display_label(state.display));
     ui.set_label(Button::Ink, ink_label(state.ink));
     ui.set_label(Button::Clear, "CLR");
-    ui.set_enabled(Button::Clear, state.ink);
     ui.set_enabled(Button::Screen, false);
     ui.set_battery(crate::link::battery_percent());
     ui.set_status("USB  starting", "HOST not connected", &wifi_line(&crate::link::network_addresses()));
@@ -771,11 +770,15 @@ pub fn run(args: Args) -> Result<(), String> {
                         }
                         log!("remdesktop: ink is now {}", if ink.on { "on" } else { "off" });
                         ui.set_label(b, ink_label(ink.on));
-                        ui.set_enabled(Button::Clear, ink.on);
                         state.ink = ink.on;
                         state.save();
                     } else {
                         clear_screen(&mut ink, &epd);
+                        // Updates that arrived meanwhile were drawn over by the redraw: have the host send the whole screen again.
+                        if let Some(h) = host.as_mut() {
+                            h.send(&Msg::Display { mode: state.display });
+                            h.flush();
+                        }
                     }
                     ui.set_progress(b, ui::HOLD_STEPS);
                 }

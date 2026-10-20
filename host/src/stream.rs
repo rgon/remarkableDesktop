@@ -26,6 +26,9 @@ const MAX_IN_FLIGHT: usize = 2;
 /// time: a slow panel gets the newest frame once it is free instead of an
 /// update that would wait, stale, behind the one being refreshed.
 const PIPELINE_ACK_MAX: Duration = Duration::from_millis(40);
+/// A quality refresh that is due and has waited this much longer goes out
+/// even though a changed frame is waiting (while scrolling one always is).
+const SETTLE_GRACE: Duration = Duration::from_millis(300);
 /// How often the sender looks again while the ghosting model has not yet
 /// taken in the updates sent (it normally notifies as soon as it has).
 const MODEL_WAIT: Duration = Duration::from_millis(30);
@@ -52,6 +55,8 @@ struct Shared {
     /// What the tablet shows. Capture keeps running while it is `None`
     /// (stopping it would remove the virtual monitor); nothing is sent.
     mode: DisplayMode,
+    /// Bumps whenever the tablet asks for a mode, even the same one: the next frame is a whole one.
+    look: u64,
     /// Newest frame as gray levels, the epoch it belongs to (it changes with
     /// the source and the mode, and the next update is then a whole frame),
     /// when it was read from the capture pipeline, and the mode it was
@@ -413,6 +418,14 @@ fn run_sender(shared: Arc<(Mutex<Shared>, Condvar)>, logical: (u32, u32), rotati
                 if s.stop {
                     return;
                 }
+                // A refresh that is overdue goes first, or a constantly
+                // changing screen (scrolling) would never get one.
+                let overdue = last.is_some()
+                    && s.mode != DisplayMode::None
+                    && unsettled.next_due(settle_after).is_some_and(|t| Instant::now() >= t + SETTLE_GRACE);
+                if overdue && s.may_send() {
+                    break Work::Settle(unsettled.due(Instant::now(), settle_after));
+                }
                 if s.fresh && s.may_send() {
                     s.fresh = false;
                     if s.mode == DisplayMode::None {
@@ -530,7 +543,7 @@ impl Streamer {
             // `raw` holds a frame of this generation that is not yet rendered.
             let mut raw_new = false;
             let mut raw_for: Option<u64> = None;
-            let mut rendered_as: Option<(u64, DisplayMode)> = None;
+            let mut rendered_as: Option<(u64, DisplayMode, u64)> = None;
             let mut epoch = 0u64;
             let mut captured_at = Instant::now();
             // Frames made, and what the GPU says changed since the one the
@@ -546,12 +559,12 @@ impl Streamer {
             let mut applied_pending = 0u64;
             let mut model_moved = false;
             loop {
-                let (wanted, generation, shown, mode) = {
+                let (wanted, generation, shown, mode, look) = {
                     let s = lock.lock().unwrap();
                     if s.stop {
                         return;
                     }
-                    (s.source.clone(), s.generation, s.shown, s.mode)
+                    (s.source.clone(), s.generation, s.shown, s.mode, s.look)
                 };
                 if current.as_ref().map(|c| c.0) != Some(generation) {
                     current = None; // stops the old stream (and removes a virtual monitor)
@@ -608,7 +621,7 @@ impl Streamer {
                 // picture is ready when the sender is; rendering is one at a
                 // time, so the GPU the compositor shares is never queued up
                 // with work, and the capture pipe drops what comes too fast.
-                let wanted_look = (generation, mode);
+                let wanted_look = (generation, mode, look);
                 let render_new = raw_new;
                 let will_render = raw_for == Some(generation) && (render_new || rendered_as != Some(wanted_look));
                 // The updates sent since go into the model first, so a frame
@@ -726,6 +739,9 @@ impl Streamer {
         let (lock, cv) = &*self.shared;
         let mut s = lock.lock().unwrap();
         s.mode = mode;
+        // Asking again for the same mode sends the whole frame again (the
+        // tablet's CLR button does, after it flashed the panel).
+        s.look += 1;
         s.in_flight.clear();
         cv.notify_all();
     }
@@ -890,6 +906,23 @@ mod tests {
         assert_eq!(third[0].2, (0, 0, 32, 32));
         assert!(rig.update(NOT).is_none());
         assert_eq!(rig.shared.0.lock().unwrap().in_flight.len(), 2);
+    }
+
+    #[test]
+    fn a_screen_that_never_stops_changing_still_gets_its_settle() {
+        let rig = Rig::new(Duration::from_millis(200));
+        rig.publish(1, 15, 15, None);
+        let (start, mut seq, mut settled) = (Instant::now(), 1u64, false);
+        // A frame is always waiting, as while scrolling; the tablet acks at once.
+        while start.elapsed() < Duration::from_secs(3) && !settled {
+            if let Some(update) = rig.update(Duration::from_millis(30)) {
+                settled = update.iter().any(|r| r.1 & RECT_SETTLE != 0);
+                rig.ack(update.last().unwrap().0);
+            }
+            seq += 1;
+            rig.publish(seq, 15, (seq % 14) as u8, None);
+        }
+        assert!(settled, "no settle in {:?} of constant change", start.elapsed());
     }
 
     #[test]
