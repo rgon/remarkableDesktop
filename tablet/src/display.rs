@@ -1,28 +1,26 @@
 //! Showing the host's screen: `Rect` updates are written into the panel
-//! buffer and refreshed in a fast mode at once; areas that then stay still
-//! get a full-quality refresh, which clears the fast mode's ghosting.
+//! buffer and refreshed at once, in the fast mode or, when the host marks
+//! them, in the quality mode that clears the fast mode's ghosting. The host
+//! decides which and when; it knows what changed and what has been still.
 
 use crate::epd::{Epd, ImageInfo, Mode};
-use remdesktop_proto::gray4;
-use std::time::{Duration, Instant};
+use remdesktop_proto::{RECT_BITS1, RECT_SETTLE, bits1, gray4};
 
-/// Refresh modes and timing for streamed content.
+/// Refresh modes for streamed content.
 #[derive(Debug, Clone, Copy)]
 pub struct Refresh {
-    /// Used for every update as it arrives. `Pen` is the engine's
+    /// Used for updates as they change. `Pen` is the engine's
     /// lowest-latency (black/white) mode.
     pub fast: Mode,
-    /// Used once an area stopped changing, to restore grays and clear
+    /// Used for the host's settle updates, to restore grays and clear
     /// ghosting. `Ui` doesn't flash, so it never blocks for long; `Content`
     /// is a flashing full-quality refresh.
     pub settle: Mode,
-    /// How long an area must be still before its settle refresh.
-    pub settle_after: Duration,
 }
 
 impl Default for Refresh {
     fn default() -> Self {
-        Self { fast: Mode::Pen, settle: Mode::Ui, settle_after: Duration::from_millis(1000) }
+        Self { fast: Mode::Pen, settle: Mode::Ui }
     }
 }
 
@@ -65,11 +63,12 @@ impl Decoder {
     }
 
     /// Writes one update into the framebuffer (no refresh yet).
-    pub fn write(&mut self, fb: &ImageInfo, r: Rect, packed_lz4: &[u8]) -> Result<Rect, String> {
+    pub fn write(&mut self, fb: &ImageInfo, r: Rect, flags: u8, packed_lz4: &[u8]) -> Result<Rect, String> {
         if r.x < 0 || r.y < 0 || r.w <= 0 || r.h <= 0 || r.x + r.w > fb.width || r.y + r.h > fb.height {
             return Err(format!("update {r:?} outside the panel"));
         }
-        let rb = gray4::row_bytes(r.w as usize);
+        let bits = flags & RECT_BITS1 != 0;
+        let rb = if bits { bits1::row_bytes(r.w as usize) } else { gray4::row_bytes(r.w as usize) };
         let want = rb * r.h as usize;
         // lz4_flex's size-prepended format: the length, then the block.
         let (head, block) = packed_lz4.split_first_chunk::<4>().ok_or("lz4: truncated")?;
@@ -83,6 +82,13 @@ impl Decoder {
         for row in 0..r.h as usize {
             let line = unsafe { fb.pixels.add((r.y as usize + row) * fb.stride as usize + r.x as usize * 4) as *mut u32 };
             let packed = &self.scratch[row * rb..][..rb];
+            if bits {
+                for x in 0..w {
+                    let white = packed[x / 8] >> (7 - x % 8) & 1 != 0;
+                    unsafe { line.add(x).write_unaligned(if white { 0xffff_ffff } else { 0xff00_0000 }) };
+                }
+                continue;
+            }
             for (i, &b) in packed.iter().enumerate() {
                 let [hi, lo] = pairs[b as usize];
                 unsafe {
@@ -97,18 +103,16 @@ impl Decoder {
     }
 }
 
-/// Refresh scheduling for screen updates. Runs on the input thread.
+/// Refreshes screen updates in the mode the host asked for. Runs on the
+/// input thread.
 pub struct Display {
     refresh: Refresh,
-    /// Updated in fast mode, waiting for a quality refresh.
-    unsettled: Option<Rect>,
-    last_update: Instant,
     pub frames: u32,
 }
 
 impl Display {
     pub fn new(refresh: Refresh) -> Self {
-        Self { refresh, unsettled: None, last_update: Instant::now(), frames: 0 }
+        Self { refresh, frames: 0 }
     }
 
     /// The mode for updates that must show up at once.
@@ -121,29 +125,12 @@ impl Display {
         self.refresh.settle
     }
 
-    /// Refreshes freshly written pixels in the fast mode.
-    pub fn show(&mut self, epd: &Epd, r: Rect) {
-        epd.swap(r.x, r.y, r.w, r.h, self.refresh.fast, 0);
+    /// Refreshes freshly written pixels, in the quality mode if `flags` has `RECT_SETTLE`.
+    pub fn show(&mut self, epd: &Epd, r: Rect, flags: u8) {
+        let mode = if flags & RECT_SETTLE != 0 { self.refresh.settle } else { self.refresh.fast };
+        epd.swap(r.x, r.y, r.w, r.h, mode, 0);
         epd.process_events(0);
-        self.unsettled = Some(self.unsettled.map_or(r, |u| u.union(r)));
-        self.last_update = Instant::now();
         self.frames += 1;
-    }
-
-    /// Gives settled areas their quality refresh. Call regularly.
-    pub fn tick(&mut self, epd: &Epd) {
-        if let Some(u) = self.unsettled {
-            if self.last_update.elapsed() >= self.refresh.settle_after {
-                epd.swap(u.x, u.y, u.w, u.h, self.refresh.settle, 0);
-                epd.process_events(0);
-                self.unsettled = None;
-            }
-        }
-    }
-
-    /// Milliseconds until `tick` has work, for the poll timeout.
-    pub fn next_tick_ms(&self) -> Option<i32> {
-        self.unsettled.map(|_| self.refresh.settle_after.saturating_sub(self.last_update.elapsed()).as_millis() as i32 + 1)
     }
 }
 
@@ -161,7 +148,7 @@ mod tests {
         let fb = ImageInfo { pixels: px.as_mut_ptr().cast(), width: 8, height: 4, stride: 8 * 4, format: crate::epd::FORMAT_RGB32 };
         let mut d = Decoder::new();
         let r = Rect { x: 2, y: 1, w: w as i32, h: h as i32 };
-        assert_eq!(d.write(&fb, r, &lz4), Ok(r));
+        assert_eq!(d.write(&fb, r, 0, &lz4), Ok(r));
         for y in 0..h {
             for x in 0..w {
                 let g = gray4::gray(levels[y * w + x]) as u32;
@@ -171,7 +158,21 @@ mod tests {
             assert_eq!(px[(y + 1) * 8 + 2 + w], 0);
         }
         let wrong = Rect { w: 4, ..r };
-        assert!(d.write(&fb, wrong, &lz4).is_err());
-        assert!(d.write(&fb, r, &[1, 2]).is_err());
+        assert!(d.write(&fb, wrong, 0, &lz4).is_err());
+        assert!(d.write(&fb, r, 0, &[1, 2]).is_err());
+    }
+
+    #[test]
+    fn decoder_expands_one_bit_updates() {
+        let (w, h) = (10usize, 2usize);
+        let levels: Vec<u8> = (0..w * h).map(|i| if i % 3 == 0 { 15 } else { 0 }).collect();
+        let lz4 = lz4_flex::block::compress_prepend_size(&bits1::pack(&levels, w, 0, 0, w, h));
+        let mut px = vec![0u32; w * h];
+        let fb = ImageInfo { pixels: px.as_mut_ptr().cast(), width: w as i32, height: h as i32, stride: w as i32 * 4, format: crate::epd::FORMAT_RGB32 };
+        let r = Rect { x: 0, y: 0, w: w as i32, h: h as i32 };
+        assert_eq!(Decoder::new().write(&fb, r, RECT_BITS1, &lz4), Ok(r));
+        for i in 0..w * h {
+            assert_eq!(px[i], if levels[i] > 7 { 0xffff_ffff } else { 0xff00_0000 });
+        }
     }
 }

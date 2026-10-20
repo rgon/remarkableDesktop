@@ -9,6 +9,7 @@ mod keymap;
 mod mapping;
 mod outputs;
 mod stats;
+mod tiles;
 mod stream;
 mod udp;
 mod uinput;
@@ -49,11 +50,13 @@ struct Args {
     display: bool,
     /// Offer the pen over UDP when on Wi-Fi.
     udp: bool,
+    /// How long a screen area must be still before it gets a quality refresh.
+    settle_ms: u64,
     run_args: Vec<String>,
 }
 
 fn parse() -> Result<Args, String> {
-    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remdesktop".into(), deploy: None, stats: false, display: true, udp: true, run_args: vec![] };
+    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remdesktop".into(), deploy: None, stats: false, display: true, udp: true, settle_ms: 1000, run_args: vec![] };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value\n{USAGE}"));
@@ -64,6 +67,7 @@ fn parse() -> Result<Args, String> {
             "--stats" => a.stats = true,
             "--no-display" => a.display = false,
             "--no-udp" => a.udp = false,
+            "--settle-ms" => a.settle_ms = value()?.parse().map_err(|_| "--settle-ms: a number")?,
             "--capture-test" => {
                 // remdesktop-host --capture-test virtual|<connector> <out.pgm>
                 let src = value()?;
@@ -90,7 +94,7 @@ fn parse() -> Result<Args, String> {
                 }
                 std::process::exit(0);
             }
-            "--rotate" | "--touch" | "--pen" | "--palm-major" | "--pen-grace-ms" | "--palm-rest-ms" | "--fast-mode" | "--settle-mode" | "--settle-ms" => {
+            "--rotate" | "--touch" | "--pen" | "--palm-major" | "--pen-grace-ms" | "--palm-rest-ms" | "--fast-mode" | "--settle-mode" => {
                 let v = value()?;
                 a.run_args.extend([flag, v]);
             }
@@ -693,7 +697,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
                 }
                 if args.display {
                     let w = writer.clone();
-                    let s = stream::Streamer::start(logical, rotation, args.stats, Box::new(move |m| send(&w, m)));
+                    let s = stream::Streamer::start(logical, rotation, args.stats, Duration::from_millis(args.settle_ms), Box::new(move |m| send(&w, m)));
                     if initial == 0 {
                         s.set_source(Some(capture::Source::Virtual), mapping::FULL);
                     }

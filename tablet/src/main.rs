@@ -44,7 +44,7 @@ const USAGE: &str = "usage:
   remdesktop hid-restore       Remove our USB HID function from the gadget.
 options: [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
          [--palm-major N] [--pen-grace-ms N] [--palm-rest-ms N] [--log-touch] [--no-usb]
-         [--fast-mode M] [--settle-mode M] [--settle-ms N]
+         [--fast-mode M] [--settle-mode M]
          (modes: pen, mono, animation, ui, content)";
 
 fn main() {
@@ -105,9 +105,6 @@ fn parse_run(args: &[String]) -> Result<daemon::Args, String> {
             }
             "--fast-mode" => refresh.fast = Mode::parse(&value()?).ok_or("--fast-mode: unknown mode")?,
             "--settle-mode" => refresh.settle = Mode::parse(&value()?).ok_or("--settle-mode: unknown mode")?,
-            "--settle-ms" => {
-                refresh.settle_after = Duration::from_millis(value()?.parse().map_err(|_| "--settle-ms: a number")?)
-            }
             "--palm-major" => palm.max_major = value()?.parse().map_err(|_| "--palm-major: a number")?,
             "--pen-grace-ms" => palm.pen_grace_us = value()?.parse::<u64>().map_err(|_| "--pen-grace-ms: a number")? * 1000,
             "--palm-rest-ms" => palm.rest_us = value()?.parse::<u64>().map_err(|_| "--palm-rest-ms: a number")? * 1000,

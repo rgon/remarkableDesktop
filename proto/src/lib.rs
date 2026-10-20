@@ -14,7 +14,7 @@ pub use pen::{PEN_DEVICE, PenState};
 pub use sync::{Datagram, Snapshot};
 pub use touch::{TOUCH_DEVICE, TouchState};
 
-pub const VERSION: u16 = 11;
+pub const VERSION: u16 = 12;
 
 /// What the tablet's panel shows of the host's screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -86,9 +86,10 @@ pub enum Msg {
     /// Host → tablet: new pixels for a rectangle of the panel, in panel
     /// (portrait) coordinates. `data` is LZ4 (size-prepended block) of
     /// 4-bit gray, two pixels per byte (high nibble first), rows padded to
-    /// whole bytes.
-    Rect { id: u32, x: u16, y: u16, w: u16, h: u16, data: Vec<u8> },
-    /// Tablet → host: `Rect` `id` is on its way to the panel; send the next.
+    /// whole bytes. `flags` is a mix of the `RECT_*` constants.
+    Rect { id: u32, x: u16, y: u16, w: u16, h: u16, flags: u8, data: Vec<u8> },
+    /// Tablet → host: the `Rect` `id` that had `RECT_LAST` is on its way to
+    /// the panel; send the next update.
     Ack { id: u32 },
     /// Host → tablet: coordinate correction for a device's USB HID reports
     /// (the host corrects uinput input itself). Fractions of the device
@@ -127,6 +128,15 @@ pub enum Msg {
     /// The same for the touch screen: a change in which contacts are down.
     TouchState { seq: u32, time_us: u64, state: TouchState },
 }
+
+/// `Rect` flag: refresh with the quality (settle) mode, clearing the fast
+/// mode's ghosting; without it the fast mode is used.
+pub const RECT_SETTLE: u8 = 1;
+/// `Rect` flag: `data` is 1 bit per pixel (set = white), 8 pixels per byte,
+/// high bit first, rows padded to whole bytes, instead of 4-bit gray.
+pub const RECT_BITS1: u8 = 2;
+/// `Rect` flag: the last rectangle of an update; only this one is acked.
+pub const RECT_LAST: u8 = 4;
 
 const HELLO: u8 = 1;
 const DEVICE: u8 = 2;
@@ -219,11 +229,12 @@ impl Msg {
                 p.push(*index);
                 TARGET
             }
-            Msg::Rect { id, x, y, w, h, data } => {
+            Msg::Rect { id, x, y, w, h, flags, data } => {
                 p.extend_from_slice(&id.to_le_bytes());
                 for v in [x, y, w, h] {
                     p.extend_from_slice(&v.to_le_bytes());
                 }
+                p.push(*flags);
                 p.extend_from_slice(data);
                 RECT
             }
@@ -339,7 +350,8 @@ impl Msg {
             TARGET => Msg::Target { index: c.u8()? },
             RECT => {
                 let (id, x, y, w, h) = (c.u32()?, c.u16()?, c.u16()?, c.u16()?, c.u16()?);
-                Msg::Rect { id, x, y, w, h, data: c.take(len - c.at)?.to_vec() }
+                let flags = c.u8()?;
+                Msg::Rect { id, x, y, w, h, flags, data: c.take(len - c.at)?.to_vec() }
             }
             ACK => Msg::Ack { id: c.u32()? },
             MAPPING => {
@@ -438,6 +450,29 @@ pub mod gray4 {
     }
 }
 
+/// Black and white, one bit per pixel (set = white), for updates that have
+/// no grays (the edge view).
+pub mod bits1 {
+    pub fn row_bytes(w: usize) -> usize {
+        w.div_ceil(8)
+    }
+
+    /// Packs the `w`×`h` window at (`x`, `y`) of a one-level-per-byte image
+    /// (gray4 levels) with row length `stride`; levels above 7 are white.
+    pub fn pack(levels: &[u8], stride: usize, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+        let rb = row_bytes(w);
+        let mut out = vec![0u8; rb * h];
+        for r in 0..h {
+            let src = &levels[(y + r) * stride + x..][..w];
+            let dst = &mut out[r * rb..][..rb];
+            for (i, &l) in src.iter().enumerate() {
+                dst[i / 8] |= ((l > 7) as u8) << (7 - i % 8);
+            }
+        }
+        out
+    }
+}
+
 /// Microseconds on this machine's CLOCK_MONOTONIC (the clock evdev
 /// timestamps use once set with EVIOCSCLOCKID).
 pub fn monotonic_us() -> u64 {
@@ -525,6 +560,15 @@ mod tests {
     }
 
     #[test]
+    fn bits1_packs_msb_first_and_pads_rows() {
+        // 10 wide so each row needs two bytes; levels > 7 are white.
+        let levels: Vec<u8> = (0..20).map(|i| if i % 3 == 0 { 15 } else { 0 }).collect();
+        let packed = bits1::pack(&levels, 10, 0, 0, 10, 2);
+        assert_eq!(packed, vec![0b1001_0010, 0b0100_0000, 0b0010_0100, 0b1000_0000]);
+        assert_eq!(bits1::row_bytes(10), 2);
+    }
+
+    #[test]
     fn round_trip() {
         let msgs = vec![
             Msg::Hello { version: VERSION, width: 1872, height: 1404, rotation: 90, view: "2".into() },
@@ -554,7 +598,7 @@ mod tests {
             Msg::Direct { addr: "10.11.99.1".into(), port: 4242, token: [9; 16] },
             Msg::Screens { names: vec!["DP-6".into(), "HDMI-2".into()] },
             Msg::Target { index: 2 },
-            Msg::Rect { id: 3, x: 8, y: 16, w: 3, h: 2, data: vec![1, 2, 3] },
+            Msg::Rect { id: 3, x: 8, y: 16, w: 3, h: 2, flags: RECT_SETTLE | RECT_LAST, data: vec![1, 2, 3] },
             Msg::Ack { id: 3 },
             Msg::Mapping { device: 1, shown: [0, 65535, 100, 65000], to: [1, 2, 3, 4] },
             Msg::Status { usb_hid: true, pen_mouse: false, touchpad: true },

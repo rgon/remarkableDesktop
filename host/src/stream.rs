@@ -1,10 +1,14 @@
-//! Streams a captured screen to the tablet: only the changed rectangle of
-//! the newest frame, and only once the tablet acknowledged the previous one,
-//! so no queue (and no latency) builds up on the slow e-ink side.
+//! Streams a captured screen to the tablet: only the changed tiles of the
+//! newest frame (as a few rectangles, smallest first), and only once the
+//! tablet acknowledged the previous update, so no queue (and no latency)
+//! builds up on the slow e-ink side. Tiles that then stay still are sent
+//! again for the tablet's quality refresh, which clears the fast mode's
+//! ghosting; the host decides which tiles and when, as it knows what changed.
 
 use crate::capture::{Capture, Source};
 use crate::edges;
-use remdesktop_proto::{DisplayMode, Msg, gray4};
+use crate::tiles::{self, Grid};
+use remdesktop_proto::{DisplayMode, Msg, RECT_BITS1, RECT_LAST, RECT_SETTLE, bits1, gray4};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,8 +25,9 @@ struct Shared {
     mode: DisplayMode,
     /// Newest frame as gray levels, the epoch it belongs to (it changes with
     /// the source and the mode, and the next update is then a whole frame),
-    /// and when it was read from the capture pipeline.
-    frame: Option<(u64, Vec<u8>, Instant)>,
+    /// when it was read from the capture pipeline, and the mode it was
+    /// rendered for.
+    frame: Option<(u64, Vec<u8>, Instant, DisplayMode)>,
     fresh: bool,
     acked: bool,
     /// Set when a capture (re)started; carries the virtual monitor's name.
@@ -72,27 +77,6 @@ pub struct Streamer {
 
 pub type Send = Box<dyn FnMut(&Msg) -> std::io::Result<()> + std::marker::Send>;
 
-/// Bounding box of differences between two same-sized images, as
-/// (x, y, w, h), or None if identical.
-fn changed(a: &[u8], b: &[u8], w: usize, h: usize) -> Option<(usize, usize, usize, usize)> {
-    let rows: Vec<usize> = (0..h).filter(|&r| a[r * w..][..w] != b[r * w..][..w]).collect();
-    let (&y0, &y1) = (rows.first()?, rows.last()?);
-    let (mut x0, mut x1) = (w, 0);
-    for &r in &rows {
-        let (ra, rb) = (&a[r * w..][..w], &b[r * w..][..w]);
-        if let Some(i) = (0..x0).find(|&i| ra[i] != rb[i]) {
-            x0 = i;
-        }
-        if let Some(i) = (x1..w).rev().find(|&i| ra[i] != rb[i]) {
-            x1 = i;
-        }
-    }
-    // Even x and width: whole bytes in the 4-bit packing.
-    let x0 = x0 & !1;
-    let x1 = (x1 + 2).min(w) & !1;
-    Some((x0, y0, x1.max(x0 + 2).min(w) - x0, y1 + 1 - y0))
-}
-
 /// Paints the letterbox bars white (GStreamer pads with black). Only rows
 /// and columns that are entirely black and within the expected bar size
 /// (plus rounding slack) are touched, so dark content is left alone.
@@ -128,7 +112,7 @@ fn whiten_bars(frame: &mut [u8], logical: (u32, u32), rotation: u16, shown: [f64
 impl Streamer {
     /// `logical` is the tablet's screen as the user sees it; frames are
     /// produced in panel portrait for `rotation`.
-    pub fn start(logical: (u32, u32), rotation: u16, stats: bool, mut send: Send) -> Streamer {
+    pub fn start(logical: (u32, u32), rotation: u16, stats: bool, settle_after: Duration, mut send: Send) -> Streamer {
         let stats = stats.then(DisplayStats::default);
         let shared = Arc::new((Mutex::new(Shared { acked: true, stats, ..Default::default() }), Condvar::new()));
 
@@ -202,7 +186,7 @@ impl Streamer {
                         _ => raw.iter().map(|&v| gray4::level(v)).collect(),
                     };
                     let mut s = lock.lock().unwrap();
-                    s.frame = Some((epoch, levels, captured_at));
+                    s.frame = Some((epoch, levels, captured_at, mode));
                     s.fresh = true;
                     cv.notify_all();
                 }
@@ -214,50 +198,117 @@ impl Streamer {
             let (lock, cv) = &*send_shared;
             let (pw, ph) = if rotation % 180 == 90 { (logical.1, logical.0) } else { logical };
             let (w, h) = (pw as usize, ph as usize);
+            let grid = Grid::new(w, h);
             let mut last: Option<(u64, Vec<u8>)> = None;
+            // When each tile last changed, until it got its quality refresh.
+            let mut unsettled: Vec<Option<Instant>> = vec![None; grid.tiles()];
             let mut id = 0u32;
-            loop {
-                let (generation, frame, captured) = {
-                    let mut s = lock.lock().unwrap();
-                    while !(s.stop || (s.fresh && s.acked)) {
-                        s = cv.wait(s).unwrap();
-                    }
-                    if s.stop {
-                        return;
-                    }
-                    s.fresh = false;
-                    if s.mode == DisplayMode::None {
-                        // Nothing is sent; whatever comes after starts from a whole frame.
-                        last = None;
-                        continue;
-                    }
-                    s.frame.clone().unwrap()
-                };
-                if frame.len() != w * h {
-                    continue;
-                }
-                // A new source starts from a full frame.
-                let rect = match &last {
-                    Some((g, prev)) if *g == generation => changed(prev, &frame, w, h),
-                    _ => Some((0, 0, w, h)),
-                };
-                let Some((x, y, rw, rh)) = rect else { continue };
-                let packed = gray4::pack(&frame, w, x, y, rw, rh);
-                let data = lz4_flex::block::compress_prepend_size(&packed);
-                id = id.wrapping_add(1);
+            // Sends the rectangles of one update, smallest first (so a pen or
+            // cursor reaches the panel before bulk changes); the last one is
+            // acked. `captured` is when the frame was read, for the latency
+            // stats (None: not reported). False if the link broke.
+            let mut send_rects = |rects: &[tiles::Rect], frame: &[u8], mode: DisplayMode, flags: u8, captured: Option<Instant>| -> bool {
+                let (mut pixels, mut bytes) = (0, 0);
+                let msgs: Vec<Msg> = rects
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(x, y, rw, rh))| {
+                        let (flags, packed) = if mode == DisplayMode::Edge {
+                            (flags | RECT_BITS1, bits1::pack(frame, w, x, y, rw, rh))
+                        } else {
+                            (flags, gray4::pack(frame, w, x, y, rw, rh))
+                        };
+                        let flags = if i + 1 == rects.len() { flags | RECT_LAST } else { flags };
+                        let data = lz4_flex::block::compress_prepend_size(&packed);
+                        id = id.wrapping_add(1);
+                        pixels += rw * rh;
+                        bytes += data.len();
+                        Msg::Rect { id, x: x as u16, y: y as u16, w: rw as u16, h: rh as u16, flags, data }
+                    })
+                    .collect();
                 {
                     let mut s = lock.lock().unwrap();
                     s.acked = false;
-                    s.in_flight = Some((id, captured, data.len()));
-                    if let Some(st) = &mut s.stats {
-                        st.pixels += rw * rh;
+                    s.in_flight = captured.map(|c| (id, c, bytes));
+                    if let (Some(st), Some(_)) = (&mut s.stats, captured) {
+                        st.pixels += pixels;
                     }
                 }
-                let msg = Msg::Rect { id, x: x as u16, y: y as u16, w: rw as u16, h: rh as u16, data };
-                if send(&msg).is_err() {
-                    return;
+                msgs.iter().all(|m| send(m).is_ok())
+            };
+            loop {
+                let settle_at = unsettled.iter().flatten().min().map(|t| *t + settle_after);
+                enum Work {
+                    Frame((u64, Vec<u8>, Instant, DisplayMode)),
+                    Settle,
                 }
-                last = Some((generation, frame));
+                let work = {
+                    let mut s = lock.lock().unwrap();
+                    loop {
+                        if s.stop {
+                            return;
+                        }
+                        if s.fresh && s.acked {
+                            s.fresh = false;
+                            if s.mode == DisplayMode::None {
+                                // Nothing is sent; whatever comes after starts from a whole frame.
+                                last = None;
+                                unsettled.fill(None);
+                                continue;
+                            }
+                            break Work::Frame(s.frame.clone().unwrap());
+                        }
+                        let now = Instant::now();
+                        match settle_at {
+                            Some(t) if s.acked && now >= t => break Work::Settle,
+                            Some(t) if s.acked => s = cv.wait_timeout(s, t - now).unwrap().0,
+                            _ => s = cv.wait(s).unwrap(),
+                        }
+                    }
+                };
+                match work {
+                    Work::Frame((generation, frame, captured, mode)) => {
+                        if frame.len() != w * h {
+                            continue;
+                        }
+                        // A new source starts from a full frame.
+                        let dirty = match &last {
+                            Some((g, prev)) if *g == generation => grid.dirty(prev, &frame),
+                            _ => vec![true; grid.tiles()],
+                        };
+                        let rects = if dirty.iter().all(|&d| d) { vec![(0, 0, w, h)] } else { grid.rects(&dirty) };
+                        if rects.is_empty() {
+                            continue;
+                        }
+                        if !send_rects(&rects, &frame, mode, 0, Some(captured)) {
+                            return;
+                        }
+                        let now = Instant::now();
+                        for (t, _) in dirty.iter().enumerate().filter(|(_, d)| **d) {
+                            unsettled[t] = Some(now);
+                        }
+                        last = Some((generation, frame));
+                    }
+                    Work::Settle => {
+                        let Some((_, frame)) = &last else {
+                            unsettled.fill(None);
+                            continue;
+                        };
+                        let now = Instant::now();
+                        let due: Vec<bool> = unsettled.iter().map(|t| t.is_some_and(|t| now >= t + settle_after)).collect();
+                        let mode = lock.lock().unwrap().mode;
+                        if mode == DisplayMode::None {
+                            continue;
+                        }
+                        let rects = grid.rects(&due);
+                        if !send_rects(&rects, frame, mode, RECT_SETTLE, None) {
+                            return;
+                        }
+                        for (t, _) in due.iter().enumerate().filter(|(_, d)| **d) {
+                            unsettled[t] = None;
+                        }
+                    }
+                }
             }
         });
         Streamer { shared, threads: vec![capture, sender] }
@@ -319,8 +370,6 @@ impl Drop for Streamer {
 
 #[cfg(test)]
 mod tests {
-    use super::changed;
-
     #[test]
     fn whitens_only_black_bars() {
         // 4x6 portrait panel, logical 6x4 rotated 90°, picture letterboxed
@@ -331,15 +380,5 @@ mod tests {
         assert!(f[..2 * 4].iter().all(|&v| v == 255));
         assert!(f[4 * 4..].iter().all(|&v| v == 255));
         assert!(f[2 * 4..4 * 4].iter().all(|&v| v == 100));
-    }
-
-    #[test]
-    fn bounding_box_of_changes() {
-        let a = vec![0u8; 8 * 4];
-        let mut b = a.clone();
-        b[1 * 8 + 3] = 5;
-        b[2 * 8 + 5] = 5;
-        assert_eq!(changed(&a, &b, 8, 4), Some((2, 1, 4, 2)));
-        assert_eq!(changed(&a, &a, 8, 4), None);
     }
 }

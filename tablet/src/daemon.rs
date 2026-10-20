@@ -298,9 +298,6 @@ pub fn run(args: Args) -> Result<(), String> {
         fds.push(server.udp_fd());
         let mut pfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
         let mut timeout = if hold.is_some() { 30 } else { IDLE_WAKE.as_millis() as i32 };
-        if let Some(t) = display.next_tick_ms() {
-            timeout = timeout.min(t);
-        }
         if let Some(t) = host.as_ref().and_then(|h| h.udp.as_ref()).and_then(|u| u.next_in_ms()) {
             timeout = timeout.min(t);
         }
@@ -514,10 +511,13 @@ pub fn run(args: Args) -> Result<(), String> {
                         }
                     }
                     Incoming::Msg(_) => {}
-                    Incoming::Decoded { id, rect } => {
+                    Incoming::Decoded { id, flags, rect } => {
                         // Ack first: the host prepares the next update while we refresh.
-                        h.send(&Msg::Ack { id });
-                        h.flush();
+                        // Only the last rectangle of an update is acked.
+                        if flags & remdesktop_proto::RECT_LAST != 0 {
+                            h.send(&Msg::Ack { id });
+                            h.flush();
+                        }
                         match rect {
                             // An update that was already on its way when the screen was switched off.
                             Ok(_) if state.display == DisplayMode::None => {
@@ -526,7 +526,7 @@ pub fn run(args: Args) -> Result<(), String> {
                             }
                             Ok(r) => {
                                 ui.redraw_overlays_in(r);
-                                display.show(&epd, r);
+                                display.show(&epd, r, flags);
                                 ink.overwritten(&epd.fb, r);
                             }
                             Err(e) => log!("remdesktop: {e}"),
@@ -780,7 +780,6 @@ pub fn run(args: Args) -> Result<(), String> {
             }
             (None, None) => {}
         }
-        display.tick(&epd);
         epd.process_events(0);
     }
 
