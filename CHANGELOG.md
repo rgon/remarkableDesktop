@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.6](https://github.com/rgon/remarkableDesktop/compare/v0.11.5...v0.11.6) (2026-10-20)
+
+
+### Features
+
+* fill dark pixels in edge mode with a GPU threshold ([0705807](https://github.com/rgon/remarkableDesktop/commit/0705807ba0185f6974290fd8cd3b8c3c62f475c8))
+* fill enclosed dark regions in edge mode ([eabfe52](https://github.com/rgon/remarkableDesktop/commit/eabfe5291907c0f00c09d2a2775297f22af953e6))
+* find the changed tiles of edge frames on the GPU ([1543de8](https://github.com/rgon/remarkableDesktop/commit/1543de8c0d6bef41d9013f028a35229600063a75))
+* run edge detection on the GPU through Vulkan with a CPU fallback ([d2feec5](https://github.com/rgon/remarkableDesktop/commit/d2feec5b5c33060a547f58d6231a250cecd88b6f))
+
+
+### Performance Improvements
+
+* pack edge frames to bits on the GPU and send them without a 4-bit copy ([94d26f5](https://github.com/rgon/remarkableDesktop/commit/94d26f55cb2cfceb6c9060607e8502f6093afd69))
+* speed up edge mode and skip stale capture frames ([ce45777](https://github.com/rgon/remarkableDesktop/commit/ce45777a17f00bed5fba8cb6e5ddeca674c796c0))
+
 ## [0.11.5](https://github.com/rgon/remarkableDesktop/compare/v0.11.4...v0.11.5) (2026-10-20)
 
 
