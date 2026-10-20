@@ -30,28 +30,16 @@ impl Grid {
         self.cols * self.rows
     }
 
-    /// The tiles where two same-sized images differ.
-    pub fn dirty(&self, a: &[u8], b: &[u8]) -> Vec<bool> {
+    /// The tiles where two same-sized images differ. The images have
+    /// `per_byte` pixels to a byte (1, 2 or 8) with rows padded to bytes;
+    /// tiles start on byte boundaries, as `TILE` is a multiple of 8.
+    pub fn dirty_packed(&self, a: &[u8], b: &[u8], per_byte: usize) -> Vec<bool> {
+        let rb = self.w.div_ceil(per_byte);
         let mut out = vec![false; self.tiles()];
         for ty in 0..self.rows {
             let (y0, y1) = (ty * TILE, ((ty + 1) * TILE).min(self.h));
             for tx in 0..self.cols {
-                let (x0, x1) = (tx * TILE, ((tx + 1) * TILE).min(self.w));
-                out[ty * self.cols + tx] = (y0..y1).any(|y| a[y * self.w + x0..y * self.w + x1] != b[y * self.w + x0..y * self.w + x1]);
-            }
-        }
-        out
-    }
-
-    /// The same for two images of one bit per pixel, rows padded to bytes
-    /// (tiles start on byte boundaries, as `TILE` is a multiple of 8).
-    pub fn dirty_bits(&self, a: &[u8], b: &[u8]) -> Vec<bool> {
-        let rb = self.w.div_ceil(8);
-        let mut out = vec![false; self.tiles()];
-        for ty in 0..self.rows {
-            let (y0, y1) = (ty * TILE, ((ty + 1) * TILE).min(self.h));
-            for tx in 0..self.cols {
-                let (x0, x1) = (tx * TILE / 8, (((tx + 1) * TILE).min(self.w)).div_ceil(8));
+                let (x0, x1) = (tx * TILE / per_byte, ((tx + 1) * TILE).min(self.w).div_ceil(per_byte));
                 out[ty * self.cols + tx] = (y0..y1).any(|y| a[y * rb + x0..y * rb + x1] != b[y * rb + x0..y * rb + x1]);
             }
         }
@@ -127,14 +115,27 @@ mod tests {
         let rb = w.div_ceil(8);
         let a = vec![0u8; rb * h];
         let mut b = a.clone();
-        assert!(g.dirty_bits(&a, &b).iter().all(|&d| !d));
+        assert!(g.dirty_packed(&a, &b, 8).iter().all(|&d| !d));
         // A pixel in the last column of the last tile of the second row of tiles.
         b[35 * rb + 8] ^= 0x80;
-        let d = g.dirty_bits(&a, &b);
+        let d = g.dirty_packed(&a, &b, 8);
         assert_eq!(d, vec![false, false, false, false, false, true]);
         // One in the middle tile of the first row.
         b[3 * rb + 5] ^= 1;
-        assert_eq!(g.dirty_bits(&a, &b), vec![false, true, false, false, false, true]);
+        assert_eq!(g.dirty_packed(&a, &b, 8), vec![false, true, false, false, false, true]);
+    }
+
+    #[test]
+    fn nibble_images_are_compared_per_tile_too() {
+        // 70 wide: 35 bytes a row, the last tile covering bytes 32..35.
+        let (w, h) = (70usize, 40usize);
+        let g = Grid::new(w, h);
+        let a = vec![0u8; 35 * h];
+        let mut b = a.clone();
+        b[35 * 34 + 34] = 0x10; // the last pixel's byte, in the second row of tiles
+        assert_eq!(g.dirty_packed(&a, &b, 2), vec![false, false, false, false, false, true]);
+        b[2 * 35 + 16] = 1; // the second tile's first byte (pixel 32)
+        assert_eq!(g.dirty_packed(&a, &b, 2), vec![false, true, false, false, false, true]);
     }
 
     #[test]
@@ -143,9 +144,9 @@ mod tests {
         assert_eq!((g.cols, g.rows), (4, 3));
         let a = vec![0u8; 100 * 70];
         let mut b = a.clone();
-        assert!(g.dirty(&a, &b).iter().all(|&d| !d));
+        assert!(g.dirty_packed(&a, &b, 1).iter().all(|&d| !d));
         b[40 * 100 + 99] = 1; // last column, second row of tiles
-        let d = g.dirty(&a, &b);
+        let d = g.dirty_packed(&a, &b, 1);
         assert_eq!(d.iter().filter(|&&d| d).count(), 1);
         assert!(d[4 + 3]);
     }
