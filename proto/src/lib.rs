@@ -7,7 +7,14 @@
 
 use std::io::{self, Read, Write};
 
-pub const VERSION: u16 = 9;
+pub mod pen;
+pub mod sync;
+pub mod touch;
+pub use pen::{PEN_DEVICE, PenState};
+pub use sync::{Datagram, Snapshot};
+pub use touch::{TOUCH_DEVICE, TouchState};
+
+pub const VERSION: u16 = 11;
 
 /// What the tablet's panel shows of the host's screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -108,6 +115,17 @@ pub enum Msg {
     Display { mode: DisplayMode },
     /// The tablet is exiting on purpose (X button held, power button).
     Bye,
+    /// Tablet → host, for hosts on Wi-Fi: the pen can also go over UDP to
+    /// this port (see `pen`); `key` goes in every datagram.
+    UdpOffer { port: u16, key: u32 },
+    /// Host → tablet: a probe was answered, so datagrams get through; the
+    /// pen now goes over UDP.
+    UdpReady,
+    /// Tablet → host: a pen snapshot whose buttons, tool or contact changed,
+    /// for the host to apply if the datagrams never delivered it.
+    PenState { seq: u32, time_us: u64, state: PenState },
+    /// The same for the touch screen: a change in which contacts are down.
+    TouchState { seq: u32, time_us: u64, state: TouchState },
 }
 
 const HELLO: u8 = 1;
@@ -128,10 +146,17 @@ const REMOTE_OK: u8 = 15;
 const GO_REMOTE: u8 = 16;
 const KEYS: u8 = 17;
 const DISPLAY: u8 = 18;
+const UDP_OFFER: u8 = 19;
+const UDP_READY: u8 = 20;
+const PEN_STATE: u8 = 21;
+const TOUCH_STATE: u8 = 22;
 
 impl Msg {
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
-        let mut p = Vec::new();
+        // Tag and length are reserved up front so the message leaves in one
+        // write: on an unbuffered socket (NODELAY) three writes are three
+        // packets, each costing Wi-Fi airtime.
+        let mut p = vec![0u8; 5];
         let tag = match self {
             Msg::Hello { version, width, height, rotation, view } => {
                 for v in [version, width, height, rotation] {
@@ -238,9 +263,28 @@ impl Msg {
                 p.push(*mode as u8);
                 DISPLAY
             }
+            Msg::UdpOffer { port, key } => {
+                p.extend_from_slice(&port.to_le_bytes());
+                p.extend_from_slice(&key.to_le_bytes());
+                UDP_OFFER
+            }
+            Msg::UdpReady => UDP_READY,
+            Msg::PenState { seq, time_us, state } => {
+                p.extend_from_slice(&seq.to_le_bytes());
+                p.extend_from_slice(&time_us.to_le_bytes());
+                state.put(&mut p);
+                PEN_STATE
+            }
+            Msg::TouchState { seq, time_us, state } => {
+                p.extend_from_slice(&seq.to_le_bytes());
+                p.extend_from_slice(&time_us.to_le_bytes());
+                state.put(&mut p);
+                TOUCH_STATE
+            }
         };
-        w.write_all(&[tag])?;
-        w.write_all(&(p.len() as u32).to_le_bytes())?;
+        p[0] = tag;
+        let len = (p.len() - 5) as u32;
+        p[1..5].copy_from_slice(&len.to_le_bytes());
         w.write_all(&p)
     }
 
@@ -317,6 +361,18 @@ impl Msg {
             DISPLAY => Msg::Display {
                 mode: *DisplayMode::ALL.get(c.u8()? as usize).ok_or_else(|| bad("unknown display mode"))?,
             },
+            UDP_OFFER => Msg::UdpOffer { port: c.u16()?, key: c.u32()? },
+            UDP_READY => Msg::UdpReady,
+            PEN_STATE => Msg::PenState {
+                seq: c.u32()?,
+                time_us: c.u64()?,
+                state: PenState::get(c.take(PenState::SIZE)?).ok_or_else(|| bad("short pen state"))?,
+            },
+            TOUCH_STATE => Msg::TouchState {
+                seq: c.u32()?,
+                time_us: c.u64()?,
+                state: TouchState::get(c.take(len - c.at)?).ok_or_else(|| bad("short touch state"))?.0,
+            },
             t => return Err(bad(&format!("unknown message tag {t}"))),
         };
         Ok(Some(msg))
@@ -390,6 +446,26 @@ pub fn monotonic_us() -> u64 {
     ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
+/// Latency tuning for the session socket (both ends): no Nagle, no delayed
+/// ACKs, and the highest priority class Linux lets unprivileged code ask for
+/// (DSCP EF plus socket priority 6), which Wi-Fi maps to its voice queue
+/// instead of best effort. Best effort: failures are ignored.
+pub fn tune_socket(fd: std::os::fd::RawFd) {
+    set_option(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+    set_option(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1);
+    prioritize(fd);
+}
+
+/// The priority half of `tune_socket`, for UDP sockets too.
+pub fn prioritize(fd: std::os::fd::RawFd) {
+    set_option(fd, libc::IPPROTO_IP, libc::IP_TOS, 0xb8);
+    set_option(fd, libc::SOL_SOCKET, libc::SO_PRIORITY, 6);
+}
+
+fn set_option(fd: i32, level: i32, name: i32, value: i32) {
+    unsafe { libc::setsockopt(fd, level, name, &value as *const i32 as *const libc::c_void, 4) };
+}
+
 fn put_str(p: &mut Vec<u8>, s: &str) {
     p.extend_from_slice(&(s.len() as u16).to_le_bytes());
     p.extend_from_slice(s.as_bytes());
@@ -460,6 +536,19 @@ mod tests {
                 abs: vec![Abs { code: 0, min: 0, max: 20967, resolution: 100 }],
             }),
             Msg::Frame { device: 1, time_us: 123_456_789, events: vec![Event { kind: 3, code: 0, value: -5 }] },
+            Msg::UdpOffer { port: 40000, key: 0xdead_beef },
+            Msg::UdpReady,
+            Msg::TouchState {
+                seq: 4,
+                time_us: 8,
+                state: {
+                    let mut t = TouchState::default();
+                    t.slots[3] = Some(touch::Contact { id: 7, x: 1, y: -2, pressure: 3, major: 4, minor: 5 });
+                    t.edges = 2;
+                    t
+                },
+            },
+            Msg::PenState { seq: 9, time_us: 77, state: PenState { flags: 5, x: -1, y: 2, pressure: 3, distance: -4, tilt: [5, -6], edges: 11 } },
             Msg::Ping { host_us: 42 },
             Msg::Pong { host_us: 42, tablet_us: 7 },
             Msg::Direct { addr: "10.11.99.1".into(), port: 4242, token: [9; 16] },

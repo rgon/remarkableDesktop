@@ -46,8 +46,8 @@ const INPUT_PROP_DIRECT: u32 = 1;
 /// Physical size of the rM2 panel in portrait, in mm.
 const PANEL_MM: [f32; 2] = [157.8, 210.4];
 
-pub const PEN_ID: u8 = 1;
-pub const TOUCH_ID: u8 = 2;
+pub const PEN_ID: u8 = remdesktop_proto::PEN_DEVICE;
+pub const TOUCH_ID: u8 = remdesktop_proto::TOUCH_DEVICE;
 pub const KEYS_ID: u8 = 3;
 
 /// Linux key codes for the shortcut buttons.
@@ -426,7 +426,7 @@ impl Default for PalmConfig {
 
 const MT_TOOL_PALM: i32 = 2;
 const ABS_MT_TOOL_TYPE: u16 = 0x37;
-const SLOTS: usize = 16;
+const SLOTS: usize = remdesktop_proto::touch::SLOTS;
 /// A contact that stays within this many mm of where it landed hasn't moved.
 const REST_SLOP_MM: i32 = 3;
 

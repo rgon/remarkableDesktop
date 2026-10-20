@@ -99,6 +99,57 @@ struct Host {
     /// Keys typing z and y in the host's keyboard layout. Undo/redo send
     /// Ctrl + these while known, else the dedicated Undo/Redo keys.
     keys: Option<(u16, u16)>,
+    /// Pen and touch over UDP, offered to hosts on Wi-Fi.
+    udp: Option<UdpPath>,
+}
+
+/// One host's UDP path for pen and touch: set up by the host's probe, used
+/// from its `UdpReady` on.
+struct UdpPath {
+    pen: remdesktop_proto::pen::PenTx,
+    touch: remdesktop_proto::touch::TouchTx,
+    /// Where the host's probe came from.
+    peer: Option<std::net::SocketAddr>,
+    ready: bool,
+}
+
+impl UdpPath {
+    fn new(key: u32) -> Self {
+        UdpPath { pen: remdesktop_proto::pen::PenTx::new(key), touch: remdesktop_proto::touch::TouchTx::new(key), peer: None, ready: false }
+    }
+
+    /// A frame of the pen or touch screen: the datagram to send and the
+    /// copy of its step for TCP, or None if it goes another way (it is then
+    /// only followed, so the first datagram is true).
+    fn route(&mut self, device: u8, usb_hid: bool, time_us: u64, events: &[Event]) -> Option<(std::net::SocketAddr, remdesktop_proto::sync::Packet)> {
+        let peer = self.peer.filter(|_| self.ready && !usb_hid);
+        let now = remdesktop_proto::monotonic_us();
+        match (device, peer) {
+            (input::PEN_ID, Some(p)) => Some((p, self.pen.frame(time_us, now, events))),
+            (input::TOUCH_ID, Some(p)) => Some((p, self.touch.frame(time_us, now, events))),
+            (input::PEN_ID, None) => {
+                self.pen.track(events);
+                None
+            }
+            (input::TOUCH_ID, None) => {
+                self.touch.track(events);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Datagrams of due repeats.
+    fn repeats(&mut self, usb_hid: bool) -> Vec<(std::net::SocketAddr, Vec<u8>)> {
+        let now = remdesktop_proto::monotonic_us();
+        let Some(peer) = self.peer.filter(|_| self.ready && !usb_hid) else { return vec![] };
+        [self.pen.tick(now), self.touch.tick(now)].into_iter().flatten().map(|d| (peer, d)).collect()
+    }
+
+    fn next_in_ms(&self) -> Option<i32> {
+        let now = remdesktop_proto::monotonic_us();
+        [self.pen.next_in_ms(now), self.touch.next_in_ms(now)].into_iter().flatten().min()
+    }
 }
 
 impl Host {
@@ -223,6 +274,7 @@ pub fn run(args: Args) -> Result<(), String> {
     let mut display = Display::new(refresh);
     let mut ink = Ink::new(state.ink);
     let mut host: Option<Host> = None;
+    let mut power_save = crate::link::PowerSave::default();
     let mut hid_was_up = false;
     // Last status sent to the host (usb hid, pen mouse, touchpad).
     let mut sent_status: Option<(bool, bool, bool)> = None;
@@ -243,9 +295,13 @@ pub fn run(args: Args) -> Result<(), String> {
         let mut fds = input_fds.clone();
         fds.push(server.fd());
         fds.push(host.as_ref().map_or(-1, |h| h.wake.as_raw_fd()));
+        fds.push(server.udp_fd());
         let mut pfds: Vec<libc::pollfd> = fds.iter().map(|&fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }).collect();
         let mut timeout = if hold.is_some() { 30 } else { IDLE_WAKE.as_millis() as i32 };
         if let Some(t) = display.next_tick_ms() {
+            timeout = timeout.min(t);
+        }
+        if let Some(t) = host.as_ref().and_then(|h| h.udp.as_ref()).and_then(|u| u.next_in_ms()) {
             timeout = timeout.min(t);
         }
         unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, timeout) };
@@ -280,11 +336,6 @@ pub fn run(args: Args) -> Result<(), String> {
                     frames.push((input::PEN_ID, t, e));
                 }
             }
-        }
-        // One refresh per wake-up, whatever number of pen frames arrived.
-        if let Some(r) = ink.take_pending() {
-            epd.swap(r.x, r.y, r.w, r.h, display.fast(), 0);
-            epd.process_events(0);
         }
         if let Some(touch) = touch.as_mut() {
             let now = remdesktop_proto::monotonic_us();
@@ -325,6 +376,13 @@ pub fn run(args: Args) -> Result<(), String> {
         }
         hid_was_up = hid_up;
         for (device, time_us, mut events) in frames {
+            if let Some((peer, packet)) = host.as_mut().and_then(|h| h.udp.as_mut()).and_then(|u| u.route(device, hid_up, time_us, &events)) {
+                server.udp_send(peer, &packet.datagram);
+                if let Some(h) = host.as_mut() {
+                    packet.edge.iter().for_each(|edge| h.send(edge));
+                }
+                continue;
+            }
             if let (true, Some(g), Some(r)) = (hid_up, gadget.as_ref(), ranges.as_ref()) {
                 let report = if device == input::PEN_ID {
                     mappings[0].apply(&mut events, r.pen, false);
@@ -345,6 +403,30 @@ pub fn run(args: Args) -> Result<(), String> {
             }
         }
 
+        // Repeats of the latest pen and touch states, and the hosts' probes.
+        for (peer, d) in host.as_mut().and_then(|h| h.udp.as_mut()).map(|u| u.repeats(hid_up)).unwrap_or_default() {
+            server.udp_send(peer, &d);
+        }
+        for (from, d) in server.udp_recv() {
+            use remdesktop_proto::Datagram;
+            if let (Some(h), Datagram::Probe { key }) = (host.as_mut(), d) {
+                if let Some(u) = h.udp.as_mut().filter(|u| u.pen.key() == key && from.ip() == h.link.peer) {
+                    u.peer = Some(from);
+                    server.udp_send(from, &Datagram::Ack { key }.encode());
+                }
+            }
+        }
+        // Input leaves before the panel is touched: the refresh call below
+        // can take a while.
+        if let Some(h) = host.as_mut() {
+            h.flush();
+        }
+        // One refresh per wake-up, whatever number of pen frames arrived.
+        if let Some(r) = ink.take_pending() {
+            epd.swap(r.x, r.y, r.w, r.h, display.fast(), 0);
+            epd.process_events(0);
+        }
+
         if let Some(f) = files[2].as_mut().filter(|_| pfds[2].revents != 0) {
             let power = input::read_events(f).unwrap_or_default();
             if power.iter().any(|e| e.kind == input::EV_KEY && e.code == input::KEY_POWER && e.value == 1) {
@@ -359,9 +441,16 @@ pub fn run(args: Args) -> Result<(), String> {
                 if let Some(old) = host.take() {
                     old.link.close();
                 }
+                // Wi-Fi power save adds tens of ms of jitter: off while a
+                // host is on Wi-Fi, back to what it was otherwise.
+                if crate::link::is_usb(link.peer) {
+                    power_save.restore();
+                } else {
+                    power_save.disable();
+                }
                 match link.spawn_reader(epd.fb) {
                     Ok((incoming, wake)) => {
-                        let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true, heard: Instant::now(), remote: None, keys: None };
+                        let mut h = Host { link, incoming, wake, declared: false, views: vec![], target: 0, alive: true, heard: Instant::now(), remote: None, keys: None, udp: None };
                         h.send(&Msg::Addresses { addrs: addresses.clone() });
                         h.send(&Msg::Hello {
                             version: remdesktop_proto::VERSION,
@@ -371,6 +460,12 @@ pub fn run(args: Args) -> Result<(), String> {
                             view: state.view.clone(),
                         });
                         h.send(&Msg::Display { mode: state.display });
+                        // Wi-Fi hosts get the pen over UDP if they can reach it.
+                        if !crate::link::is_usb(h.link.peer) {
+                            let key = crate::link::random_key();
+                            h.udp = Some(UdpPath::new(key));
+                            h.send(&Msg::UdpOffer { port: server.udp_port(), key });
+                        }
                         sent_status = None; // sent with the next wake-up
                         host = Some(h);
                     }
@@ -411,6 +506,12 @@ pub fn run(args: Args) -> Result<(), String> {
                         let f = |v: [u16; 4]| v.map(|x| x as f64 / 65535.0);
                         let i = if device == input::PEN_ID { 0 } else { 1 };
                         mappings[i] = Mapping { shown: f(shown), to: f(to) };
+                    }
+                    Incoming::Msg(Msg::UdpReady) => {
+                        if let Some(u) = h.udp.as_mut().filter(|u| u.peer.is_some()) {
+                            log!("remdesktop: pen and touch over UDP");
+                            u.ready = true;
+                        }
                     }
                     Incoming::Msg(_) => {}
                     Incoming::Decoded { id, rect } => {
@@ -461,6 +562,7 @@ pub fn run(args: Args) -> Result<(), String> {
         if host_gone {
             log!("remdesktop: host went away");
             host = None;
+            power_save.restore();
             ui.set_enabled(Button::Net, false);
             mappings = [Mapping::default(); 2];
             ui.set_label(Button::Undo, "UNDO");
@@ -693,6 +795,7 @@ pub fn run(args: Args) -> Result<(), String> {
         h.send(&Msg::Bye);
         h.flush();
     }
+    power_save.restore();
     drop(server);
     if gadget.is_some() {
         log!("remdesktop: removing the usb hid function");
