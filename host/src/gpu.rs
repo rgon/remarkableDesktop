@@ -1,6 +1,6 @@
 //! Edge detection's per-pixel stages (blur, Sobel, suppression, hysteresis,
 //! line placement) on the GPU through Vulkan, so a frame costs the CPU only
-//! a copy in, a copy out and the fill (see `edges.rs`, which also has the
+//! a copy in and a copy out (see `edges.rs`, which also has the
 //! CPU version of everything here). `libvulkan` is loaded at run time: where
 //! there is no Vulkan driver, `Gpu::new` fails and the CPU does the work.
 //!

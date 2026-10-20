@@ -96,9 +96,8 @@ logs to the journal.
   or with `REMDESKTOP_NO_GPU` set, it runs on the CPU. A weak edge chain
   longer than about 500 pixels is cut short on the GPU.
 - **Dark areas in edge mode:** every pixel darker than gray 100 is drawn
-  black (a threshold, on the GPU, so no CPU load). Dark regions with lighter
-  pixels inside come out speckled; `REMDESKTOP_EDGE_FILL=region` fills
-  enclosed dark regions instead, on the CPU, which costs more per frame.
+  black, on the GPU (or a cheap pass on the CPU fallback). Dark shapes with
+  lighter pixels inside come out speckled; there is no region fill.
 
 ## Input
 - **Monitor targeting:** pen and touchscreen are mapped through GNOME's

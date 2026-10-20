@@ -4,8 +4,7 @@
 //! Gaussian blur, Sobel gradient, non-maximum suppression, then hysteresis
 //! thresholding. The result is one-pixel black lines on white, drawn on the
 //! darker side of each edge, so outlines sit inside shapes instead of
-//! growing them. Enclosed regions that are dark in the original are then
-//! filled solid.
+//! growing them. Pixels that are dark in the original are then made black.
 
 /// Gradient magnitude (|gx| + |gy| of a Sobel over 0..=255 gray, so four
 /// times the step in brightness) from which an edge is certain.
@@ -13,18 +12,17 @@ const HIGH: i32 = 4 * 60;
 /// Gradient magnitude an edge may fade to while still joined to a certain one.
 const LOW: i32 = 4 * 24;
 
-/// Mean gray (0..=255) under which an enclosed region is filled black, and
-/// the gray under which the naive fill blackens a pixel.
+/// Gray (0..=255) under which a pixel is drawn black, outline or not.
 pub(crate) const DARK: u64 = 100;
 
 /// `gray` is `w`×`h`, one byte per pixel. Returns the same size: 0 on an
-/// edge, 255 elsewhere. (The CPU way with the region fill; the streamer
-/// goes through `Detector`.)
+/// edge or a dark pixel, 255 elsewhere. (The CPU way; the streamer goes
+/// through `Detector`.)
 #[cfg(test)]
 pub fn detect(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = outline(gray, w, h);
     if usable(gray, w, h) {
-        fill_dark(gray, &mut out, w, h);
+        threshold(gray, &mut out);
     }
     out
 }
@@ -37,19 +35,9 @@ fn usable(gray: &[u8], w: usize, h: usize) -> bool {
 /// otherwise. The frame size may change between calls.
 pub struct Detector {
     backend: Backend,
-    fill: Fill,
 }
 
-/// What turns dark areas solid.
-#[derive(Clone, Copy, PartialEq)]
-enum Fill {
-    /// Every pixel darker than `DARK` is black: nothing for the CPU to do.
-    Threshold,
-    /// Enclosed regions whose mean is darker than `DARK` are black (`fill_dark`, on the CPU).
-    Region,
-}
-
-/// The naive fill: pixels of `gray` darker than `DARK` turn black in `out`.
+/// Dark areas: pixels of `gray` darker than `DARK` turn black in `out`.
 pub(crate) fn threshold(gray: &[u8], out: &mut [u8]) {
     for (o, &g) in out.iter_mut().zip(gray) {
         if (g as u64) < DARK {
@@ -66,22 +54,8 @@ enum Backend {
 }
 
 impl Detector {
-    /// `REMDESKTOP_EDGE_FILL=region` fills enclosed dark regions on the CPU
-    /// instead of the default per-pixel threshold.
     pub fn new() -> Detector {
-        let fill = if std::env::var("REMDESKTOP_EDGE_FILL").is_ok_and(|v| v == "region") { Fill::Region } else { Fill::Threshold };
-        Detector { backend: Backend::Untried, fill }
-    }
-
-    /// The outline `out` of `gray` with the chosen fill applied.
-    fn finish(&self, gray: &[u8], out: &mut [u8], w: usize, h: usize) {
-        if !usable(gray, w, h) {
-            return;
-        }
-        match self.fill {
-            Fill::Threshold => threshold(gray, out),
-            Fill::Region => fill_dark(gray, out, w, h),
-        }
+        Detector { backend: Backend::Untried }
     }
 
     pub fn detect(&mut self, gray: &[u8], w: usize, h: usize) -> Vec<u8> {
@@ -92,7 +66,7 @@ impl Detector {
             self.backend = if std::env::var_os("REMDESKTOP_NO_GPU").is_some() || !usable(gray, w, h) {
                 Backend::Cpu
             } else {
-                match crate::gpu::Gpu::new(w, h, if self.fill == Fill::Threshold { DARK as u32 } else { 0 }) {
+                match crate::gpu::Gpu::new(w, h, DARK as u32) {
                     Ok(g) => {
                         eprintln!("remdesktop-host: edge detection on the GPU ({})", g.name());
                         Backend::Gpu(g)
@@ -109,13 +83,8 @@ impl Detector {
             _ => None,
         };
         match gpu_result {
-            Some(Ok(mut out)) => {
-                // The GPU applied the threshold itself.
-                if self.fill == Fill::Region {
-                    self.finish(gray, &mut out, w, h);
-                }
-                out
-            }
+            // The GPU applied the threshold itself.
+            Some(Ok(out)) => out,
             Some(Err(e)) => {
                 eprintln!("remdesktop-host: the GPU failed ({e}); edge detection on the CPU from now on");
                 self.backend = Backend::Cpu;
@@ -127,12 +96,14 @@ impl Detector {
 
     fn cpu(&self, gray: &[u8], w: usize, h: usize) -> Vec<u8> {
         let mut out = outline(gray, w, h);
-        self.finish(gray, &mut out, w, h);
+        if usable(gray, w, h) {
+            threshold(gray, &mut out);
+        }
         out
     }
 }
 
-/// The one-pixel outlines, before the dark regions are filled.
+/// The one-pixel outlines, before dark pixels are blackened.
 pub(crate) fn outline(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
     let mut out = vec![255u8; w * h];
     if !usable(gray, w, h) {
@@ -165,84 +136,6 @@ pub(crate) fn outline(gray: &[u8], w: usize, h: usize) -> Vec<u8> {
         }
     }
     out
-}
-
-/// Fills the regions the outlines enclose that are dark in the original, so
-/// dark shapes and strokes come out solid instead of hollow.
-///
-/// Regions are the 4-connected runs of non-edge pixels: the one-pixel lines
-/// are 8-connected, so a 4-connected fill cannot slip through a diagonal
-/// step. A region is black when its mean gray is below `DARK`.
-fn fill_dark(gray: &[u8], out: &mut [u8], w: usize, h: usize) {
-    // Work on runs of non-edge pixels instead of single pixels: the regions
-    // are found by joining the runs of neighboring rows that overlap (4-connectivity).
-    let mut runs: Vec<(u32, u32)> = vec![]; // x0..x1 within its row
-    let mut row_start = Vec::with_capacity(h + 1);
-    let mut sum: Vec<u64> = vec![];
-    for y in 0..h {
-        row_start.push(runs.len());
-        let row = &out[y * w..][..w];
-        let g = &gray[y * w..][..w];
-        let mut x = 0;
-        while x < w {
-            if row[x] == 0 {
-                x += 1;
-                continue;
-            }
-            let x0 = x;
-            let mut total = 0u64;
-            while x < w && row[x] != 0 {
-                total += g[x] as u64;
-                x += 1;
-            }
-            runs.push((x0 as u32, x as u32));
-            sum.push(total);
-        }
-    }
-    row_start.push(runs.len());
-
-    let mut parent: Vec<u32> = (0..runs.len() as u32).collect();
-    fn find(parent: &mut [u32], mut i: u32) -> u32 {
-        while parent[i as usize] != i {
-            parent[i as usize] = parent[parent[i as usize] as usize];
-            i = parent[i as usize];
-        }
-        i
-    }
-    for y in 1..h {
-        let (mut p, p_end) = (row_start[y - 1], row_start[y]);
-        let (mut c, c_end) = (row_start[y], row_start[y + 1]);
-        while p < p_end && c < c_end {
-            let ((px0, px1), (cx0, cx1)) = (runs[p], runs[c]);
-            if px0 < cx1 && cx0 < px1 {
-                let (a, b) = (find(&mut parent, p as u32), find(&mut parent, c as u32));
-                if a != b {
-                    parent[b as usize] = a;
-                }
-            }
-            if px1 < cx1 {
-                p += 1;
-            } else {
-                c += 1;
-            }
-        }
-    }
-
-    // Per region: the pixels it has and their gray.
-    let mut total = vec![(0u64, 0u64); runs.len()];
-    for i in 0..runs.len() {
-        let r = find(&mut parent, i as u32) as usize;
-        total[r].0 += sum[i];
-        total[r].1 += (runs[i].1 - runs[i].0) as u64;
-    }
-    for y in 0..h {
-        for i in row_start[y]..row_start[y + 1] {
-            let (gray_sum, count) = total[find(&mut parent, i as u32) as usize];
-            if gray_sum < DARK * count {
-                out[y * w + runs[i].0 as usize..y * w + runs[i].1 as usize].fill(0);
-            }
-        }
-    }
 }
 
 /// Runs `f(first_row, rows_of_a, rows_of_b)` on bands of rows in parallel.
