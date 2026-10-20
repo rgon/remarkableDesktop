@@ -122,7 +122,7 @@ struct Slot {
 }
 
 /// Lines of the info box in the bottom-left corner.
-const STATUS_LINES: usize = 3;
+const STATUS_LINES: usize = 4;
 const STATUS_W: u32 = 800;
 const STATUS_LINE_H: i32 = 44;
 
@@ -147,7 +147,7 @@ impl<'a> Ui<'a> {
                 Slot { rect: Rectangle::new(Point::new(x, MARGIN), Size::new(BUTTON, BUTTON)), label: String::new(), drawn: None, enabled: true }
             })
             .collect();
-        let status = [concat!("remdesktop v", env!("CARGO_PKG_VERSION")).to_string(), String::new(), String::new()];
+        let status = [concat!("remdesktop v", env!("CARGO_PKG_VERSION")).to_string(), String::new(), String::new(), String::new()];
         Self { canvas, rotation, size, buttons, status }
     }
 
@@ -198,12 +198,13 @@ impl<'a> Ui<'a> {
     }
 
     /// Sets the info box's status lines (below the version), redrawing if changed.
-    pub fn set_status(&mut self, usb: &str, host: &str) {
-        if self.status[1] == usb && self.status[2] == host {
+    pub fn set_status(&mut self, usb: &str, host: &str, wifi: &str) {
+        if self.status[1] == usb && self.status[2] == host && self.status[3] == wifi {
             return;
         }
         self.status[1] = usb.into();
         self.status[2] = host.into();
+        self.status[3] = wifi.into();
         self.draw_status();
         self.canvas.flush(Mode::Ui);
     }

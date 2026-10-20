@@ -179,7 +179,7 @@ pub fn run(args: Args) -> Result<(), String> {
     ui.set_label(Button::Clear, "CLR");
     ui.set_enabled(Button::Clear, state.ink);
     ui.set_enabled(Button::Screen, false);
-    ui.set_status("USB  starting", "HOST not connected");
+    ui.set_status("USB  starting", "HOST not connected", &wifi_line(&crate::link::network_addresses()));
     ui.draw_home();
 
     // USB HID: descriptor ranges come from the same declarations uinput uses.
@@ -484,7 +484,7 @@ pub fn run(args: Args) -> Result<(), String> {
             Some(_) => "HOST connected (input, display)".into(),
             None => "HOST not connected".into(),
         };
-        ui.set_status(usb_line, &host_line);
+        ui.set_status(usb_line, &host_line, &wifi_line(&addresses));
 
         // Hold buttons.
         // A finger or the pen tip on a button.
@@ -695,4 +695,12 @@ pub fn run(args: Args) -> Result<(), String> {
     log!("remdesktop: restoring the screen");
     let _ = std::io::stderr().flush();
     session.end(&epd)
+}
+
+/// The info box line with the tablet's Wi-Fi address, to connect a host to.
+fn wifi_line(addresses: &[String]) -> String {
+    match addresses.first() {
+        Some(ip) => format!("WIFI {ip}"),
+        None => "WIFI not connected".into(),
+    }
 }
