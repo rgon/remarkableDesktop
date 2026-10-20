@@ -8,9 +8,9 @@
 
 /// Gradient magnitude (|gx| + |gy| of a Sobel over 0..=255 gray, so four
 /// times the step in brightness) from which an edge is certain.
-const HIGH: i32 = 4 * 60;
+const HIGH: i32 = 4 * 70;
 /// Gradient magnitude an edge may fade to while still joined to a certain one.
-const LOW: i32 = 4 * 24;
+const LOW: i32 = 4 * 28;
 
 /// Gray (0..=255) under which a pixel is drawn black, outline or not.
 pub(crate) const DARK: u64 = 100;

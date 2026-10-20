@@ -39,8 +39,9 @@ struct Params {
 // Must equal tiles::TILE.
 const TILE: u32 = 32u;
 
-const LOW: i32 = 96;
-const HIGH: i32 = 240;
+// Must equal LOW and HIGH in edges.rs (4 * 28 and 4 * 70).
+const LOW: i32 = 112;
+const HIGH: i32 = 280;
 
 fn gray(i: u32) -> u32 {
     return (src_px[i >> 2u] >> ((i & 3u) * 8u)) & 255u;
