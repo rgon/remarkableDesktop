@@ -78,6 +78,17 @@ logs to the journal.
   authenticates. This is fine over USB (10.11.99.x). Over shared Wi-Fi,
   others on the network can see the streamed screen, and input when not on
   USB HID.
+- **Pen and touch over UDP (Wi-Fi only):** on a non-USB link both go in
+  unencrypted UDP datagrams (state snapshots, see `proto/src/sync.rs`) next to
+  the TCP session; the key in them only stops stray packets, not anyone who
+  can see the network. If the host's probe gets no answer within 1.5 s
+  (firewall, AP client isolation) input stays on TCP; `--no-udp` forces that.
+  Positions, pressure and the like have no reliable copy, only the repeats
+  after the last change (up to 4 s), so on a very lossy link the pointer can
+  rest a few samples short of the pen or finger. Button, tool and contact
+  changes (a finger landing or lifting, a tap) always arrive, in order and
+  once. Replayed late, a tap shows up as a press and release at the place it
+  happened. Keyboard-like undo/redo and the screen stream stay on TCP.
 
 ## Input
 - **Monitor targeting:** pen and touchscreen are mapped through GNOME's

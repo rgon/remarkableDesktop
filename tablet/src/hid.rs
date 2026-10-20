@@ -9,7 +9,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
 
 const GADGET: &str = "/sys/kernel/config/usb_gadget/g_ether";
 const INSTANCE: &str = "remdesktop";
@@ -97,9 +98,18 @@ pub enum Link {
     Suspended = 2,
 }
 
+/// Reports waiting for the sender thread. A write to ep1 blocks until the
+/// computer polls (and for good while it doesn't), which the input loop must
+/// not wait for.
+type Outbox = Arc<(Mutex<VecDeque<Vec<u8>>>, Condvar)>;
+
+/// Oldest reports are dropped beyond this (the computer stopped polling).
+const OUTBOX_MAX: usize = 64;
+
 pub struct Gadget {
     state: Arc<AtomicU8>,
     ep1: Arc<Mutex<Option<File>>>,
+    outbox: Outbox,
 }
 
 impl Gadget {
@@ -141,7 +151,10 @@ impl Gadget {
         let ep1: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
         let (st, e1) = (state.clone(), ep1.clone());
         std::thread::spawn(move || serve_ep0(ep0, report, st, e1));
-        Ok(Gadget { state, ep1 })
+        let outbox: Outbox = Default::default();
+        let (ob, st, e1) = (outbox.clone(), state.clone(), ep1.clone());
+        std::thread::spawn(move || send_reports(ob, st, e1));
+        Ok(Gadget { state, ep1, outbox })
     }
 
     pub fn link(&self) -> Link {
@@ -152,21 +165,44 @@ impl Gadget {
         }
     }
 
-    /// Sends one input report (first byte = report ID). Dropped while the
+    /// Queues one input report (first byte = report ID). Dropped while the
     /// host isn't polling.
     pub fn send(&self, report: &[u8]) -> bool {
-        if self.link() != Link::Up {
+        if self.link() != Link::Up || self.ep1.lock().unwrap().is_none() {
             return false;
         }
-        let mut ep1 = self.ep1.lock().unwrap();
-        match ep1.as_mut().map(|f| f.write(report)) {
-            Some(Ok(_)) => true,
-            Some(Err(e)) => {
-                log!("remdesktop: hid report: {e}");
-                *ep1 = None;
-                false
+        let (queue, wake) = &*self.outbox;
+        let mut q = queue.lock().unwrap();
+        if q.len() >= OUTBOX_MAX {
+            q.pop_front();
+        }
+        q.push_back(report.to_vec());
+        wake.notify_one();
+        true
+    }
+}
+
+/// Writes queued reports to ep1, in order.
+fn send_reports(outbox: Outbox, state: Arc<AtomicU8>, ep1: Arc<Mutex<Option<File>>>) {
+    // Same priority as the input loop (set after this thread is spawned, so not inherited).
+    let param = libc::sched_param { sched_priority: 20 };
+    unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+    let (queue, wake) = &*outbox;
+    loop {
+        let report = {
+            let mut q = queue.lock().unwrap();
+            while q.is_empty() {
+                q = wake.wait(q).unwrap();
             }
-            None => false,
+            q.pop_front().unwrap()
+        };
+        if state.load(Ordering::Relaxed) != Link::Up as u8 {
+            continue;
+        }
+        let mut ep1 = ep1.lock().unwrap();
+        if let Some(Err(e)) = ep1.as_mut().map(|f| f.write(&report)) {
+            log!("remdesktop: hid report: {e}");
+            *ep1 = None;
         }
     }
 }

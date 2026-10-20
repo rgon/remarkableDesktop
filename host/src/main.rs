@@ -10,10 +10,11 @@ mod mapping;
 mod outputs;
 mod stats;
 mod stream;
+mod udp;
 mod uinput;
 
 use mapping::Mapper;
-use remdesktop_proto::{Device, DisplayMode, Msg};
+use remdesktop_proto::{Device, DisplayMode, Msg, PEN_DEVICE, TOUCH_DEVICE};
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -34,7 +35,7 @@ static ASKED: AtomicBool = AtomicBool::new(false);
 
 const USAGE: &str = "usage: remdesktop-host [--ssh root@10.11.99.1] [--remote /home/root/remdesktop]
                        [--deploy <local remdesktop binary>] [--stats] [--no-usb] [--list-screens]
-                       [--no-display]
+                       [--no-display] [--no-udp]
                        [--rotate 0|90|180|270] [--touch touchpad|touchscreen] [--pen tablet|mouse]
                        [--palm-major N] [--pen-grace-ms N] [--palm-rest-ms N] [--log-touch]
                        [--fast-mode M] [--settle-mode M] [--settle-ms N]";
@@ -46,11 +47,13 @@ struct Args {
     stats: bool,
     /// Stream the screen to the tablet (otherwise input only).
     display: bool,
+    /// Offer the pen over UDP when on Wi-Fi.
+    udp: bool,
     run_args: Vec<String>,
 }
 
 fn parse() -> Result<Args, String> {
-    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remdesktop".into(), deploy: None, stats: false, display: true, run_args: vec![] };
+    let mut a = Args { ssh: "root@10.11.99.1".into(), remote: "/home/root/remdesktop".into(), deploy: None, stats: false, display: true, udp: true, run_args: vec![] };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value\n{USAGE}"));
@@ -60,6 +63,7 @@ fn parse() -> Result<Args, String> {
             "--deploy" => a.deploy = Some(value()?),
             "--stats" => a.stats = true,
             "--no-display" => a.display = false,
+            "--no-udp" => a.udp = false,
             "--capture-test" => {
                 // remdesktop-host --capture-test virtual|<connector> <out.pgm>
                 let src = value()?;
@@ -238,6 +242,7 @@ fn find_session(args: &Args, wait: Duration) -> Result<(SocketAddr, [u8; 16]), S
 fn connect(addr: SocketAddr, token: &[u8; 16]) -> std::io::Result<TcpStream> {
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(3))?;
     tcp.set_nodelay(true)?;
+    remdesktop_proto::tune_socket(std::os::fd::AsRawFd::as_raw_fd(&tcp));
     (&tcp).write_all(token)?;
     Ok(tcp)
 }
@@ -260,7 +265,25 @@ struct Virtual {
     decl: Device,
     dev: uinput::VirtualDevice,
     mapper: Mapper,
+    /// What the pen shows, for the datagrams' snapshots to be diffed against.
+    pen: remdesktop_proto::pen::PenSync,
+    touch: remdesktop_proto::touch::TouchSync,
 }
+
+impl Virtual {
+    /// Writes batches of events, each followed by a SYN_REPORT.
+    fn emit(&mut self, id: u8, batches: Vec<Vec<remdesktop_proto::Event>>) {
+        for mut events in batches {
+            self.mapper.apply(&mut events);
+            if let Err(e) = self.dev.emit(&events) {
+                eprintln!("remdesktop-host: write to device {id}: {e}");
+            }
+        }
+    }
+}
+
+/// Shared by the TCP loop and the pen's UDP thread.
+type Devices = Arc<Mutex<HashMap<u8, Virtual>>>;
 
 /// uinput ids, as set in uinput.rs.
 const VENDOR: u16 = 0x1d50;
@@ -548,6 +571,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
     // link (e.g. USB unplugged), which TCP alone would not report.
     tcp.set_read_timeout(Some(Duration::from_millis(1500))).map_err(|e| e.to_string())?;
     tcp.set_write_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
+    let tablet_ip = tcp.peer_addr().ok().map(|a| a.ip());
     let mut stream = BufReader::new(tcp.try_clone().map_err(|e| e.to_string())?);
     let closer = tcp.try_clone().map_err(|e| e.to_string())?;
     let writer: Writer = Arc::new(Mutex::new(Box::new(tcp)));
@@ -581,8 +605,40 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
         })
     };
 
-    let mut stats = stats::Stats::new(args.stats);
-    let mut devices: HashMap<u8, Virtual> = HashMap::new();
+    // Undo/redo keys for the current keyboard layout, re-checked now and then
+    // (the user may switch input sources). Asking GNOME forks a process and
+    // compiles a keymap, which must not stall input forwarding.
+    let keys_watcher = {
+        let (w, stop) = (writer.clone(), stop_prober.clone());
+        std::thread::spawn(move || {
+            let mut keys_sent: Option<Vec<u16>> = None;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                match keymap::keys_for(&['z', 'y']) {
+                    Some((codes, layout)) if keys_sent.as_ref() != Some(&codes) => {
+                        eprintln!("remdesktop-host: keyboard layout {layout}: undo/redo on key codes {codes:?}");
+                        let _ = send(&w, &Msg::Keys { undo: codes[0], redo: codes[1] });
+                        keys_sent = Some(codes);
+                    }
+                    Some(_) => {}
+                    None if keys_sent.is_none() => {
+                        eprintln!("remdesktop-host: couldn't read the keyboard layout; undo/redo assume QWERTY");
+                        keys_sent = Some(vec![]);
+                    }
+                    None => {}
+                }
+                for _ in 0..50 {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        })
+    };
+
+    let stats = Arc::new(Mutex::new(stats::Stats::new(args.stats)));
+    let devices: Devices = Default::default();
+    let mut udp_pen: Option<std::thread::JoinHandle<()>> = None;
     // Monitors as they were before we added a virtual one; views index these.
     let mut monitors: Vec<outputs::Output> = vec![];
     // Current layout, for mapping (includes the virtual monitor).
@@ -594,10 +650,6 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
     let mut display_mode = DisplayMode::Normal;
     // Messages we feed ourselves (resuming the tablet's saved view).
     let mut queued: std::collections::VecDeque<Msg> = Default::default();
-    // Undo/redo keys for the current keyboard layout, re-checked now and then
-    // (the user may switch input sources).
-    let mut keys_sent: Option<Vec<u16>> = None;
-    let mut keys_checked: Option<std::time::Instant> = None;
     let offset: stats::Offset = Default::default();
     let mut hid_probe: Option<stats::HidProbe> = None;
     let result = loop {
@@ -609,25 +661,9 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
             // A virtual monitor appeared: point input at it.
             screens = outputs::list().unwrap_or_default();
             target = Target { output: screens.iter().find(|o| o.name == name).cloned(), shown: mapping::FULL };
-            remap(&mut devices, &screens, &target, gs);
+            remap(&mut devices.lock().unwrap(), &screens, &target, gs);
             if status.usb_hid {
                 remap_hid(&writer, &screens, &target, gs, status);
-            }
-        }
-        if keys_checked.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
-            keys_checked = Some(std::time::Instant::now());
-            match keymap::keys_for(&['z', 'y']) {
-                Some((codes, layout)) if keys_sent.as_ref() != Some(&codes) => {
-                    eprintln!("remdesktop-host: keyboard layout {layout}: undo/redo on key codes {codes:?}");
-                    let _ = send(&writer, &Msg::Keys { undo: codes[0], redo: codes[1] });
-                    keys_sent = Some(codes);
-                }
-                Some(_) => {}
-                None if keys_sent.is_none() => {
-                    eprintln!("remdesktop-host: couldn't read the keyboard layout; undo/redo assume QWERTY");
-                    keys_sent = Some(vec![]);
-                }
-                None => {}
             }
         }
         let msg = match queued.pop_front() {
@@ -687,12 +723,13 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
             }
             Ok(Some(Msg::Device(d))) => {
                 // Same id again: the tablet changed the device (e.g. touch mode).
-                devices.remove(&d.id);
+                // Declared again (mode change): the tablet's step count has moved on.
+                let redeclared = devices.lock().unwrap().remove(&d.id).is_some();
                 match uinput::VirtualDevice::create(&d) {
                     Ok(dev) => {
                         eprintln!("remdesktop-host: created \"{}\"", d.name);
-                        devices.insert(d.id, Virtual { decl: d, dev, mapper: Mapper::default() });
-                        remap(&mut devices, &screens, &target, gs);
+                        devices.lock().unwrap().insert(d.id, Virtual { decl: d, dev, mapper: Mapper::default(), pen: if redeclared { Default::default() } else { remdesktop_proto::pen::PenSync::synced() }, touch: if redeclared { Default::default() } else { remdesktop_proto::touch::TouchSync::synced() } });
+                        remap(&mut devices.lock().unwrap(), &screens, &target, gs);
                     }
                     Err(e) => eprintln!("remdesktop-host: creating \"{}\": {e}", d.name),
                 }
@@ -703,13 +740,47 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
                 }
             }
             Ok(Some(Msg::Frame { device, time_us, mut events })) => {
-                if let Some(v) = devices.get_mut(&device) {
+                if let Some(v) = devices.lock().unwrap().get_mut(&device) {
+                    match device {
+                        PEN_DEVICE => v.pen.track(&events),
+                        TOUCH_DEVICE => v.touch.track(&events),
+                        _ => {}
+                    }
                     v.mapper.apply(&mut events);
                     if let Err(e) = v.dev.emit(&events) {
                         eprintln!("remdesktop-host: write to device {device}: {e}");
                     }
                 }
-                stats.frame(device, time_us);
+                stats.lock().unwrap().frame(device, time_us);
+            }
+            Ok(Some(Msg::PenState { seq, time_us: _, state })) => {
+                if let Some(v) = devices.lock().unwrap().get_mut(&PEN_DEVICE) {
+                    let batches = v.pen.edge(seq, state);
+                    v.emit(PEN_DEVICE, batches);
+                }
+            }
+            Ok(Some(Msg::TouchState { seq, time_us: _, state })) => {
+                if let Some(v) = devices.lock().unwrap().get_mut(&TOUCH_DEVICE) {
+                    let batches = v.touch.edge(seq, state);
+                    v.emit(TOUCH_DEVICE, batches);
+                }
+            }
+            Ok(Some(Msg::UdpOffer { port, key })) => {
+                if let (true, None, Some(ip)) = (args.udp, &udp_pen, tablet_ip.filter(|i| i.is_ipv4())) {
+                    let pen = udp::Pen {
+                        tablet: SocketAddr::new(ip, port),
+                        key,
+                        devices: devices.clone(),
+                        writer: writer.clone(),
+                        stop: stop_prober.clone(),
+                        stats: stats.clone(),
+                        report: args.stats,
+                    };
+                    match udp::spawn(pen) {
+                        Ok(t) => udp_pen = Some(t),
+                        Err(e) => eprintln!("remdesktop-host: udp: {e}; the pen stays on TCP"),
+                    }
+                }
             }
             Ok(Some(Msg::Target { index })) => {
                 let monitor = monitors.get((index as usize).wrapping_sub(1)).cloned();
@@ -728,7 +799,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
                     // (letterboxed) picture of it, shown or not.
                     let shown = monitor.as_ref().map_or(mapping::FULL, |m| mapping::letterbox(logical, m));
                     target = Target { output: monitor, shown };
-                    remap(&mut devices, &screens, &target, gs);
+                    remap(&mut devices.lock().unwrap(), &screens, &target, gs);
                     if status.usb_hid {
                         remap_hid(&writer, &screens, &target, gs, status);
                     }
@@ -747,6 +818,7 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
                 }
             }
             Ok(Some(Msg::Pong { host_us, tablet_us })) => {
+                let mut stats = stats.lock().unwrap();
                 stats.pong(host_us, tablet_us);
                 *offset.lock().unwrap() = stats.clock_offset();
             }
@@ -767,9 +839,13 @@ fn session(tcp: TcpStream, port: u16, args: &Args, gs: &mut gsettings::Outputs, 
     };
     stop_prober.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(streamer);
+    if let Some(t) = udp_pen {
+        let _ = t.join();
+    }
     drop(devices);
     // The pinger exits once the socket is shut down.
     let _ = closer.shutdown(std::net::Shutdown::Both);
     let _ = pinger.join();
+    let _ = keys_watcher.join();
     result
 }

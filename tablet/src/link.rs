@@ -6,10 +6,11 @@
 
 use crate::display::{Decoder, Rect};
 use crate::epd::ImageInfo;
+use remdesktop_proto::Datagram;
 use remdesktop_proto::Msg;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::mpsc;
@@ -21,6 +22,8 @@ pub const SESSION_FILE: &str = "/run/remdesktop/session";
 pub struct Server {
     listener: TcpListener,
     token: [u8; 16],
+    /// Pen datagrams to hosts on Wi-Fi (see `remdesktop_proto::pen`).
+    udp: UdpSocket,
 }
 
 impl Server {
@@ -29,7 +32,33 @@ impl Server {
         listener.set_nonblocking(true)?;
         let mut token = [0u8; 16];
         File::open("/dev/urandom")?.read_exact(&mut token)?;
-        Ok(Server { listener, token })
+        let udp = UdpSocket::bind(("0.0.0.0", 0))?;
+        udp.set_nonblocking(true)?;
+        remdesktop_proto::prioritize(udp.as_raw_fd());
+        Ok(Server { listener, token, udp })
+    }
+
+    pub fn udp_fd(&self) -> RawFd {
+        self.udp.as_raw_fd()
+    }
+
+    pub fn udp_port(&self) -> u16 {
+        self.udp.local_addr().map_or(0, |a| a.port())
+    }
+
+    /// Best effort: a lost datagram is covered by the protocol.
+    pub fn udp_send(&self, to: SocketAddr, datagram: &[u8]) {
+        let _ = self.udp.send_to(datagram, to);
+    }
+
+    /// Everything waiting on the UDP socket, as (sender, datagram).
+    pub fn udp_recv(&self) -> Vec<(SocketAddr, Datagram)> {
+        let mut out = vec![];
+        let mut buf = [0u8; 256];
+        while let Ok((n, from)) = self.udp.recv_from(&mut buf) {
+            out.extend(Datagram::decode(&buf[..n]).map(|d| (from, d)));
+        }
+        out
     }
 
     /// Publishes port and token for the host. Done once the USB setup has
@@ -58,6 +87,7 @@ impl Server {
             // A dead link (cable pulled) must never stall the input loop.
             tcp.set_write_timeout(Some(Duration::from_millis(250)))?;
             tcp.set_nodelay(true)?;
+            remdesktop_proto::tune_socket(tcp.as_raw_fd());
             Ok(got == self.token)
         };
         match check() {
@@ -126,6 +156,66 @@ impl Link {
     pub fn close(&self) {
         let _ = self.tcp.shutdown(std::net::Shutdown::Both);
     }
+}
+
+/// A random key for one host's UDP datagrams.
+pub fn random_key() -> u32 {
+    let mut b = [0u8; 4];
+    let _ = File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
+    u32::from_le_bytes(b)
+}
+
+/// Wi-Fi power save, switched off while a host is connected over Wi-Fi.
+/// Remembers the interface's previous setting and puts it back on `restore`
+/// (also when dropped, as a fallback for early returns).
+#[derive(Default)]
+pub struct PowerSave {
+    /// Interface and whether power save was on before we touched it.
+    saved: Option<(String, bool)>,
+}
+
+impl PowerSave {
+    pub fn disable(&mut self) {
+        if self.saved.is_some() {
+            return;
+        }
+        let Some(iface) = wireless_interface() else { return };
+        let on = match iw(&["dev", &iface, "get", "power_save"]) {
+            Some(out) => out.contains(": on"),
+            None => return,
+        };
+        if on {
+            if iw(&["dev", &iface, "set", "power_save", "off"]).is_none() {
+                return;
+            }
+            log!("remdesktop: wifi power save off on {iface}");
+        }
+        self.saved = Some((iface, on));
+    }
+
+    pub fn restore(&mut self) {
+        if let Some((iface, on)) = self.saved.take() {
+            if on && iw(&["dev", &iface, "set", "power_save", "on"]).is_some() {
+                log!("remdesktop: wifi power save back on for {iface}");
+            }
+        }
+    }
+}
+
+impl Drop for PowerSave {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn wireless_interface() -> Option<String> {
+    std::fs::read_dir("/sys/class/net").ok()?.flatten().find(|e| e.path().join("wireless").is_dir()).map(|e| e.file_name().to_string_lossy().into_owned())
+}
+
+/// Output of `iw args`, None if it is missing or failed.
+fn iw(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("iw").args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Whether an address belongs to the USB network (the tablet is 10.11.99.1).
