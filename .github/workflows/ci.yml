@@ -36,8 +36,11 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cargo-zigbuild
-        run: pipx install cargo-zigbuild
+      - name: Install zig and cargo-zigbuild
+        run: |
+          # cargo-zigbuild runs `python3 -m ziglang` when there is no `zig` binary
+          python3 -m pip install --user --break-system-packages ziglang
+          pipx install cargo-zigbuild
 
       - name: Build tablet binary
         run: |
